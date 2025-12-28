@@ -144,7 +144,11 @@ Ultimate Downloader/
 
 ## 📜 License
 
-This project is for personal use. Please respect the terms of service of all integrated platforms.
+This project is licensed under [CC BY-NC-ND 4.0](LICENSE).
+
+- ✅ You may view and use this code for personal, non-commercial purposes
+- ❌ You may not modify, distribute derivatives, or use commercially
+- ✅ You must give appropriate credit to the author
 
 ---
 
