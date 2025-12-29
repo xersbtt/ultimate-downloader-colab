@@ -1,10 +1,21 @@
 # Ultimate Downloader Changelog
 
-Comprehensive changelog documenting all changes from v1.0 to v4.25.
+Comprehensive changelog documenting all changes from v1.0 to v4.26.
 
 ---
 
-## v4.25 (Latest)
+## v4.26 (Latest)
+**Theme: Real-Debrid Parallel Downloads**
+
+### ✨ New Features
+- **Real-Debrid Parallel Downloads**: Direct RD links (`real-debrid.com/d/XXX`) now download in parallel
+  - Added `resolve_rd_link()` function to unrestrict RD links during resolve phase
+  - RD links get re-resolved on resume for fresh download URLs
+  - Magnets remain sequential (need to wait for RD caching)
+
+---
+
+## v4.25
 **Theme: Parallel Downloads & Session Resume**
 
 ### ✨ New Features

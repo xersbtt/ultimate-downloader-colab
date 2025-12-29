@@ -70,7 +70,7 @@ progress_bar = widgets.FloatProgress(value=0.0, min=0.0, max=100.0, description=
 status_label = widgets.HTML(value="")
 
 input_ui = widgets.VBox([
-    widgets.HTML("<h3>🚀 Ultimate Downloader v4.25</h3>"),
+    widgets.HTML("<h3>🚀 Ultimate Downloader v4.26</h3>"),
     widgets.HBox([token_gf, token_rd]),
     widgets.HBox([show_name_override, playlist_selection, concurrent_slider]),
     text_area,
@@ -95,7 +95,7 @@ def save_session(tasks: List[DownloadTask], gofile_token: str = "", rd_token: st
     """Persist current download state to Drive."""
     try:
         session = {
-            "version": "4.25",
+            "version": "4.26",
             "started_at": datetime.now().isoformat(),
             "gofile_token": gofile_token,
             "rd_token": rd_token,
@@ -608,6 +608,23 @@ def process_rd_link(link, key):
     except Exception as e:
         print(f"   ❌ RD Error: {str(e)[:80]}")
 
+def resolve_rd_link(url: str, rd_key: str) -> List[Tuple[str, str]]:
+    """Unrestrict a Real-Debrid link and return (download_url, filename) tuple."""
+    if not rd_key:
+        print(f"   ❌ RD Token required for: {url}")
+        return []
+    try:
+        h = {"Authorization": f"Bearer {rd_key}"}
+        d = requests.post("https://api.real-debrid.com/rest/1.0/unrestrict/link", 
+                         data={"link": url}, headers=h, timeout=30).json()
+        if 'error' in d:
+            print(f"   ❌ RD Unrestrict Error: {d.get('error', 'Unknown')}")
+            return []
+        return [(d['download'], d['filename'])]
+    except Exception as e:
+        print(f"   ❌ RD Resolve Error: {str(e)[:80]}")
+        return []
+
 # --- PARALLEL DOWNLOAD WORKER ---
 def download_worker(task: DownloadTask, gofile_token: str) -> DownloadTask:
     """Worker function for parallel downloads. Returns updated task."""
@@ -655,8 +672,18 @@ def resolve_all_links(urls: List[str], session: requests.Session, tokens: dict, 
                     original_url=url  # Store original for re-resolve
                 ))
         elif "magnet:?" in url:
+            # Magnets stay sequential (need to wait for RD to cache)
             rd_urls.append(url)
+        elif "real-debrid.com/d/" in url:
+            # RD direct links can be parallelized
+            resolved = resolve_rd_link(url, rd_key)
+            for u, n in resolved:
+                parallel_tasks.append(DownloadTask(
+                    url=u, filename=n, source="rd", link_type="rd",
+                    original_url=url  # Store original for re-resolve
+                ))
         elif rd_key and "http" in url:
+            # Other premium links through RD - keep sequential for now
             rd_urls.append(url)
         else:
             # Direct URL
@@ -739,19 +766,19 @@ def execute_batch(mode: str, resume: bool = False):
             print(f"📂 Resuming {len(pending_tasks)} of {len(all_tasks)} tasks...")
             
             # Install required tools first
-            needs_pixeldrain_gofile = any(t.link_type in ['gofile', 'pixeldrain'] for t in pending_tasks)
+            needs_pixeldrain_gofile_rd = any(t.link_type in ['gofile', 'pixeldrain', 'rd'] for t in pending_tasks)
             needs_ytdlp = any(t.link_type == 'youtube' for t in pending_tasks)
             needs_mega = any(t.link_type == 'mega' for t in pending_tasks)
             needs_aria = any(t.link_type in ['gofile', 'pixeldrain', 'direct', 'rd'] for t in pending_tasks)
             setup_environment(needs_mega, needs_ytdlp, needs_aria)
             
-            # Re-resolve Gofile/Pixeldrain URLs to get fresh API tokens (bypasses IP rate limits)
-            if needs_pixeldrain_gofile:
-                print("🔄 Re-resolving Gofile/Pixeldrain links with fresh session...")
+            # Re-resolve Gofile/Pixeldrain/RD URLs to get fresh API tokens (bypasses IP rate limits)
+            if needs_pixeldrain_gofile_rd:
+                print("🔄 Re-resolving links with fresh session...")
                 s, t = get_gofile_session(gofile_token)
                 
                 for task in pending_tasks:
-                    if task.original_url and task.link_type in ['gofile', 'pixeldrain']:
+                    if task.original_url and task.link_type in ['gofile', 'pixeldrain', 'rd']:
                         try:
                             if task.link_type == 'gofile':
                                 resolved = resolve_gofile(task.original_url, s, t)
@@ -760,6 +787,10 @@ def execute_batch(mode: str, resume: bool = False):
                                     task.cookie = t.get('token')
                             elif task.link_type == 'pixeldrain':
                                 resolved = resolve_pixeldrain(task.original_url, s)
+                                if resolved:
+                                    task.url = resolved[0][0]  # Update with fresh API URL
+                            elif task.link_type == 'rd':
+                                resolved = resolve_rd_link(task.original_url, rd_key)
                                 if resolved:
                                     task.url = resolved[0][0]  # Update with fresh API URL
                         except Exception as e:

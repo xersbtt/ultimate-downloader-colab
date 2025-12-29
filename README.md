@@ -22,7 +22,7 @@ A powerful Google Colab-based tool for downloading media from multiple sources d
 
 ### 1. Open in Google Colab
 
-Create a new Colab notebook and paste the entire contents of `ultimate_downloader_v4.25.py` into a cell, then run it.
+Create a new Colab notebook and paste the entire contents of `ultimate_downloader_v4.26.py` into a cell, then run it.
 
 ### 2. Configure API Keys (Optional)
 
@@ -139,7 +139,7 @@ For age-restricted or member-only content:
 
 ```
 Ultimate Downloader/
-├── ultimate_downloader_v4.25.py   # Latest version
+├── ultimate_downloader_v4.26.py   # Latest version
 ├── CHANGELOG.md                    # Version history
 ├── README.md                       # This file
 ├── LICENSE                         # CC BY-NC-ND 4.0
