@@ -5,6 +5,8 @@ A powerful Google Colab-based tool for downloading media from multiple sources d
 ## ✨ Features
 
 - **Multi-Source Downloads**: Gofile, Pixeldrain, Mega.nz, YouTube, Twitch, Vimeo, and more
+- **Parallel Downloads**: Download up to 5 files concurrently (configurable)
+- **Session Resume**: Automatically resume interrupted downloads after runtime restart
 - **Real-Debrid Integration**: Unrestrict premium links and process magnet links
 - **Smart Media Sorting**: Automatically organizes into Plex-compatible folder structures
   - TV Shows: `Show Name/Season XX/Show Name - S01E01.mkv`
@@ -20,7 +22,7 @@ A powerful Google Colab-based tool for downloading media from multiple sources d
 
 ### 1. Open in Google Colab
 
-Create a new Colab notebook and paste the entire contents of `ultimate_downloader_v4.24.py` into a cell, then run it.
+Create a new Colab notebook and paste the entire contents of `ultimate_downloader_v4.25.py` into a cell, then run it.
 
 ### 2. Configure API Keys (Optional)
 
@@ -59,6 +61,7 @@ Files will be organized and saved to your Google Drive.
 | **RD Token** | Real-Debrid API key for premium links/magnets |
 | **Show Name** | Override auto-detected show name for all files |
 | **Playlist Range** | Select specific items: `1,3,5-10` or leave empty for all |
+| **Parallel DLs** | Number of concurrent downloads (1-5) |
 
 ### Drive Folders
 
@@ -66,6 +69,7 @@ Files are saved to these folders in your Google Drive:
 - `My Drive/TV Shows/` - Detected TV episodes
 - `My Drive/Movies/` - Detected movies
 - `My Drive/YouTube/` - YouTube downloads without episode patterns
+- `My Drive/Ultimate Downloader/` - Config files (session.json, yt_history.txt)
 
 ---
 
@@ -115,6 +119,7 @@ For age-restricted or member-only content:
 |--------|--------|
 | **Start Download** | Download videos and organize to Drive |
 | **Download Subtitles Only** | Fetch subtitles without downloading videos |
+| **Resume Previous** | Resume interrupted session (appears when session exists) |
 
 ---
 
@@ -134,10 +139,11 @@ For age-restricted or member-only content:
 
 ```
 Ultimate Downloader/
-├── ultimate_downloader_v4.24.py   # Latest version
+├── ultimate_downloader_v4.25.py   # Latest version
 ├── CHANGELOG.md                    # Version history
 ├── README.md                       # This file
-└── [older versions...]             # Previous versions
+├── LICENSE                         # CC BY-NC-ND 4.0
+└── archive/                        # Previous versions
 ```
 
 ---

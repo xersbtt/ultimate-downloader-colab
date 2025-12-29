@@ -1,10 +1,44 @@
 # Ultimate Downloader Changelog
 
-Comprehensive changelog documenting all changes from v1.0 to v4.24.
+Comprehensive changelog documenting all changes from v1.0 to v4.25.
 
 ---
 
-## v4.24 (Latest)
+## v4.25 (Latest)
+**Theme: Parallel Downloads & Session Resume**
+
+### ✨ New Features
+- **Parallel Downloads**: Download up to 5 files concurrently using `ThreadPoolExecutor`
+  - New UI slider to control concurrent download count (1-5)
+  - Applies to Gofile, Pixeldrain, and direct URL downloads
+  - Thread-safe progress tracking with per-task status
+- **Session Resume**: Save and resume interrupted downloads
+  - Session state saved to `Ultimate Downloader/session.json` on Drive
+  - New "Resume Previous" button appears when interrupted session detected
+  - Failed tasks automatically retry on resume
+  - Session cleared on successful batch completion
+- **IP Bypass for Rate-Limited Sites**: Re-resolves Gofile/Pixeldrain URLs on resume
+  - Stores original user URLs, not resolved API URLs
+  - New runtime = new IP = bypasses Pixeldrain rate limits
+
+### 🔧 Improvements
+- New `DownloadTask` dataclass for structured task tracking
+- Pre-resolve all links before downloading (faster batch start)
+- Config files now stored in `My Drive/Ultimate Downloader/` folder
+- Drive mounts automatically on script load (enables resume detection)
+- Enhanced status display showing active download count and progress
+
+### 🐛 Bug Fixes
+- Fixed: Resume now properly installs required tools (aria2, yt-dlp, etc.)
+- Fixed: Progress bar updates during parallel downloads
+
+### ⚠️ Notes
+- YouTube, MEGA, and Real-Debrid downloads remain sequential (tool limitations)
+- Session file location: `My Drive/Ultimate Downloader/session.json`
+
+---
+
+## v4.24
 **Theme: Code Quality & Colab Secrets Integration**
 
 ### ✨ New Features
@@ -295,3 +329,5 @@ Comprehensive changelog documenting all changes from v1.0 to v4.24.
 | v4.19 | Security hardening (path traversal prevention) |
 | v4.22 | Playlist range selection |
 | v4.24 | Colab secrets integration and type hints |
+| v4.25 | Parallel downloads and session resume |
+

@@ -57,3 +57,6 @@ Thumbs.db
 cookies.txt
 *.part
 *.ytdl
+
+# Antigravity workflows (local only)
+.agent/
