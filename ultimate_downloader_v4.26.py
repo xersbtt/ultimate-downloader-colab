@@ -797,10 +797,10 @@ def execute_batch(mode: str, resume: bool = False):
                             print(f"   ⚠️ Could not re-resolve {task.filename}: {e}")
             
             # Separate by type for processing
-            parallel_tasks = [t for t in pending_tasks if t.link_type in ['gofile', 'pixeldrain', 'direct']]
+            parallel_tasks = [t for t in pending_tasks if t.link_type in ['gofile', 'pixeldrain', 'direct', 'rd']]
             youtube_urls = [t.url for t in pending_tasks if t.link_type == 'youtube']
             mega_urls = [t.url for t in pending_tasks if t.link_type == 'mega']
-            rd_urls = [t.url for t in pending_tasks if t.link_type == 'rd']
+            rd_urls = [t.url for t in pending_tasks if t.link_type == 'magnet']  # Only magnets go sequential
         else:
             urls = [x.strip() for x in text_area.value.split('\n') if x.strip()]
             if not urls:
