@@ -5,8 +5,11 @@ A powerful Google Colab-based tool for downloading media from multiple sources d
 ## ✨ Features
 
 - **Multi-Source Downloads**: Gofile, Pixeldrain, Mega.nz, YouTube, Twitch, Vimeo, and more
+- **35+ Premium Hosts via Real-Debrid**: MediaFire, 1fichier, Rapidgator, Nitroflare, etc.
 - **Parallel Downloads**: Download up to 5 files concurrently (configurable)
 - **Session Resume**: Automatically resume interrupted downloads after runtime restart
+- **Queue Management**: Preview, reorder, and select which files to download
+- **Download History**: Persistent log of completed downloads for debugging
 - **Real-Debrid Integration**: Unrestrict premium links and process magnet links
 - **Smart Media Sorting**: Automatically organizes into Plex-compatible folder structures
   - TV Shows: `Show Name/Season XX/Show Name - S01E01.mkv`
@@ -22,7 +25,7 @@ A powerful Google Colab-based tool for downloading media from multiple sources d
 
 ### 1. Open in Google Colab
 
-Create a new Colab notebook and paste the entire contents of `ultimate_downloader_v4.26.py` into a cell, then run it.
+Create a new Colab notebook and paste the entire contents of `ultimate_downloader_v4.27.py` into a cell, then run it.
 
 ### 2. Configure API Keys (Optional)
 

@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
+from uuid import uuid4
 import ipywidgets as widgets
 from IPython.display import display, clear_output
 from urllib.parse import urlparse, unquote
@@ -36,7 +37,19 @@ DRIVE_YOUTUBE_PATH = "YouTube"
 MIN_FILE_SIZE_MB = 10
 KEEP_EXTENSIONS = {'.srt', '.ass', '.sub', '.vtt'}
 SESSION_FILE = f"{UD_CONFIG_PATH}session.json"
+HISTORY_FILE = f"{UD_CONFIG_PATH}history.json"
 MAX_CONCURRENT_DEFAULT = 3
+
+# Real-Debrid supported file hosts (route through RD when token available)
+RD_SUPPORTED_HOSTS = {
+    '1fichier.com', '4shared.com', 'alfafile.net', 'clicknupload.org', 'ddownload.com',
+    'dailymotion.com', 'dropbox.com', 'filefactory.com', 'hexupload.net', 'hitfile.net',
+    'k2s.cc', 'keep2share.cc', 'mediafire.com', 'mega.nz', 'mixdrop.co', 'nitroflare.com',
+    'oboom.com', 'rapidgator.net', 'redtube.com', 'scribd.com', 'sendspace.com',
+    'solidfiles.com', 'soundcloud.com', 'streamtape.com', 'turbobit.net', 'ulozto.net',
+    'upload.ee', 'uploaded.net', 'uptobox.com', 'userscloud.com', 'vidoza.net',
+    'vimeo.com', 'wetransfer.com', 'wipfiles.net', 'worldbytez.com', 'youporn.com',
+}
 
 # --- DOWNLOAD TASK DATACLASS ---
 @dataclass
@@ -45,6 +58,7 @@ class DownloadTask:
     filename: str
     source: str
     link_type: str  # gofile, pixeldrain, direct, youtube, mega, rd
+    id: str = field(default_factory=lambda: str(uuid4()))  # Unique ID for tracking
     status: str = "pending"  # pending, downloading, done, failed, skipped
     error: Optional[str] = None
     cookie: Optional[str] = None
@@ -66,15 +80,34 @@ text_area = widgets.Textarea(description='Links:', placeholder='Paste Links Here
 btn = widgets.Button(description="Start Download", button_style='success', icon='download')
 btn_subs = widgets.Button(description="Download Subtitles Only", button_style='info', icon='closed-captioning')
 btn_resume = widgets.Button(description="Resume Previous", button_style='warning', icon='play', layout=widgets.Layout(display='none'))
+btn_history = widgets.Button(description="📜", button_style='', tooltip='View Download History', layout=widgets.Layout(width='40px'))
 progress_bar = widgets.FloatProgress(value=0.0, min=0.0, max=100.0, description='Idle', bar_style='info', layout=widgets.Layout(width='98%'))
 status_label = widgets.HTML(value="")
 
+# --- QUEUE MANAGEMENT UI ---
+queue_list = widgets.SelectMultiple(options=[], description='Queue:', layout=widgets.Layout(width='98%', height='200px'))
+btn_queue_up = widgets.Button(description="▲ Up", button_style='', layout=widgets.Layout(width='60px'))
+btn_queue_down = widgets.Button(description="▼ Down", button_style='', layout=widgets.Layout(width='60px'))
+btn_queue_select_all = widgets.Button(description="Select All", button_style='info', layout=widgets.Layout(width='80px'))
+btn_queue_select_none = widgets.Button(description="None", button_style='', layout=widgets.Layout(width='60px'))
+btn_queue_remove = widgets.Button(description="Remove", button_style='danger', layout=widgets.Layout(width='70px'))
+btn_queue_start = widgets.Button(description="▶ Start Selected", button_style='success', layout=widgets.Layout(width='120px'))
+btn_queue_cancel = widgets.Button(description="Cancel", button_style='warning', layout=widgets.Layout(width='70px'))
+
+queue_controls = widgets.HBox([btn_queue_up, btn_queue_down, btn_queue_select_all, btn_queue_select_none, btn_queue_remove, btn_queue_start, btn_queue_cancel])
+queue_ui = widgets.VBox([
+    widgets.HTML("<b>📋 Queue Preview</b> <small>(Select items to manage)</small>"),
+    queue_list,
+    queue_controls
+], layout=widgets.Layout(display='none'))  # Hidden by default
+
 input_ui = widgets.VBox([
-    widgets.HTML("<h3>🚀 Ultimate Downloader v4.26</h3>"),
+    widgets.HTML("<h3>🚀 Ultimate Downloader v4.27</h3>"),
     widgets.HBox([token_gf, token_rd]),
     widgets.HBox([show_name_override, playlist_selection, concurrent_slider]),
     text_area,
-    widgets.HBox([btn, btn_subs, btn_resume]),
+    widgets.HBox([btn, btn_subs, btn_resume, btn_history]),
+    queue_ui,
     progress_bar,
     status_label,
     widgets.HTML("<hr>")
@@ -91,14 +124,15 @@ def load_session() -> Optional[Dict[str, Any]]:
         print(f"⚠️ Could not load session: {e}")
     return None
 
-def save_session(tasks: List[DownloadTask], gofile_token: str = "", rd_token: str = ""):
+def save_session(tasks: List[DownloadTask], gofile_token: str = "", rd_token: str = "", show_name: str = ""):
     """Persist current download state to Drive."""
     try:
         session = {
-            "version": "4.26",
+            "version": "4.27",
             "started_at": datetime.now().isoformat(),
             "gofile_token": gofile_token,
             "rd_token": rd_token,
+            "show_name_override": show_name,
             "tasks": [asdict(t) for t in tasks]
         }
         with open(SESSION_FILE, 'w') as f:
@@ -120,6 +154,168 @@ def check_resume_available():
         btn_resume.layout.display = 'inline-flex'
     else:
         btn_resume.layout.display = 'none'
+
+# --- DOWNLOAD HISTORY ---
+def log_download(filename: str, source: str, size_mb: float, destination: str, status: str = "success"):
+    """Append download to persistent history log for debugging."""
+    try:
+        history = []
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, 'r') as f:
+                history = json.load(f)
+        
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "filename": filename,
+            "source": source,
+            "size_mb": round(size_mb, 2),
+            "destination": destination,
+            "status": status
+        }
+        history.insert(0, entry)  # Newest first
+        history = history[:500]   # Keep last 500 entries
+        
+        with open(HISTORY_FILE, 'w') as f:
+            json.dump(history, f, indent=2)
+    except Exception:
+        pass  # Silent fail for logging
+
+def view_history(b=None):
+    """Open history file location in output."""
+    if os.path.exists(HISTORY_FILE):
+        print(f"📜 History file: {HISTORY_FILE}")
+        print(f"   (Open in Google Drive to view)")
+        try:
+            with open(HISTORY_FILE, 'r') as f:
+                history = json.load(f)
+            print(f"\\n📊 Last 10 downloads (times in UTC):")
+            for i, entry in enumerate(history[:10], 1):
+                ts = entry.get('timestamp', '')[:16].replace('T', ' ')
+                fn = entry.get('filename', 'Unknown')[:40]
+                src = entry.get('source', '?')
+                size = entry.get('size_mb', 0)
+                print(f"   {i}. [{ts}] {fn} ({src}, {size:.1f}MB)")
+        except Exception as e:
+            print(f"   ⚠️ Could not read history: {e}")
+    else:
+        print("📜 No download history yet.")
+
+# --- QUEUE MANAGEMENT ---
+pending_queue: List[DownloadTask] = []  # Global queue state
+queue_mode: str = ""  # "video" or "subs_only"
+
+def update_queue_display():
+    """Update the queue list widget with current pending_queue."""
+    options = []
+    for i, task in enumerate(pending_queue):
+        source_icon = {"gofile": "📁", "pixeldrain": "💾", "rd": "⚡", "direct": "🔗", 
+                       "youtube": "▶️", "mega": "☁️", "mediafire": "🔥", "1fichier": "📦"}.get(task.link_type, "📄")
+        name = task.filename[:50] if task.filename else task.url[:50]
+        options.append(f"{i+1}. {source_icon} {name}")
+    queue_list.options = options
+    queue_list.value = tuple(options)  # Select all by default
+
+def show_queue_preview(tasks: List[DownloadTask], mode: str):
+    """Show queue UI with resolved tasks."""
+    global pending_queue, queue_mode
+    pending_queue = tasks.copy()
+    queue_mode = mode
+    update_queue_display()
+    queue_ui.layout.display = 'block'
+    btn.disabled = True
+    btn_subs.disabled = True
+    print(f"📋 Queue loaded with {len(tasks)} items. Review and click 'Start Selected' to begin.")
+
+def hide_queue():
+    """Hide queue UI and reset state."""
+    global pending_queue
+    pending_queue = []
+    queue_ui.layout.display = 'none'
+    queue_list.options = []
+    btn.disabled = False
+    btn_subs.disabled = False
+
+def queue_move_up(b=None):
+    """Move selected items up in the queue."""
+    global pending_queue
+    selected = list(queue_list.value)
+    if not selected:
+        return
+    indices = [int(s.split('.')[0]) - 1 for s in selected]
+    indices.sort()
+    for idx in indices:
+        if idx > 0 and idx - 1 not in indices:
+            pending_queue[idx], pending_queue[idx-1] = pending_queue[idx-1], pending_queue[idx]
+    update_queue_display()
+    # Re-select moved items
+    new_selected = [queue_list.options[max(0, i-1)] for i in indices]
+    queue_list.value = tuple(new_selected)
+
+def queue_move_down(b=None):
+    """Move selected items down in the queue."""
+    global pending_queue
+    selected = list(queue_list.value)
+    if not selected:
+        return
+    indices = [int(s.split('.')[0]) - 1 for s in selected]
+    indices.sort(reverse=True)
+    for idx in indices:
+        if idx < len(pending_queue) - 1 and idx + 1 not in indices:
+            pending_queue[idx], pending_queue[idx+1] = pending_queue[idx+1], pending_queue[idx]
+    update_queue_display()
+    # Re-select moved items
+    new_selected = [queue_list.options[min(len(pending_queue)-1, i+1)] for i in indices]
+    queue_list.value = tuple(new_selected)
+
+def queue_select_all(b=None):
+    """Select all items in queue."""
+    queue_list.value = tuple(queue_list.options)
+
+def queue_select_none(b=None):
+    """Deselect all items in queue."""
+    queue_list.value = ()
+
+def queue_remove_selected(b=None):
+    """Remove selected items from queue."""
+    global pending_queue
+    selected = list(queue_list.value)
+    if not selected:
+        return
+    indices_to_remove = {int(s.split('.')[0]) - 1 for s in selected}
+    pending_queue = [t for i, t in enumerate(pending_queue) if i not in indices_to_remove]
+    update_queue_display()
+    if not pending_queue:
+        hide_queue()
+        print("📋 Queue is empty.")
+
+def queue_cancel(b=None):
+    """Cancel queue and return to link input."""
+    hide_queue()
+    print("❌ Queue cancelled.")
+
+def start_from_queue(b=None):
+    """Start downloading selected items from queue."""
+    global pending_queue, queue_mode
+    
+    selected = list(queue_list.value)
+    if not selected:
+        print("⚠️ No items selected! Select items to download.")
+        return
+    
+    # Get selected indices
+    selected_indices = {int(s.split('.')[0]) - 1 for s in selected}
+    selected_tasks = [t for i, t in enumerate(pending_queue) if i in selected_indices]
+    
+    if not selected_tasks:
+        print("⚠️ No valid items selected!")
+        return
+    
+    # Hide queue and start download
+    hide_queue()
+    print(f"🚀 Starting download of {len(selected_tasks)} selected items...")
+    
+    # Process the selected tasks
+    execute_selected_tasks(selected_tasks, queue_mode)
 
 # --- HELPER FUNCTIONS ---
 def reset_progress():
@@ -475,8 +671,10 @@ def handle_file_processing(file_path, source="generic"):
         if os.path.exists(final_dest): os.remove(final_dest)
         
         if not os.path.exists(os.path.dirname(final_dest)): os.makedirs(os.path.dirname(final_dest))
+        size_mb = os.path.getsize(file_path) / (1024 * 1024)
         shutil.move(file_path, final_dest)
         print(f"   ✨ Moved to {cat}: {os.path.basename(final_dest)}")
+        log_download(os.path.basename(final_dest), source, size_mb, final_dest)
         return
 
     print(f"   📦 Archive Detected: {filename}")
@@ -531,8 +729,10 @@ def handle_file_processing(file_path, source="generic"):
                 continue
 
             if not os.path.exists(os.path.dirname(final_dest)): os.makedirs(os.path.dirname(final_dest))
+            size_mb = os.path.getsize(extracted_full) / (1024 * 1024)
             shutil.move(extracted_full, final_dest)
             print(f"      [{extracted_count}/{total_files}] -> {os.path.basename(final_dest)}")
+            log_download(os.path.basename(final_dest), source, size_mb, final_dest)
         
         if os.path.exists(extract_temp): shutil.rmtree(extract_temp, ignore_errors=True)
         os.makedirs(extract_temp)
@@ -625,12 +825,80 @@ def resolve_rd_link(url: str, rd_key: str) -> List[Tuple[str, str]]:
         print(f"   ❌ RD Resolve Error: {str(e)[:80]}")
         return []
 
+def resolve_mediafire(url: str, session: requests.Session) -> List[Tuple[str, str]]:
+    """Resolve MediaFire link to direct download URL by parsing HTML."""
+    try:
+        resp = session.get(url, timeout=30)
+        # Look for the download button href
+        match = re.search(r'href="(https://download\d*\.mediafire\.com/[^"]+)"', resp.text)
+        if match:
+            download_url = match.group(1)
+            # Extract filename from URL or page title
+            filename_match = re.search(r'/([^/]+)$', download_url)
+            if filename_match:
+                filename = unquote(filename_match.group(1))
+                print(f"   📁 MediaFire: {filename}")
+                return [(download_url, sanitize_filename(filename))]
+        # Try alternate pattern for older MediaFire pages
+        match2 = re.search(r'aria-label="Download file"\s+href="([^"]+)"', resp.text)
+        if match2:
+            download_url = match2.group(1)
+            filename = re.search(r'/([^/]+)$', download_url).group(1)
+            return [(download_url, sanitize_filename(unquote(filename)))]
+        print(f"   ⚠️ MediaFire: Could not find download link")
+    except Exception as e:
+        print(f"   ❌ MediaFire Error: {str(e)[:80]}")
+    return []
+
+def resolve_1fichier(url: str, session: requests.Session) -> List[Tuple[str, str]]:
+    """Resolve 1fichier link to direct download URL."""
+    try:
+        # Get the page first to extract any needed info
+        resp = session.get(url, timeout=30)
+        
+        # Extract filename from page
+        filename_match = re.search(r'<title>([^<]+)</title>', resp.text)
+        filename = "1fichier_download"
+        if filename_match:
+            title = filename_match.group(1)
+            # Clean up title (remove "1fichier.com:" prefix if present)
+            filename = re.sub(r'^.*?:\s*', '', title).strip()
+            if not filename or filename == "1fichier.com":
+                filename = "1fichier_download"
+        
+        # 1fichier requires a POST to download
+        # Check if there's a waiting time (free downloads)
+        if 'You must wait' in resp.text or 'Please wait' in resp.text:
+            print(f"   ⚠️ 1fichier: Rate limited, try later or use premium")
+            return []
+        
+        # Try to get the download link via POST
+        # Note: 1fichier may require CAPTCHA for free downloads
+        post_resp = session.post(url, data={'dl_no_ssl': 'on', 'dlinline': 'on'}, timeout=30, allow_redirects=False)
+        
+        if post_resp.status_code == 302:
+            # Redirect to download URL
+            download_url = post_resp.headers.get('Location', '')
+            if download_url:
+                print(f"   📁 1fichier: {filename}")
+                return [(download_url, sanitize_filename(filename))]
+        
+        # Check response for direct link
+        dl_match = re.search(r'href="(https://[^"]*1fichier[^"]*)"[^>]*>Click here', post_resp.text, re.IGNORECASE)
+        if dl_match:
+            return [(dl_match.group(1), sanitize_filename(filename))]
+        
+        print(f"   ⚠️ 1fichier: Could not extract download link (may require premium or CAPTCHA)")
+    except Exception as e:
+        print(f"   ❌ 1fichier Error: {str(e)[:80]}")
+    return []
+
 # --- PARALLEL DOWNLOAD WORKER ---
 def download_worker(task: DownloadTask, gofile_token: str) -> DownloadTask:
     """Worker function for parallel downloads. Returns updated task."""
     task.status = "downloading"
     try:
-        f = download_with_aria2(task.url, task.filename, COLAB_ROOT, task.cookie, task_id=task.url)
+        f = download_with_aria2(task.url, task.filename, COLAB_ROOT, task.cookie, task_id=task.id)
         if f:
             handle_file_processing(f, source=task.source)
             task.status = "done"
@@ -671,6 +939,38 @@ def resolve_all_links(urls: List[str], session: requests.Session, tokens: dict, 
                     url=u, filename=n, source="pixeldrain", link_type="pixeldrain",
                     original_url=url  # Store original for re-resolve
                 ))
+        elif "mediafire.com" in url:
+            # Prefer RD if available, fallback to direct resolve
+            if rd_key:
+                resolved = resolve_rd_link(url, rd_key)
+                for u, n in resolved:
+                    parallel_tasks.append(DownloadTask(
+                        url=u, filename=n, source="mediafire", link_type="rd",
+                        original_url=url
+                    ))
+            else:
+                resolved = resolve_mediafire(url, session)
+                for u, n in resolved:
+                    parallel_tasks.append(DownloadTask(
+                        url=u, filename=n, source="mediafire", link_type="mediafire",
+                        original_url=url
+                    ))
+        elif "1fichier.com" in url:
+            # Prefer RD if available, fallback to direct resolve
+            if rd_key:
+                resolved = resolve_rd_link(url, rd_key)
+                for u, n in resolved:
+                    parallel_tasks.append(DownloadTask(
+                        url=u, filename=n, source="1fichier", link_type="rd",
+                        original_url=url
+                    ))
+            else:
+                resolved = resolve_1fichier(url, session)
+                for u, n in resolved:
+                    parallel_tasks.append(DownloadTask(
+                        url=u, filename=n, source="1fichier", link_type="1fichier",
+                        original_url=url
+                    ))
         elif "magnet:?" in url:
             # Magnets stay sequential (need to wait for RD to cache)
             rd_urls.append(url)
@@ -682,8 +982,16 @@ def resolve_all_links(urls: List[str], session: requests.Session, tokens: dict, 
                     url=u, filename=n, source="rd", link_type="rd",
                     original_url=url  # Store original for re-resolve
                 ))
+        elif rd_key and any(host in url for host in RD_SUPPORTED_HOSTS):
+            # Route through RD for any supported premium host
+            resolved = resolve_rd_link(url, rd_key)
+            for u, n in resolved:
+                parallel_tasks.append(DownloadTask(
+                    url=u, filename=n, source="rd_host", link_type="rd",
+                    original_url=url
+                ))
         elif rd_key and "http" in url:
-            # Other premium links through RD - keep sequential for now
+            # Other links through RD - try unrestricting
             rd_urls.append(url)
         else:
             # Direct URL
@@ -707,7 +1015,7 @@ def update_progress_display(tasks: List[DownloadTask]):
     active_progress = 0
     active_infos = []
     for t in active[:3]:
-        status = active_downloads.get(t.url, "0%")
+        status = active_downloads.get(t.id, "0%")
         active_infos.append(status)
         # Extract percentage from status like "45% (5.2MiB/s)"
         match = re.search(r'(\d+)%', status)
@@ -737,6 +1045,103 @@ def progress_monitor(tasks: List[DownloadTask], interval: float = 0.5):
         except Exception:
             pass
 
+def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str):
+    """Execute download for selected tasks from queue."""
+    clear_output(wait=True)
+    display(input_ui)
+    btn.disabled = True
+    btn_subs.disabled = True
+    btn_resume.disabled = True
+    
+    try:
+        gofile_token = token_gf.value.strip()
+        rd_key = token_rd.value.strip()
+        max_workers = concurrent_slider.value
+        
+        # Separate by type
+        parallel_tasks = [t for t in selected_tasks if t.link_type in ['gofile', 'pixeldrain', 'direct', 'rd']]
+        youtube_urls = [t.url for t in selected_tasks if t.link_type == 'youtube']
+        mega_urls = [t.url for t in selected_tasks if t.link_type == 'mega']
+        rd_urls = [t.url for t in selected_tasks if t.link_type == 'magnet']
+        
+        all_tasks = selected_tasks.copy()
+        
+        total_parallel = len(parallel_tasks)
+        total_sequential = len(youtube_urls) + len(mega_urls) + len(rd_urls)
+        print(f"📊 Starting: {total_parallel} parallel + {total_sequential} sequential\n")
+        
+        # --- PARALLEL DOWNLOADS ---
+        if parallel_tasks:
+            print(f"⚡ Starting {total_parallel} parallel downloads (max {max_workers} concurrent)...")
+            
+            global stop_monitor
+            stop_monitor = False
+            import threading
+            monitor_thread = threading.Thread(target=progress_monitor, args=(parallel_tasks,), daemon=True)
+            monitor_thread.start()
+            
+            try:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_task = {
+                        executor.submit(download_worker, task, gofile_token): task 
+                        for task in parallel_tasks
+                    }
+                    
+                    for future in as_completed(future_to_task):
+                        task = future_to_task[future]
+                        try:
+                            result = future.result()
+                            for i, t in enumerate(all_tasks):
+                                if t.id == result.id:
+                                    all_tasks[i] = result
+                                    break
+                            save_session(all_tasks, gofile_token, rd_key, show_name_override.value.strip())
+                        except Exception as e:
+                            print(f"   ❌ Task failed: {str(e)[:80]}")
+            finally:
+                stop_monitor = True
+            
+            print(f"✅ Parallel downloads complete!")
+        
+        # --- SEQUENTIAL DOWNLOADS ---
+        if youtube_urls:
+            print(f"\n▶️ Processing {len(youtube_urls)} YouTube links...")
+            for i, url in enumerate(youtube_urls, 1):
+                print(f"   [{i}/{len(youtube_urls)}] {url[:60]}...")
+                process_youtube_link(url, mode)
+        
+        if mega_urls:
+            print(f"\n☁️ Processing {len(mega_urls)} Mega links...")
+            for i, url in enumerate(mega_urls, 1):
+                print(f"   [{i}/{len(mega_urls)}] {url[:60]}...")
+                process_mega_link(url)
+        
+        if rd_urls and rd_key:
+            print(f"\n⚡ Processing {len(rd_urls)} RD Magnet links...")
+            for i, url in enumerate(rd_urls, 1):
+                print(f"   [{i}/{len(rd_urls)}] {url[:60]}...")
+                process_rd_link(url, rd_key)
+        
+        # Summary
+        done_count = sum(1 for t in all_tasks if t.status == 'done')
+        failed_count = sum(1 for t in all_tasks if t.status == 'failed')
+        
+        if failed_count > 0:
+            print(f"\n⚠️ Completed with {done_count} success, {failed_count} failed")
+        else:
+            print(f"\n✅ All {done_count} tasks completed successfully!")
+            clear_session()
+    
+    except Exception as e:
+        print(f"\n❌ Critical Error: {e}")
+    finally:
+        btn.disabled = False
+        btn_subs.disabled = False
+        btn_resume.disabled = False
+        reset_progress()
+        check_resume_available()
+
+
 def execute_batch(mode: str, resume: bool = False):
     clear_output(wait=True)
     display(input_ui)
@@ -759,6 +1164,11 @@ def execute_batch(mode: str, resume: bool = False):
             
             gofile_token = session_data.get('gofile_token', gofile_token)
             rd_key = session_data.get('rd_token', rd_key)
+            # Restore show name override from session
+            saved_show_name = session_data.get('show_name_override', '')
+            if saved_show_name:
+                show_name_override.value = saved_show_name
+                print(f"   🎬 Restored show name: {saved_show_name}")
             all_tasks = [DownloadTask(**t) for t in session_data.get('tasks', [])]
             
             # Filter to only pending/failed tasks
@@ -805,6 +1215,8 @@ def execute_batch(mode: str, resume: bool = False):
             urls = [x.strip() for x in text_area.value.split('\n') if x.strip()]
             if not urls:
                 print("❌ No links provided!")
+                btn.disabled = False
+                btn_subs.disabled = False
                 return
             
             needs_ytdlp = any(h in u for u in urls for h in ['youtube.com', 'youtu.be', 'twitch.tv', 'tiktok.com', 'vimeo.com', 'dailymotion.com', 'soundcloud.com'])
@@ -828,8 +1240,13 @@ def execute_batch(mode: str, resume: bool = False):
                 all_tasks.append(DownloadTask(url=url, filename="", source="rd", link_type="rd"))
             
             # Save initial session
-            save_session(all_tasks, gofile_token, rd_key)
+            save_session(all_tasks, gofile_token, rd_key, show_name_override.value.strip())
+            
+            # Show queue preview instead of immediate download
+            show_queue_preview(all_tasks, mode)
+            return  # Wait for user to click "Start Selected"
         
+        # This code only runs for RESUME mode (preview was skipped)
         total_parallel = len(parallel_tasks)
         total_sequential = len(youtube_urls) + len(mega_urls) + len(rd_urls)
         print(f"📊 Tasks: {total_parallel} parallel + {total_sequential} sequential\n")
@@ -859,10 +1276,10 @@ def execute_batch(mode: str, resume: bool = False):
                             
                             # Update task in all_tasks and save session
                             for i, t in enumerate(all_tasks):
-                                if t.url == result.url:
+                                if t.id == result.id:
                                     all_tasks[i] = result
                                     break
-                            save_session(all_tasks, gofile_token, rd_key)
+                            save_session(all_tasks, gofile_token, rd_key, show_name_override.value.strip())
                             
                         except Exception as e:
                             print(f"   ❌ Task failed: {str(e)[:80]}")
@@ -935,6 +1352,16 @@ def execute_batch(mode: str, resume: bool = False):
 btn.on_click(lambda b: execute_batch("video"))
 btn_subs.on_click(lambda b: execute_batch("subs_only"))
 btn_resume.on_click(lambda b: execute_batch("video", resume=True))
+btn_history.on_click(view_history)
+
+# Queue control bindings
+btn_queue_up.on_click(queue_move_up)
+btn_queue_down.on_click(queue_move_down)
+btn_queue_select_all.on_click(queue_select_all)
+btn_queue_select_none.on_click(queue_select_none)
+btn_queue_remove.on_click(queue_remove_selected)
+btn_queue_cancel.on_click(queue_cancel)
+btn_queue_start.on_click(lambda b: start_from_queue())
 
 # --- INITIAL SETUP ---
 def early_mount_drive():

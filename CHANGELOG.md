@@ -1,10 +1,45 @@
 # Ultimate Downloader Changelog
 
-Comprehensive changelog documenting all changes from v1.0 to v4.26.
+Comprehensive changelog documenting all changes from v1.0 to v4.27.
 
 ---
 
-## v4.26 (Latest)
+## v4.27 (Latest)
+**Theme: Queue Management, File Host Support & History Logging**
+
+### ✨ New Features
+- **Download History Log**: Persistent log of all completed downloads
+  - Stores last 500 downloads in `history.json`
+  - Records timestamp (UTC), filename, source, size, destination
+  - New 📜 button in UI to view recent downloads
+- **Batch Queue Management**: Preview and modify downloads before starting
+  - Queue preview shows all resolved links with source icons
+  - Select/deselect individual items with checkboxes
+  - Move items up/down to reorder priority
+  - Remove selected items from queue
+  - "Start Selected" to download only chosen items
+- **Session Resume Show Name**: Show name override now persists across sessions
+  - Saved in session.json and restored on resume
+- **Real-Debrid Host Routing**: 35+ file hosts now route through RD
+  - MediaFire, 1fichier, Rapidgator, Nitroflare, etc.
+  - Prefer RD when token available (premium speeds, no CAPTCHA)
+  - Fallback to direct resolve for non-RD users
+- **MediaFire Direct Support**: HTML parsing for non-RD users
+- **1fichier Direct Support**: POST-based download for non-RD users
+
+### 🔧 Improvements
+- Queue icons: 🔥 MediaFire, 📦 1fichier added
+- History shows formatted output with file sizes
+- `RD_SUPPORTED_HOSTS` constant for easy maintenance
+
+### 🐛 Bug Fixes
+- Fixed: RD direct links now correctly parallelized in resume mode
+- Fixed: Session resume now restores show_name_override field
+- Improved: DownloadTask now uses UUID for tracking (prevents collisions with re-resolved URLs)
+
+---
+
+## v4.26
 **Theme: Real-Debrid Parallel Downloads**
 
 ### ✨ New Features
