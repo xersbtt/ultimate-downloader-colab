@@ -1134,18 +1134,34 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str):
             for i, url in enumerate(youtube_urls, 1):
                 print(f"   [{i}/{len(youtube_urls)}] {url[:60]}...")
                 process_youtube_link(url, mode)
+                # Mark as done in task list
+                for t in all_tasks:
+                    if t.url == url and t.link_type == 'youtube':
+                        t.status = "done"
+                        break
         
         if mega_urls:
             print(f"\n☁️ Processing {len(mega_urls)} Mega links...")
             for i, url in enumerate(mega_urls, 1):
                 print(f"   [{i}/{len(mega_urls)}] {url[:60]}...")
                 process_mega_link(url)
+                # Mark as done in task list
+                for t in all_tasks:
+                    if t.url == url and t.link_type == 'mega':
+                        t.status = "done"
+                        break
         
         if rd_urls and rd_key:
             print(f"\n⚡ Processing {len(rd_urls)} RD Magnet links...")
             for i, url in enumerate(rd_urls, 1):
                 print(f"   [{i}/{len(rd_urls)}] {url[:60]}...")
                 process_rd_link(url, rd_key)
+                # Mark as done in task list
+                for t in all_tasks:
+                    if t.url == url and t.link_type == 'magnet':
+                        t.status = "done"
+                        break
+
         
         # Summary
         done_count = sum(1 for t in all_tasks if t.status == 'done')

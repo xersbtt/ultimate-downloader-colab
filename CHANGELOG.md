@@ -12,6 +12,7 @@ Comprehensive changelog documenting all changes from v1.0 to v4.28.
   - Shallow metadata extraction returning identical titles for all entries
   - Episode detection failing for non-English patterns (e.g., Vietnamese "Tập")
   - When `show_name_override` was set without episode match, all files defaulted to `S01E01`
+- **Fixed task count in summary message**: Summary now correctly shows number of completed downloads instead of "All 0 tasks"
 
 ### ✨ New Features
 - **Playlist Index Fallback**: When no episode pattern matches but `show_name_override` is set, playlist position (1, 2, 3...) is used as episode number
