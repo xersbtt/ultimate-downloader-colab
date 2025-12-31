@@ -6,7 +6,7 @@ A powerful Google Colab-based tool for downloading media from multiple sources d
 
 - **Multi-Source Downloads**: Gofile, Pixeldrain, Mega.nz, YouTube, Twitch, Vimeo, and more
 - **35+ Premium Hosts via Real-Debrid**: MediaFire, 1fichier, Rapidgator, Nitroflare, etc.
-- **Parallel Downloads**: Download up to 5 files concurrently (configurable)
+- **Parallel Downloads**: Download up to 5 files concurrently for Gofile, Pixeldrain, Real-Debrid, and direct HTTP links
 - **Session Resume**: Automatically resume interrupted downloads after runtime restart
 - **Queue Management**: Preview, reorder, and select which files to download
 - **Download History**: Persistent log of completed downloads for debugging
@@ -25,7 +25,13 @@ A powerful Google Colab-based tool for downloading media from multiple sources d
 
 ### 1. Open in Google Colab
 
-Create a new Colab notebook and paste the entire contents of `ultimate_downloader_v4.27.py` into a cell, then run it.
+Create a new Colab notebook and paste this one-liner into a cell:
+
+```python
+import requests; exec(requests.get("https://raw.githubusercontent.com/xersbtt/ultimate-downloader-colab/main/ultimate_downloader_v4.28.py").text)
+```
+
+Run the cell and the UI will appear automatically.
 
 ### 2. Configure API Keys (Optional)
 
@@ -63,8 +69,8 @@ Files will be organized and saved to your Google Drive.
 | **Gofile Token** | API token for private Gofile folders |
 | **RD Token** | Real-Debrid API key for premium links/magnets |
 | **Show Name** | Override auto-detected show name for all files |
-| **Playlist Range** | Select specific items: `1,3,5-10` or leave empty for all |
-| **Parallel DLs** | Number of concurrent downloads (1-5) |
+| **Playlist Range** | Select specific YouTube playlist items: `1,3,5-10` or leave empty for all |
+| **Parallel DLs** | Number of concurrent downloads (1-5, applies to Gofile/Pixeldrain/RD/HTTP) |
 
 ### Drive Folders
 
@@ -72,24 +78,25 @@ Files are saved to these folders in your Google Drive:
 - `My Drive/TV Shows/` - Detected TV episodes
 - `My Drive/Movies/` - Detected movies
 - `My Drive/YouTube/` - YouTube downloads without episode patterns
-- `My Drive/Ultimate Downloader/` - Config files (session.json, yt_history.txt)
+- `My Drive/Ultimate Downloader/` - Config files (session.json, history.json)
 
 ---
 
 ## 📺 Supported Sources
 
-| Source | Features |
-|--------|----------|
-| **Gofile** | Public/private folders, cookie auth |
-| **Pixeldrain** | Direct file downloads |
-| **Mega.nz** | Full download support |
-| **Real-Debrid** | Link unrestricting, magnet processing |
-| **YouTube** | Videos, playlists, subtitles |
-| **Twitch** | VODs and clips |
-| **Vimeo** | Video downloads |
-| **TikTok** | Video downloads |
-| **Dailymotion** | Video downloads |
-| **SoundCloud** | Audio downloads |
+| Source | Features | Download Mode |
+|--------|----------|---------------|
+| **Gofile** | Public/private folders, cookie auth | Parallel |
+| **Pixeldrain** | Direct file downloads | Parallel |
+| **Real-Debrid** | Link unrestricting, magnet processing | Parallel |
+| **Direct HTTP** | Any direct download URL | Parallel |
+| **Mega.nz** | Full download support | Sequential |
+| **YouTube** | Videos, playlists, subtitles | Sequential |
+| **Twitch** | VODs and clips | Sequential |
+| **Vimeo** | Video downloads | Sequential |
+| **TikTok** | Video downloads | Sequential |
+| **Dailymotion** | Video downloads | Sequential |
+| **SoundCloud** | Audio downloads | Sequential |
 
 ---
 
@@ -102,7 +109,14 @@ The downloader recognizes these naming patterns:
 | Standard | `Show.Name.S01E05.mkv` | Season 01, Episode 05 |
 | Asian Drama | `Drama EP01.mkv` | Season 01, Episode 01 |
 | Chinese | `电视剧 第5集.mkv` | Season 01, Episode 05 |
-| Multi-Part | `Movie 上篇.mkv` | Adds `-pt1` suffix |
+| Vietnamese | `Phim Tập 3.mkv` | Season 01, Episode 03 |
+| Korean | `드라마 5화.mkv` | Season 01, Episode 05 |
+| German | `Serie Folge 2.mkv` | Season 01, Episode 02 |
+| Spanish | `Serie Capitulo 4.mkv` | Season 01, Episode 04 |
+| Pipe/Dash | `Show Name \| 7.mkv` | Season 01, Episode 07 |
+| Asian Multi-Part | `Movie 上篇.mkv` | Adds `-pt1` suffix |
+
+> **Tip**: When using "Show Name" override with playlists, the playlist position (1, 2, 3...) will be used as the episode number if no pattern matches.
 
 ---
 
@@ -121,7 +135,7 @@ For age-restricted or member-only content:
 | Button | Action |
 |--------|--------|
 | **Start Download** | Download videos and organize to Drive |
-| **Download Subtitles Only** | Fetch subtitles without downloading videos |
+| **Download Subtitles Only** | Fetch subtitles from YouTube without downloading videos |
 | **Resume Previous** | Resume interrupted session (appears when session exists) |
 
 ---
@@ -142,7 +156,7 @@ For age-restricted or member-only content:
 
 ```
 Ultimate Downloader/
-├── ultimate_downloader_v4.26.py   # Latest version
+├── ultimate_downloader_v4.28.py   # Latest version
 ├── CHANGELOG.md                    # Version history
 ├── README.md                       # This file
 ├── LICENSE                         # CC BY-NC-ND 4.0

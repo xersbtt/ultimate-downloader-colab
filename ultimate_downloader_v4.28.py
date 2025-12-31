@@ -102,7 +102,7 @@ queue_ui = widgets.VBox([
 ], layout=widgets.Layout(display='none'))  # Hidden by default
 
 input_ui = widgets.VBox([
-    widgets.HTML("<h3>🚀 Ultimate Downloader v4.27</h3>"),
+    widgets.HTML("<h3>🚀 Ultimate Downloader v4.28</h3>"),
     widgets.HBox([token_gf, token_rd]),
     widgets.HBox([show_name_override, playlist_selection, concurrent_slider]),
     text_area,
@@ -128,7 +128,7 @@ def save_session(tasks: List[DownloadTask], gofile_token: str = "", rd_token: st
     """Persist current download state to Drive."""
     try:
         session = {
-            "version": "4.27",
+            "version": "4.28",
             "started_at": datetime.now().isoformat(),
             "gofile_token": gofile_token,
             "rd_token": rd_token,
@@ -360,16 +360,16 @@ def is_safe_path(base_dir: str, filename: str) -> bool:
     except Exception:
         return False
 
-def check_duplicate_in_drive(filename: str, source: str = "generic") -> bool:
+def check_duplicate_in_drive(filename: str, source: str = "generic", playlist_index: Optional[int] = None) -> bool:
     """Check if file already exists in Drive to avoid re-downloading"""
-    dest_path, category = determine_destination_path(filename, source, dry_run=True)
+    dest_path, category = determine_destination_path(filename, source, dry_run=True, playlist_index=playlist_index)
     if os.path.exists(dest_path):
         file_size = os.path.getsize(dest_path) / (1024 * 1024)
         print(f"   ⏭️  SKIPPED (Already exists): {os.path.basename(dest_path)} ({file_size:.1f} MB)")
         return True
     return False
 
-def determine_destination_path(filename: str, source: str = "generic", dry_run: bool = False) -> Tuple[str, str]:
+def determine_destination_path(filename: str, source: str = "generic", dry_run: bool = False, playlist_index: Optional[int] = None) -> Tuple[str, str]:
     filename = sanitize_filename(filename)
     part_suffix = ""
     if "上篇" in filename or re.search(r'(?i)(?:Part|Pt)\.?\s*1\b', filename): part_suffix = "-pt1"
@@ -380,29 +380,41 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
     show_name = "Unknown Show" 
     
     sxe_strict = re.search(r'(?i)\bS(\d{1,2})E(\d{1,2})\b', filename)
-    sxe_loose = re.search(r'(?i)\b(?:Ep?|Episode)[ ._]?(\d{1,3})\b', filename)
-    sxe_asian = re.search(r'第(\d+)集', filename)
+    # Added Vietnamese "Tập", Korean "화", and more flexible episode patterns
+    sxe_loose = re.search(r'(?i)(?:\b(?:Ep?|Episode|Tập|Tập phim|Folge|Capitulo|Cap)[ .\-_]?(\d{1,3})\b|[|\-–—]\s*(?:Ep?|Episode|Tập)?\s*(\d{1,3})\s*[|\]]?)', filename)
+    sxe_asian = re.search(r'(?:第(\d+)集|(\d+)화)', filename)
 
     season_num, episode_num = 1, 1
     is_tv = False
+    episode_detected = False
 
     if sxe_strict:
         season_num, episode_num = int(sxe_strict.group(1)), int(sxe_strict.group(2))
         show_name = clean_show_name(filename[:sxe_strict.start()])
         is_tv = True
+        episode_detected = True
     elif sxe_loose:
-        episode_num = int(sxe_loose.group(1))
+        # Handle multiple capture groups (first non-None wins)
+        ep_num = sxe_loose.group(1) or sxe_loose.group(2)
+        episode_num = int(ep_num) if ep_num else 1
         show_name = clean_show_name(filename[:sxe_loose.start()])
         if len(show_name) < 2: show_name = clean_show_name(os.path.splitext(filename[sxe_loose.end():])[0])
         is_tv = True
+        episode_detected = True
     elif sxe_asian:
-        episode_num = int(sxe_asian.group(1))
+        # Handle multiple capture groups for Asian patterns
+        ep_num = sxe_asian.group(1) or sxe_asian.group(2)
+        episode_num = int(ep_num) if ep_num else 1
         show_name = clean_show_name(filename[:sxe_asian.start()])
         is_tv = True
+        episode_detected = True
     
     if manual_show_name:
         show_name = manual_show_name
         is_tv = True
+        # Use playlist_index as episode fallback when pattern detection fails
+        if not episode_detected and playlist_index is not None:
+            episode_num = playlist_index
     elif is_tv: pass
     else:
         year_match = re.search(r'\b(19|20)\d{2}\b', filename)
@@ -533,10 +545,23 @@ def process_youtube_link(url, mode="video"):
             for i, entry in enumerate(entries, 1):
                 if not entry: continue
                 
+                # For playlists, entries may have shallow metadata - extract full info per video
+                video_url = entry.get('webpage_url') or entry.get('url') or entry.get('id')
+                if not video_url:
+                    print(f"      [{i}/{total_items}] ⚠️ Skipped: No valid URL found")
+                    continue
+                
+                # If entry looks like shallow metadata (no formats), fetch full info
+                if 'formats' not in entry and 'id' in entry:
+                    try:
+                        entry = ydl.extract_info(video_url, download=False) or entry
+                    except Exception:
+                        pass  # Fall back to shallow entry if extraction fails
+                
                 title = entry.get('title', 'Unknown')
                 ext = 'mkv' if mode == "video" else 'srt'
                 temp_filename = f"{title}.{ext}"
-                if check_duplicate_in_drive(temp_filename, source="youtube"):
+                if check_duplicate_in_drive(temp_filename, source="youtube", playlist_index=i):
                     continue
                 
                 print(f"      [{i}/{total_items}] Downloading: {title}")

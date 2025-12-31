@@ -1,10 +1,30 @@
 # Ultimate Downloader Changelog
 
-Comprehensive changelog documenting all changes from v1.0 to v4.27.
+Comprehensive changelog documenting all changes from v1.0 to v4.28.
 
 ---
 
-## v4.27 (Latest)
+## v4.28 (Latest)
+**Theme: YouTube Playlist Bug Fix & International Episode Patterns**
+
+### 🐛 Bug Fixes
+- **Fixed YouTube playlist duplicate detection**: All videos in a playlist were incorrectly marked as "Already exists" due to:
+  - Shallow metadata extraction returning identical titles for all entries
+  - Episode detection failing for non-English patterns (e.g., Vietnamese "Tập")
+  - When `show_name_override` was set without episode match, all files defaulted to `S01E01`
+
+### ✨ New Features
+- **Playlist Index Fallback**: When no episode pattern matches but `show_name_override` is set, playlist position (1, 2, 3...) is used as episode number
+- **International Episode Patterns**: Added support for:
+  - Vietnamese: `Tập 1`, `Tập phim 1`
+  - Korean: `1화`
+  - German: `Folge 1`
+  - Spanish: `Capitulo 1`, `Cap 1`
+  - Flexible pipe/dash patterns: `Show Name | 3`, `Show Name - 2`
+
+---
+
+## v4.27
 **Theme: Queue Management, File Host Support & History Logging**
 
 ### ✨ New Features
@@ -376,4 +396,6 @@ Comprehensive changelog documenting all changes from v1.0 to v4.27.
 | v4.22 | Playlist range selection |
 | v4.24 | Colab secrets integration and type hints |
 | v4.25 | Parallel downloads and session resume |
+| v4.27 | Queue management, file host routing, download history |
+| v4.28 | YouTube playlist fix, international episode patterns |
 
