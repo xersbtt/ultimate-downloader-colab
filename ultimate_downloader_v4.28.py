@@ -24,8 +24,34 @@ def get_colab_secret(key: str, default: str = "") -> str:
         return userdata.get(key)
     except (ImportError, ModuleNotFoundError):
         return default
-    except Exception:
+    except Exception as e:
+        # This catches SecretNotFoundError and NotebookAccessError
         return default
+
+def check_and_load_secrets():
+    """Re-check secrets and populate fields if they were empty on initial load."""
+    try:
+        from google.colab import userdata
+        # Try to load RD_TOKEN if field is empty
+        if not token_rd.value:
+            try:
+                rd_val = userdata.get('RD_TOKEN')
+                if rd_val:
+                    token_rd.value = rd_val
+                    print("🔑 RD_TOKEN loaded from Colab Secrets")
+            except Exception:
+                pass
+        # Try to load GOFILE_TOKEN if field is empty
+        if not token_gf.value:
+            try:
+                gf_val = userdata.get('GOFILE_TOKEN')
+                if gf_val:
+                    token_gf.value = gf_val
+                    print("🔑 GOFILE_TOKEN loaded from Colab Secrets")
+            except Exception:
+                pass
+    except (ImportError, ModuleNotFoundError):
+        pass
 
 # --- CONFIGURATION ---
 COLAB_ROOT = "/content/"
@@ -438,6 +464,10 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
 def setup_environment(needs_mega, needs_ytdlp, needs_aria):
     drive_path = f"{COLAB_ROOT}drive"
     if not os.path.exists(drive_path): drive.mount(drive_path)
+    
+    # Try to load secrets again (may not have been accessible on initial load)
+    check_and_load_secrets()
+    
     # Create media folders and config folder
     for p in [DRIVE_TV_PATH, DRIVE_MOVIE_PATH, DRIVE_YOUTUBE_PATH]:
         full_p = f"{DRIVE_BASE}{p}"
