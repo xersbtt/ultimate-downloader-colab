@@ -160,7 +160,7 @@ Ultimate Downloader/
 ├── ultimate_downloader_v4.28.py   # Versioned snapshot
 ├── CHANGELOG.md                    # Version history
 ├── README.md                       # This file
-├── LICENSE                         # CC BY-NC-ND 4.0
+├── LICENSE                         # MIT License
 └── archive/                        # Previous versions
 ```
 
@@ -168,11 +168,11 @@ Ultimate Downloader/
 
 ## 📜 License
 
-This project is licensed under [CC BY-NC-ND 4.0](LICENSE).
+This project is licensed under the [MIT License](LICENSE).
 
-- ✅ You may view and use this code for personal, non-commercial purposes
-- ❌ You may not modify, distribute derivatives, or use commercially
-- ✅ You must give appropriate credit to the author
+- ✅ Free to use, modify, and distribute
+- ✅ Commercial use allowed
+- ✅ Just include the copyright notice
 
 ---
 
