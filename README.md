@@ -28,7 +28,7 @@ A powerful Google Colab-based tool for downloading media from multiple sources d
 Create a new Colab notebook and paste this one-liner into a cell:
 
 ```python
-import requests; exec(requests.get("https://raw.githubusercontent.com/xersbtt/ultimate-downloader-colab/main/ultimate_downloader_v4.28.py").text)
+import requests; exec(requests.get("https://raw.githubusercontent.com/xersbtt/ultimate-downloader-colab/main/ultimate_downloader.py").text)
 ```
 
 Run the cell and the UI will appear automatically.
@@ -156,7 +156,8 @@ For age-restricted or member-only content:
 
 ```
 Ultimate Downloader/
-├── ultimate_downloader_v4.28.py   # Latest version
+├── ultimate_downloader.py          # Latest version (always current)
+├── ultimate_downloader_v4.28.py   # Versioned snapshot
 ├── CHANGELOG.md                    # Version history
 ├── README.md                       # This file
 ├── LICENSE                         # CC BY-NC-ND 4.0
