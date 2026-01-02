@@ -1,10 +1,47 @@
 # Ultimate Downloader Changelog
 
-Comprehensive changelog documenting all changes from v1.0 to v4.28.
+Comprehensive changelog documenting all changes from v1.0 to v4.29.
 
 ---
 
-## v4.28 (Latest)
+## v4.29 (Latest)
+**Theme: YouTube Playlist Individual Video Tracking**
+
+### 🐛 Bug Fixes
+- **Fixed completion message showing "1 task"**: Playlists now report individual video counts instead of counting the playlist URL as one task
+  - Before: "All 1 tasks completed successfully!" for a 43-video playlist
+  - After: "All 35 downloads completed successfully!" or "⚠️ Completed with 35 success, 8 failed"
+- **Fixed resume not offered after partial playlist failures**: When some videos in a playlist fail (e.g., auth errors), the session is now preserved for retry
+  - `process_youtube_link` now returns `(success_count, fail_count, total_count)` tuple
+  - YouTube task status is set to "failed" if any videos failed
+  - Session only cleared when all downloads actually succeed
+- **Fixed None entries in playlists**: Unavailable videos in playlist metadata are now counted as failures instead of causing silent issues
+- **Fixed playlist range not preserved on resume**: Session now saves and restores `playlist_range` so resumed downloads use the original filter
+
+### ✨ New Features
+- **Settings Panel (⚙️ button)**: Comprehensive settings UI with:
+  - **🔑 API Keys Status**: Shows ✅/❌ for Gofile and Real-Debrid tokens
+  - **🍪 Cookie Upload**: Upload cookies.txt directly from the UI for YouTube Premium/age-restricted content
+  - **🗑️ Clear Data**: Delete history.json, yt_history.txt, or session.json
+  - All clear actions require confirmation before deletion
+- **Restart Runtime Button**: Appears when downloads have failures, enables seamless resume workflow
+- **Subtitle Language Selection**: Queue Preview now includes language selector for YouTube subtitles (12 languages available)
+
+### 🐛 Bug Fixes
+- **Improved Filename Parsing**: Fixed issue where episode titles/info were sometimes incorrectly included in the parsed Show Name. The parser now strictly prioritizes the *earliest* detected episode pattern (e.g., "第1集") to cleaner split the show name from episode details.
+
+### 🔧 Improvements
+- Each YouTube video download now tracked individually for success/failure
+- Completion message shows accurate counts from all download types combined
+- **Improved show name cleaning**: Now strips common YouTube prefixes like VIETSUB, ENGSUB, THUYẾT MINH, etc.
+- **UI Polish**: 
+  - Renamed "Resume Previous" to "Resume Previous Session" for clarity
+  - Fixed button widths to prevent text cutoff
+  - Added YouTube download summary stats (succeeded/failed counts)
+
+---
+
+## v4.28
 **Theme: YouTube Playlist Bug Fix & International Episode Patterns**
 
 ### 🐛 Bug Fixes
@@ -399,4 +436,5 @@ Comprehensive changelog documenting all changes from v1.0 to v4.28.
 | v4.25 | Parallel downloads and session resume |
 | v4.27 | Queue management, file host routing, download history |
 | v4.28 | YouTube playlist fix, international episode patterns |
+| v4.29 | Playlist individual video tracking and resume fix |
 

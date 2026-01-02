@@ -78,7 +78,7 @@ Files are saved to these folders in your Google Drive:
 - `My Drive/TV Shows/` - Detected TV episodes
 - `My Drive/Movies/` - Detected movies
 - `My Drive/YouTube/` - YouTube downloads without episode patterns
-- `My Drive/Ultimate Downloader/` - Config files (session.json, history.json)
+- `My Drive/Ultimate Downloader/` - Config files (session.json, history.json, yt_history.txt)
 
 ---
 
@@ -124,9 +124,18 @@ The downloader recognizes these naming patterns:
 
 For age-restricted or member-only content:
 
-1. Export cookies from your browser (use a cookies.txt extension)
-2. Upload to `/content/cookies.txt` in Colab
+1. Click ⚙️ Settings → Upload Cookies button
+2. Select your `cookies.txt` file (exported from browser)
 3. The downloader will auto-detect and use them
+
+---
+
+## 🔤 Subtitle Languages
+
+When using the Queue Preview, you can select which subtitle languages to download:
+- Default: English + Vietnamese
+- Available: 12 languages (en, vi, zh, ja, ko, th, id, es, fr, de, pt, ru)
+- Works for both video downloads and subtitles-only mode
 
 ---
 
@@ -136,7 +145,10 @@ For age-restricted or member-only content:
 |--------|--------|
 | **Start Download** | Download videos and organize to Drive |
 | **Download Subtitles Only** | Fetch subtitles from YouTube without downloading videos |
-| **Resume Previous** | Resume interrupted session (appears when session exists) |
+| **Resume Previous Session** | Resume interrupted session (appears when session exists) |
+| **🔄 Restart Runtime** | Restart Colab runtime (appears after failures for easy resume) |
+| **📜 (History)** | View last 10 downloads from history log |
+| **⚙️ (Settings)** | Upload cookies, view API key status, clear history/session files |
 
 ---
 
@@ -148,7 +160,8 @@ For age-restricted or member-only content:
 | "RD Timeout" | Torrent not cached, try a different magnet |
 | "Mega Error" | Link invalid or requires login |
 | Files not detected as TV | Use "Show Name" override field |
-| YouTube age-restricted | Upload cookies.txt to /content/ |
+| YouTube age-restricted | Upload cookies.txt via ⚙️ Settings button |
+| YouTube videos skipping | Clear YT archive via ⚙️ Settings button |
 
 ---
 
@@ -157,7 +170,7 @@ For age-restricted or member-only content:
 ```
 Ultimate Downloader/
 ├── ultimate_downloader.py          # Latest version (always current)
-├── ultimate_downloader_v4.28.py   # Versioned snapshot
+├── ultimate_downloader_v4.29.py   # Versioned snapshot
 ├── CHANGELOG.md                    # Version history
 ├── README.md                       # This file
 ├── LICENSE                         # MIT License
