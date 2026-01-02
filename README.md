@@ -1,4 +1,4 @@
-# 🚀 Ultimate Downloader
+![Ultimate Downloader](banner.png)
 
 A powerful Google Colab-based tool for downloading media from multiple sources directly to Google Drive with automatic Plex-friendly organization.
 
