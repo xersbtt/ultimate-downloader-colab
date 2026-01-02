@@ -1,4 +1,4 @@
-![Ultimate Downloader](banner.png)
+![Ultimate Downloader](banner_2x1.png)
 
 A powerful Google Colab-based tool for downloading media from multiple sources directly to Google Drive with automatic Plex-friendly organization.
 
@@ -170,7 +170,7 @@ When using the Queue Preview, you can select which subtitle languages to downloa
 ```
 Ultimate Downloader/
 ├── ultimate_downloader.py          # Latest version (always current)
-├── ultimate_downloader_v4.29.py   # Versioned snapshot
+├── ultimate_downloader_v4.29.py    # Versioned snapshot
 ├── CHANGELOG.md                    # Version history
 ├── README.md                       # This file
 ├── LICENSE                         # MIT License
