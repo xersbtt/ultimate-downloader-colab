@@ -1,10 +1,45 @@
 # Ultimate Downloader Changelog
 
-Comprehensive changelog documenting all changes from v1.0 to v4.29.
+Comprehensive changelog documenting all changes from v1.0 to v4.30.
 
 ---
 
-## v4.29 (Latest)
+## v4.30 (Latest)
+**Theme: Enhanced Progress Display & Download Resilience**
+
+### ⚠️ Experimental Features
+- **YouTube Cookies (Experimental)**: Re-added cookie upload/clear functionality with warnings
+  - Cookies may cause "Requested format is not available" errors due to IP mismatch or session expiry
+  - New **🗑️ Clear Cookies** button in Settings to quickly fix cookie-related errors
+  - Marked as "(Experimental)" in the UI to set expectations
+
+### ✨ New Features
+- **Progress Display Improvements**: Enhanced download progress with real-time metrics
+  - Aggregated download speed (MB/s) across all active downloads
+  - Single downloads show real-time progress (0% → 100%)
+  - Batch downloads show completed/total progress
+  - Persistent speed display (no flickering)
+- **Automatic Retry for Failed Downloads**: Resilient handling of transient failures
+  - Failed downloads automatically retried up to 2 more times (3 total attempts)
+  - Session auto-saved after failures for easy retry via "Resume Previous"
+  - Failed files listed in summary
+- **Conditional Subtitle Selector**: Only shows for streaming links (YouTube, Vimeo, etc.)
+- **Auto-update yt-dlp**: Always upgrades to latest version on each run
+- **Thread-safe output**: Print lock prevents interleaved messages during parallel downloads
+
+### 🐛 Bug Fixes
+- **Fixed episode numbering for Chinese release formats**: Files with trailing numbers like `[Jiang Hu] Three Kingdoms 2010 HD 01.mp4` now correctly detect episode numbers
+  - Before: All files named `Show Name - S01E01.mp4` (all skipped as duplicates)
+  - After: Correctly increments to `S01E01.mp4`, `S01E02.mp4`, etc.
+- **New trailing number pattern**: Added `sxe_trailing` regex to catch formats not covered by existing patterns:
+  - `HD 01`, `HD 02` (common Chinese release format)
+  - Trailing numbers before extension: `filename 05.mp4`
+  - Numbers after dashes: `Show Name - 03.mp4`
+- **Smart filtering**: Trailing pattern excludes years (1900-2099) and resolutions (360, 480, 720, 1080, 2160, 4320) to avoid false positives
+
+---
+
+## v4.29
 **Theme: YouTube Playlist Individual Video Tracking**
 
 ### 🐛 Bug Fixes
@@ -21,7 +56,6 @@ Comprehensive changelog documenting all changes from v1.0 to v4.29.
 ### ✨ New Features
 - **Settings Panel (⚙️ button)**: Comprehensive settings UI with:
   - **🔑 API Keys Status**: Shows ✅/❌ for Gofile and Real-Debrid tokens
-  - **🍪 Cookie Upload**: Upload cookies.txt directly from the UI for YouTube Premium/age-restricted content
   - **🗑️ Clear Data**: Delete history.json, yt_history.txt, or session.json
   - All clear actions require confirmation before deletion
 - **Restart Runtime Button**: Appears when downloads have failures, enables seamless resume workflow
@@ -437,4 +471,5 @@ Comprehensive changelog documenting all changes from v1.0 to v4.29.
 | v4.27 | Queue management, file host routing, download history |
 | v4.28 | YouTube playlist fix, international episode patterns |
 | v4.29 | Playlist individual video tracking and resume fix |
+| v4.30 | Trailing number episode detection for Chinese releases |
 
