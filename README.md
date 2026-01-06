@@ -69,7 +69,7 @@ Files will be organized and saved to your Google Drive.
 | **Gofile Token** | API token for private Gofile folders |
 | **RD Token** | Real-Debrid API key for premium links/magnets |
 | **Show Name** | Override auto-detected show name for all files |
-| **Playlist Range** | Select specific YouTube playlist items: `1,3,5-10` or leave empty for all |
+| **Playlist Range** | Select specific YouTube playlist items: `1,3,5-10` or leave empty for all. **Note:** Ignored when downloading multiple playlist URLs (single videos are unaffected). |
 | **Parallel DLs** | Number of concurrent downloads (1-5, applies to Gofile/Pixeldrain/RD/HTTP) |
 
 ### Drive Folders

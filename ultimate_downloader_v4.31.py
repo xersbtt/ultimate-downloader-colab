@@ -64,6 +64,7 @@ MIN_FILE_SIZE_MB = 10
 KEEP_EXTENSIONS = {'.srt', '.ass', '.sub', '.vtt'}
 SESSION_FILE = f"{UD_CONFIG_PATH}session.json"
 HISTORY_FILE = f"{UD_CONFIG_PATH}history.json"
+SETTINGS_FILE = f"{UD_CONFIG_PATH}settings.json"
 COOKIE_PATH = f"{COLAB_ROOT}cookies.txt"
 MAX_CONCURRENT_DEFAULT = 3
 
@@ -102,11 +103,11 @@ batch_start_time: Optional[float] = None  # Track when batch started for overall
 last_display_speed: float = 0.0  # Persist last known speed to prevent flickering
 
 # --- UI ELEMENTS ---
-token_gf = widgets.Text(description='Gofile:', placeholder='Optional (Required for private)', value=get_colab_secret('GOFILE_TOKEN'))
-token_rd = widgets.Text(description='RD Token:', placeholder='Real-Debrid API Key', value=get_colab_secret('RD_TOKEN'))
-show_name_override = widgets.Text(description='Show Name:', placeholder='Optional (Forces Name)', style={'description_width': 'initial'})
-playlist_selection = widgets.Text(description='Playlist Range:', placeholder='e.g. 1,3,5-10 (Empty = All)', style={'description_width': 'initial'}, layout=widgets.Layout(width='250px'))
-concurrent_slider = widgets.IntSlider(value=MAX_CONCURRENT_DEFAULT, min=1, max=5, description='Parallel DLs:', style={'description_width': 'initial'})
+token_gf = widgets.Text(description='Gofile:', placeholder='Optional', value=get_colab_secret('GOFILE_TOKEN'), style={'description_width': '80px'}, layout=widgets.Layout(width='270px'))
+token_rd = widgets.Text(description='RD Token:', placeholder='Real-Debrid API Key', value=get_colab_secret('RD_TOKEN'), style={'description_width': '100px'}, layout=widgets.Layout(width='290px'))
+show_name_override = widgets.Text(description='Show Name:', placeholder='Optional (Forces Name)', style={'description_width': '80px'}, layout=widgets.Layout(width='270px'))
+playlist_selection = widgets.Text(description='Playlist Range:', placeholder='e.g. 1,3,5-10 (Empty = All)', style={'description_width': '100px'}, layout=widgets.Layout(width='290px'))
+concurrent_slider = widgets.IntSlider(value=MAX_CONCURRENT_DEFAULT, min=1, max=5, description='Parallel DLs:', style={'description_width': '80px'})
 
 text_area = widgets.Textarea(description='Links:', placeholder='Paste Links Here (Transfer.it, Mega, YouTube, etc.)...', layout=widgets.Layout(width='98%', height='150px'))
 btn = widgets.Button(description="Start Download", button_style='success', icon='download')
@@ -143,11 +144,158 @@ confirm_box = widgets.HBox([confirm_message, btn_confirm_yes, btn_confirm_cancel
 # Track which action is pending confirmation
 pending_action = {'type': None}
 
+# Directory configuration widgets with browse buttons
+dir_tv_input = widgets.Text(value=DRIVE_TV_PATH, description='TV Shows:', layout=widgets.Layout(width='250px'), style={'description_width': '80px'})
+dir_movie_input = widgets.Text(value=DRIVE_MOVIE_PATH, description='Movies:', layout=widgets.Layout(width='250px'), style={'description_width': '80px'})
+dir_youtube_input = widgets.Text(value=DRIVE_YOUTUBE_PATH, description='YouTube:', layout=widgets.Layout(width='250px'), style={'description_width': '80px'})
+
+btn_browse_tv = widgets.Button(description='📁', tooltip='Browse Drive folders', layout=widgets.Layout(width='35px'))
+btn_browse_movie = widgets.Button(description='📁', tooltip='Browse Drive folders', layout=widgets.Layout(width='35px'))
+btn_browse_youtube = widgets.Button(description='📁', tooltip='Browse Drive folders', layout=widgets.Layout(width='35px'))
+
+# Folder browser state
+browser_state = {'current_path': '', 'target_widget': None, 'active': False}
+
+# Browser UI widgets
+browser_path_label = widgets.HTML("")
+browser_folder_list = widgets.Select(options=[], description='', layout=widgets.Layout(width='320px', height='120px'))
+btn_browser_up = widgets.Button(description='⬆️ Up', layout=widgets.Layout(width='60px'))
+btn_browser_open = widgets.Button(description='� Open', layout=widgets.Layout(width='70px'))
+btn_browser_select = widgets.Button(description='✓ Select', button_style='success', layout=widgets.Layout(width='70px'))
+btn_browser_close = widgets.Button(description='✕', button_style='danger', layout=widgets.Layout(width='35px'))
+new_folder_input = widgets.Text(placeholder='New folder name', layout=widgets.Layout(width='150px'))
+btn_create_folder = widgets.Button(description='➕ Create', button_style='info', layout=widgets.Layout(width='90px'))
+
+browser_ui = widgets.VBox([
+    widgets.HBox([browser_path_label, btn_browser_close]),
+    browser_folder_list,
+    widgets.HBox([btn_browser_up, btn_browser_open, btn_browser_select]),
+    widgets.HBox([new_folder_input, btn_create_folder])
+], layout=widgets.Layout(display='none', border='1px solid #888', padding='5px', margin='5px 0'))
+
+def get_folders_in_path(path):
+    """Get list of folders in the given path."""
+    folders = []
+    try:
+        full_path = os.path.join(DRIVE_BASE, path) if path else DRIVE_BASE
+        for item in os.listdir(full_path):
+            item_path = os.path.join(full_path, item)
+            if os.path.isdir(item_path) and not item.startswith('.'):
+                folders.append(item)
+        folders.sort()
+    except Exception:
+        pass
+    return folders
+
+def update_browser_ui():
+    """Update the browser UI with current path contents."""
+    path = browser_state['current_path']
+    display_path = f"📁 /{path}" if path else "📁 / (Drive Root)"
+    browser_path_label.value = f"<b>{display_path}</b>"
+    folders = get_folders_in_path(path)
+    browser_folder_list.options = folders if folders else ['(empty)']
+    browser_folder_list.value = folders[0] if folders else None
+
+def open_browser(target_widget):
+    """Open the folder browser for the given input widget."""
+    def handler(b):
+        # Check if Drive is mounted
+        if not os.path.exists(DRIVE_BASE):
+            dir_status.value = "<small style='color:orange'>⚠️ Mount Drive first (run a download)</small>"
+            return
+        browser_state['target_widget'] = target_widget
+        browser_state['current_path'] = ''
+        browser_state['active'] = True
+        browser_ui.layout.display = 'block'
+        update_browser_ui()
+        dir_status.value = "<small>Navigate folders, then click ✓ Select</small>"
+    return handler
+
+def on_browser_up(b):
+    """Navigate up one directory level."""
+    path = browser_state['current_path']
+    if path:
+        parent = os.path.dirname(path)
+        browser_state['current_path'] = parent
+        update_browser_ui()
+
+def on_browser_open(b):
+    """Navigate into the selected folder."""
+    selected = browser_folder_list.value
+    if selected and selected != '(empty)':
+        path = browser_state['current_path']
+        new_path = os.path.join(path, selected) if path else selected
+        browser_state['current_path'] = new_path
+        update_browser_ui()
+
+def on_browser_select(b):
+    """Select the current folder or selected subfolder."""
+    selected = browser_folder_list.value
+    path = browser_state['current_path']
+    # If a folder is selected, use that; otherwise use current path
+    if selected and selected != '(empty)':
+        final_path = os.path.join(path, selected) if path else selected
+    else:
+        final_path = path
+    if browser_state['target_widget']:
+        browser_state['target_widget'].value = final_path
+    browser_ui.layout.display = 'none'
+    browser_state['active'] = False
+    dir_status.value = f"<small style='color:green'>✓ Set to: {final_path}</small>"
+
+def on_browser_close(b):
+    """Close the folder browser."""
+    browser_ui.layout.display = 'none'
+    browser_state['active'] = False
+    dir_status.value = ""
+
+def on_create_folder(b):
+    """Create new folder in current browsing path."""
+    folder_name = new_folder_input.value.strip()
+    if not folder_name:
+        dir_status.value = "<small style='color:orange'>⚠️ Enter a folder name</small>"
+        return
+    try:
+        path = browser_state['current_path']
+        base = os.path.join(DRIVE_BASE, path) if path else DRIVE_BASE
+        new_path = os.path.join(base, folder_name)
+        if os.path.exists(new_path):
+            dir_status.value = f"<small style='color:orange'>⚠️ '{folder_name}' already exists</small>"
+            return
+        os.makedirs(new_path)
+        new_folder_input.value = ""
+        update_browser_ui()
+        # Select the new folder
+        browser_folder_list.value = folder_name
+        dir_status.value = f"<small style='color:green'>✅ Created '{folder_name}'</small>"
+    except Exception as e:
+        dir_status.value = f"<small style='color:red'>❌ Error: {e}</small>"
+
+btn_browse_tv.on_click(open_browser(dir_tv_input))
+btn_browse_movie.on_click(open_browser(dir_movie_input))
+btn_browse_youtube.on_click(open_browser(dir_youtube_input))
+btn_browser_up.on_click(on_browser_up)
+btn_browser_open.on_click(on_browser_open)
+btn_browser_select.on_click(on_browser_select)
+btn_browser_close.on_click(on_browser_close)
+btn_create_folder.on_click(on_create_folder)
+
+dir_config_row = widgets.VBox([
+    widgets.HBox([dir_tv_input, btn_browse_tv]),
+    widgets.HBox([dir_movie_input, btn_browse_movie]),
+    widgets.HBox([dir_youtube_input, btn_browse_youtube]),
+    browser_ui
+])
+dir_status = widgets.HTML("")
+
 settings_buttons = widgets.HBox([btn_clear_history, btn_clear_ytarchive, btn_clear_session, btn_settings_close])
 cookie_row = widgets.HBox([btn_upload_cookies, btn_clear_cookies, cookie_status])
 settings_ui = widgets.VBox([
     widgets.HTML("<b>⚙️ Settings & File Management</b>"),
-    widgets.HTML("<small><b>🔑 API Keys:</b></small>"),
+    widgets.HTML("<small><b>� Download Directories (relative to Google Drive):</b></small>"),
+    dir_config_row,
+    dir_status,
+    widgets.HTML("<small><b>�🔑 API Keys:</b></small>"),
     secrets_status,
     widgets.HTML("<small><b>🍪 YouTube Cookies (Experimental):</b></small>"),
     cookie_row,
@@ -156,6 +304,63 @@ settings_ui = widgets.VBox([
     confirm_box,
     settings_status
 ], layout=widgets.Layout(display='none', padding='10px', border='1px solid #ccc', margin='5px 0'))
+
+# Helper functions to get current directory paths from widgets
+def get_tv_path():
+    """Get TV shows path from widget or default."""
+    return dir_tv_input.value.strip() or DRIVE_TV_PATH
+
+def get_movie_path():
+    """Get movies path from widget or default."""
+    return dir_movie_input.value.strip() or DRIVE_MOVIE_PATH
+
+def get_youtube_path():
+    """Get YouTube path from widget or default."""
+    return dir_youtube_input.value.strip() or DRIVE_YOUTUBE_PATH
+
+# --- SETTINGS PERSISTENCE ---
+def save_dir_settings():
+    """Save directory settings to settings.json."""
+    try:
+        if not os.path.exists(UD_CONFIG_PATH):
+            os.makedirs(UD_CONFIG_PATH, exist_ok=True)
+        settings = {
+            'tv_path': dir_tv_input.value.strip(),
+            'movie_path': dir_movie_input.value.strip(),
+            'youtube_path': dir_youtube_input.value.strip()
+        }
+        with open(SETTINGS_FILE, 'w') as f:
+            json.dump(settings, f)
+    except Exception:
+        pass  # Silently fail if Drive not mounted yet
+
+def load_dir_settings():
+    """Load directory settings from settings.json."""
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, 'r') as f:
+                settings = json.load(f)
+            if settings.get('tv_path'):
+                dir_tv_input.value = settings['tv_path']
+            if settings.get('movie_path'):
+                dir_movie_input.value = settings['movie_path']
+            if settings.get('youtube_path'):
+                dir_youtube_input.value = settings['youtube_path']
+    except Exception:
+        pass  # Use defaults if file doesn't exist or is invalid
+
+# Auto-save when directory inputs change
+def on_dir_change(change):
+    """Save settings when any directory input changes."""
+    if change['type'] == 'change' and change['name'] == 'value':
+        save_dir_settings()
+
+dir_tv_input.observe(on_dir_change, names='value')
+dir_movie_input.observe(on_dir_change, names='value')
+dir_youtube_input.observe(on_dir_change, names='value')
+
+# Try to load settings on startup (will work if Drive already mounted)
+load_dir_settings()
 
 
 # --- QUEUE MANAGEMENT UI ---
@@ -191,9 +396,10 @@ queue_ui = widgets.VBox([
 ], layout=widgets.Layout(display='none'))  # Hidden by default
 
 input_ui = widgets.VBox([
-    widgets.HTML("<h3>🚀 Ultimate Downloader v4.30</h3>"),
+    widgets.HTML("<h3>🚀 Ultimate Downloader v4.31</h3>"),
     widgets.HBox([token_gf, token_rd]),
-    widgets.HBox([show_name_override, playlist_selection, concurrent_slider]),
+    widgets.HBox([show_name_override, playlist_selection]),
+    widgets.HBox([concurrent_slider]),
     text_area,
     widgets.HBox([btn, btn_subs, btn_resume, btn_restart, btn_history, btn_settings]),
     settings_ui,
@@ -470,10 +676,54 @@ def show_queue_preview(tasks: List[DownloadTask], mode: str):
     pending_queue = tasks.copy()
     queue_mode = mode
     update_queue_display()
+    
+    # Hide subtitle options initially to prevent flash of old content
+    queue_options.layout.display = 'none'
     queue_ui.layout.display = 'block'
-    # Show subtitle selector only if streaming links (yt-dlp) are present
-    has_streaming = any(t.link_type == 'youtube' for t in tasks)
-    queue_options.layout.display = 'block' if has_streaming else 'none'
+    
+    # Check for YouTube/streaming links
+    youtube_tasks = [t for t in tasks if t.link_type == 'youtube']
+    has_streaming = len(youtube_tasks) > 0
+    
+    # Default full subtitle options
+    DEFAULT_SUBS = [('English', 'en'), ('Vietnamese', 'vi'), ('Chinese', 'zh'), ('Japanese', 'ja'), 
+                    ('Korean', 'ko'), ('Thai', 'th'), ('Indonesian', 'id'), ('Spanish', 'es'), 
+                    ('French', 'fr'), ('German', 'de'), ('Portuguese', 'pt'), ('Russian', 'ru')]
+    
+    if has_streaming:
+        # Check if any URL is a playlist OR there are multiple YouTube videos
+        has_playlist = any('list=' in t.url or '/playlist' in t.url for t in youtube_tasks)
+        has_multiple_videos = len(youtube_tasks) > 1
+        
+        if has_playlist or has_multiple_videos:
+            # For playlists or multiple videos, show full selector (can't efficiently check all)
+            subtitle_langs.options = DEFAULT_SUBS
+            subtitle_langs.value = ['en', 'vi']
+            queue_options.layout.display = 'block'
+            if has_playlist:
+                print("📋 Playlist detected - full subtitle languages available")
+            else:
+                print("📋 Multiple videos detected - full subtitle languages available")
+        else:
+            # For a single video only, fetch actual available subtitles
+            print("🔍 Checking available subtitles...")
+            available_subs = get_youtube_subtitles(youtube_tasks[0].url) if youtube_tasks else {}
+            
+            if available_subs:
+                # Update subtitle selector with available languages
+                subtitle_langs.options = [(name, code) for code, name in sorted(available_subs.items(), key=lambda x: x[1])]
+                # Pre-select English and Vietnamese if available
+                preselect = [code for code in ['en', 'vi', 'en-US', 'en-GB'] if code in available_subs]
+                subtitle_langs.value = preselect[:2] if preselect else []
+                queue_options.layout.display = 'block'
+                print(f"   ✓ Found {len(available_subs)} subtitle languages available")
+            else:
+                # No subtitles found - hide selector
+                queue_options.layout.display = 'none'
+                print("   ℹ️ No manual subtitles available for this video")
+    else:
+        queue_options.layout.display = 'none'
+    
     btn.disabled = True
     btn_subs.disabled = True
     print(f"📋 Queue loaded with {len(tasks)} items. Review and click 'Start Selected' to begin.")
@@ -702,13 +952,13 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
         year_match = re.search(r'\b(19|20)\d{2}\b', filename)
         if year_match: movie_name = clean_show_name(filename[:year_match.start()])
         elif source == "youtube":
-            return os.path.join(f"{DRIVE_BASE}{DRIVE_YOUTUBE_PATH}", filename), "YouTube"
+            return os.path.join(f"{DRIVE_BASE}{get_youtube_path()}", filename), "YouTube"
         else: movie_name = clean_show_name(os.path.splitext(filename)[0])
-        full_dir = os.path.join(f"{DRIVE_BASE}{DRIVE_MOVIE_PATH}", movie_name)
+        full_dir = os.path.join(f"{DRIVE_BASE}{get_movie_path()}", movie_name)
         if not dry_run and not os.path.exists(full_dir): os.makedirs(full_dir, exist_ok=True)
         return os.path.join(full_dir, filename), "Movies"
 
-    base_path = f"{DRIVE_BASE}{DRIVE_TV_PATH}"
+    base_path = f"{DRIVE_BASE}{get_tv_path()}"
     season_folder = f"Season {season_num:02d}"
     full_dir = os.path.join(base_path, show_name, season_folder)
     _, ext = os.path.splitext(filename)
@@ -724,8 +974,11 @@ def setup_environment(needs_mega, needs_ytdlp, needs_aria):
     # Try to load secrets again (may not have been accessible on initial load)
     check_and_load_secrets()
     
+    # Load saved directory settings from Drive
+    load_dir_settings()
+    
     # Create media folders and config folder
-    for p in [DRIVE_TV_PATH, DRIVE_MOVIE_PATH, DRIVE_YOUTUBE_PATH]:
+    for p in [get_tv_path(), get_movie_path(), get_youtube_path()]:
         full_p = f"{DRIVE_BASE}{p}"
         if not os.path.exists(full_p): os.makedirs(full_p)
     if not os.path.exists(UD_CONFIG_PATH): os.makedirs(UD_CONFIG_PATH)
@@ -776,8 +1029,85 @@ def ytdl_hook(d):
             progress_bar.value = 100
             progress_bar.description = "Done!"
 
-def process_youtube_link(url, mode="video") -> Tuple[int, int, int]:
-    """Process YouTube link. Returns (success_count, fail_count, total_count)."""
+def get_youtube_title(url: str) -> str:
+    """Quickly fetch video/playlist title for queue display."""
+    try:
+        import yt_dlp
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': True,  # Don't download, just get metadata
+            'skip_download': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info:
+                title = info.get('title', '')
+                # For playlists, show playlist name + count
+                if info.get('_type') == 'playlist':
+                    count = len(info.get('entries', []))
+                    return f"📋 {title} ({count} videos)"
+                return title[:60] + "..." if len(title) > 60 else title
+    except Exception:
+        pass
+    return ""  # Fall back to showing URL
+
+def get_youtube_subtitles(url: str) -> dict:
+    """Fetch available manual subtitles (not auto-generated) from YouTube video.
+    Returns dict of {lang_code: lang_name} or empty dict if none available.
+    """
+    try:
+        import yt_dlp
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+            'writesubtitles': True,
+            'listsubtitles': False,  # We'll get them from info dict
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info:
+                # For playlists, get subs from first available entry
+                if info.get('_type') == 'playlist':
+                    entries = info.get('entries', [])
+                    for entry in entries:
+                        if entry and entry.get('subtitles'):
+                            info = entry
+                            break
+                    else:
+                        return {}
+                
+                # Get manual subtitles only (not automatic_captions)
+                subtitles = info.get('subtitles', {})
+                if not subtitles:
+                    return {}
+                
+                # Build {code: name} dict
+                result = {}
+                for lang_code, formats in subtitles.items():
+                    # Skip if it's a weird format or live_chat
+                    if lang_code.startswith('live_chat'):
+                        continue
+                    # Get language name from first format or use code
+                    lang_name = formats[0].get('name', lang_code) if formats else lang_code
+                    # Clean up: "English" not "English - en"
+                    if ' - ' in lang_name:
+                        lang_name = lang_name.split(' - ')[0]
+                    result[lang_code] = lang_name
+                return result
+    except Exception:
+        pass
+    return {}
+
+def process_youtube_link(url, mode="video", apply_playlist_range=True) -> Tuple[int, int, int]:
+    """Process YouTube link. Returns (success_count, fail_count, total_count).
+    
+    Args:
+        url: YouTube URL to process
+        mode: 'video' or 'subtitles'
+        apply_playlist_range: If False, download all items (ignore playlist_selection)
+    """
     import yt_dlp
     print(f"   ▶️ Processing Video: {url}")
     with progress_lock:
@@ -789,7 +1119,8 @@ def process_youtube_link(url, mode="video") -> Tuple[int, int, int]:
     skip_count = 0
     
     archive_path = f"{UD_CONFIG_PATH}yt_history.txt"
-    playlist_items = normalize_playlist_range(playlist_selection.value)
+    # Only apply playlist range if flag is True and user provided a range
+    playlist_items = normalize_playlist_range(playlist_selection.value) if apply_playlist_range else None
     
     ydl_opts = {
         'outtmpl': f'{COLAB_ROOT}%(title)s.%(ext)s', 
@@ -1546,9 +1877,15 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str):
         yt_fail = 0
         if youtube_urls:
             print(f"\n▶️ Processing {len(youtube_urls)} YouTube links...")
+            # Only ignore playlist range when there are multiple actual playlist URLs
+            # Single videos don't use the range anyway, so we only care about playlists
+            playlist_url_count = sum(1 for u in youtube_urls if 'list=' in u or '/playlist' in u)
+            use_playlist_range = playlist_url_count <= 1
+            if not use_playlist_range and playlist_selection.value.strip():
+                print("   ℹ️ Multiple playlist URLs detected - playlist range ignored (downloading all videos)")
             for i, url in enumerate(youtube_urls, 1):
                 print(f"   [{i}/{len(youtube_urls)}] {url[:60]}...")
-                s, f, t = process_youtube_link(url, mode)
+                s, f, t = process_youtube_link(url, mode, apply_playlist_range=use_playlist_range)
                 yt_success += s
                 yt_fail += f
                 yt_success_cumulative += s
@@ -1727,8 +2064,13 @@ def execute_batch(mode: str, resume: bool = False):
             
             # Create session-compatible task list for saving
             all_tasks = parallel_tasks.copy()
+            
+            # Fetch YouTube titles for better queue display
             for url in youtube_urls:
-                all_tasks.append(DownloadTask(url=url, filename="", source="youtube", link_type="youtube"))
+                title = get_youtube_title(url) if 'yt_dlp' in dir() or True else ""
+                display_name = title if title else url[:50] + "..."
+                all_tasks.append(DownloadTask(url=url, filename=display_name, source="youtube", link_type="youtube"))
+            
             for url in mega_urls:
                 all_tasks.append(DownloadTask(url=url, filename="", source="mega", link_type="mega"))
             for url in rd_urls:
@@ -1794,8 +2136,13 @@ def execute_batch(mode: str, resume: bool = False):
         yt_fail = 0
         if youtube_urls:
             print(f"▶️ Processing {len(youtube_urls)} YouTube links...")
+            # Only ignore playlist range when there are multiple actual playlist URLs
+            playlist_url_count = sum(1 for u in youtube_urls if 'list=' in u or '/playlist' in u)
+            use_playlist_range = playlist_url_count <= 1
+            if not use_playlist_range and playlist_selection.value.strip():
+                print("   ℹ️ Multiple playlist URLs detected - playlist range ignored (downloading all videos)")
             for url in youtube_urls:
-                s, f, total = process_youtube_link(url, mode)
+                s, f, total = process_youtube_link(url, mode, apply_playlist_range=use_playlist_range)
                 yt_success += s
                 yt_fail += f
                 yt_success_cumulative += s

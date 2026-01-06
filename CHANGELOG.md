@@ -1,10 +1,39 @@
 # Ultimate Downloader Changelog
 
-Comprehensive changelog documenting all changes from v1.0 to v4.30.
+Comprehensive changelog documenting all changes from v1.0 to v4.31.
 
 ---
 
-## v4.30 (Latest)
+## v4.31 (Latest)
+**Theme: Configurable Download Directories & UI Polish**
+
+### ✨ New Features
+- **Configurable Download Directories**: Customize where downloads are saved
+  - New input fields in Settings for TV Shows, Movies, and YouTube paths
+  - Paths are relative to Google Drive root (e.g., `Media/TV Shows`)
+  - **Desktop-like Folder Browser**: Click 📁 to browse Drive folders
+    - Navigate into subfolders with ⬆️ Up and 📂 Open buttons
+    - Create new folders at any level with ➕ Create
+    - Select folders with ✓ Select button
+  - **Persistent Settings**: Directory preferences saved to `settings.json`
+    - Auto-saves when you change any directory input
+    - Automatically loads on startup and after Drive mounts
+
+### 🔧 Improvements
+- **YouTube Titles in Queue Preview**: Queue now shows video/playlist titles instead of raw URLs
+  - Playlists display item count (e.g., "📋 My Playlist (15 videos)")
+  - Uses fast metadata extraction without starting downloads
+- **Smarter Playlist Range**: Range selector now only ignored when downloading multiple playlist URLs
+  - Single videos + 1 playlist = range still applies to the playlist
+  - Multiple playlist URLs = range ignored (prevents confusion)
+- **Dynamic Subtitle Selector**: Shows only available subtitle languages from YouTube videos
+  - Single video: Fetches actual available manual subtitles (excludes auto-generated)
+  - Multiple videos or playlists: Shows full language selector
+  - Hidden when no subtitles are available on single videos
+
+---
+
+## v4.30
 **Theme: Enhanced Progress Display & Download Resilience**
 
 ### ⚠️ Experimental Features
@@ -472,4 +501,5 @@ Comprehensive changelog documenting all changes from v1.0 to v4.30.
 | v4.28 | YouTube playlist fix, international episode patterns |
 | v4.29 | Playlist individual video tracking and resume fix |
 | v4.30 | Trailing number episode detection for Chinese releases |
+| v4.31 | Configurable download directories with folder browser |
 
