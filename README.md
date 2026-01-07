@@ -232,8 +232,8 @@ No. Many sources work without it: YouTube, Mega.nz, Gofile, Pixeldrain, Vimeo, T
 
 **How do I get API tokens?**
 
-- **Gofile**: Log in at [gofile.io](https://gofile.io), go to Profile → API Token
-- **Real-Debrid**: Log in at [real-debrid.com](https://real-debrid.com), go to API → Generate Token
+- **Gofile**: Log in at [gofile.io](https://gofile.io), go to My Profile → Account Token
+- **Real-Debrid**: Log in at [real-debrid.com](https://real-debrid.com), go to My Devices
 
 **Can I run this locally instead of Colab?**
 
