@@ -14,7 +14,7 @@ A powerful Google Colab-based tool for downloading media from multiple sources d
 - **Smart Media Sorting**: Automatically organizes into Plex-compatible folder structures
   - TV Shows: `Show Name/Season XX/Show Name - S01E01.mkv`
   - Movies: `Movie Name/Movie Name.mkv`
-- **Archive Extraction**: Handles RAR, ZIP, 7Z with sequential extraction to save disk space
+- **Archive Extraction**: Handles RAR, ZIP, 7Z with sequential extraction to save Colab disk space
 - **Subtitle Preservation**: Keeps `.srt`, `.ass`, `.sub`, `.vtt` files regardless of size
 - **Duplicate Prevention**: Skips already-downloaded files across sessions
 - **Progress Tracking**: Real-time progress bar with speed display
@@ -25,13 +25,19 @@ A powerful Google Colab-based tool for downloading media from multiple sources d
 
 ### 1. Open in Google Colab
 
-Create a new Colab notebook and paste this one-liner into a cell:
+[Google Colab](https://colab.research.google.com/) is a free cloud-based Python environment that runs in your browser — no installation needed.
+
+1. Go to [colab.research.google.com](https://colab.research.google.com/)
+2. Click **New Notebook** (or File → New notebook)
+3. Paste this one-liner into a cell:
 
 ```python
 import requests; exec(requests.get("https://raw.githubusercontent.com/xersbtt/ultimate-downloader-colab/main/ultimate_downloader.py").text)
 ```
 
 Run the cell and the UI will appear automatically.
+
+> **Want to review the code first?** Open [`ultimate_downloader.py`](https://github.com/xersbtt/ultimate-downloader-colab/blob/main/ultimate_downloader.py), copy the entire contents, and paste directly into a Colab cell.
 
 ### 2. Configure API Keys (Optional)
 
@@ -74,11 +80,20 @@ Files will be organized and saved to your Google Drive.
 
 ### Drive Folders
 
-Files are saved to these folders in your Google Drive:
+**Default locations** (customizable via ⚙️ Settings):
 - `My Drive/TV Shows/` - Files with detected episode patterns (S01E01, Ep 1, 第5集, etc.)
 - `My Drive/Movies/` - Files without episode patterns (including downloads from Gofile, Pixeldrain, RD, etc.)
 - `My Drive/YouTube/` - YouTube downloads without episode patterns
-- `My Drive/Ultimate Downloader/` - Config files (session.json, history.json, yt_history.txt)
+- `My Drive/Ultimate Downloader/` - Config files (session.json, history.json, settings.json)
+
+**Customizing Download Directories:**
+1. Click ⚙️ Settings in the main UI
+2. Edit the path fields for TV Shows, Movies, or YouTube (paths relative to Drive root)
+3. Or click 📁 to browse your Drive folders with the folder picker:
+   - Navigate with ⬆️ Up and 📂 Open
+   - Create new folders with ➕ Create
+   - Select with ✓ Select
+4. Settings auto-save and persist across sessions
 
 ---
 
@@ -155,7 +170,7 @@ When using the Queue Preview, you can select which subtitle languages to downloa
 | **Resume Previous Session** | Resume interrupted session (appears when session exists) |
 | **🔄 Restart Runtime** | Restart Colab runtime (appears after failures for easy resume) |
 | **📜 (History)** | View last 10 downloads from history log |
-| **⚙️ (Settings)** | Manage cookies, view API key status, clear data files |
+| **⚙️ (Settings)** | Configure download directories, manage cookies, view API key status, clear data files |
 
 ---
 
@@ -172,15 +187,77 @@ When using the Queue Preview, you can select which subtitle languages to downloa
 
 ---
 
+## ❓ FAQ
+
+**Why use this instead of local download tools?**
+
+Colab provides free cloud compute with high-speed bandwidth, so downloads go directly to Google Drive without using your local internet or storage. Great for large files, slow connections, or when you want files ready on Drive for streaming to other devices.
+
+**I already have Real-Debrid — why not just use Stremio?**
+
+Stremio is for streaming; this is for downloading. Use this when you want to:
+- Build a permanent media library on Drive
+- Download for offline access or archival
+- Grab YouTube playlists, Mega links, or other sources Stremio doesn't support
+- Organize downloads into Plex-friendly folder structures automatically
+
+**Isn't this just a wrapper for yt-dlp/aria2?**
+
+Yes and no. It orchestrates multiple tools (yt-dlp, aria2, megatools, unrar) under one UI, but adds significant value:
+- Unified interface for 35+ sources including premium hosts via Real-Debrid
+- Automatic Plex-compatible organization (Show/Season/Episode structure)
+- Parallel downloads with session resume across Colab restarts
+- Queue management with preview, reordering, and selective downloads
+- Persistent history and duplicate prevention across sessions
+
+**Is it safe to run code from a URL?**
+
+The code is fully open-source — you can [review it on GitHub](https://github.com/xersbtt/ultimate-downloader-colab/blob/main/ultimate_downloader.py) or paste it directly into Colab instead of using the one-liner. Nothing is hidden.
+
+**Why did my downloads stop after a few hours?**
+
+Colab has a ~12 hour runtime limit (less if idle). If interrupted, just run the script again and click **Resume Previous Session** — your progress is saved to Drive.
+
+**Is there a storage limit?**
+
+Colab's temp disk is ~100GB, but downloads transfer directly to Google Drive, so you're only limited by your Drive quota (15GB free, more with Google One).
+
+**Do I need a Google account?**
+
+Yes — Google Colab and Google Drive both require a Google account.
+
+**Is Real-Debrid required?**
+
+No. Many sources work without it: YouTube, Mega.nz, Gofile, Pixeldrain, Vimeo, Twitch, and direct HTTP links. Real-Debrid unlocks 35+ premium file hosts.
+
+**How do I get API tokens?**
+
+- **Gofile**: Log in at [gofile.io](https://gofile.io), go to Profile → API Token
+- **Real-Debrid**: Log in at [real-debrid.com](https://real-debrid.com), go to API → Generate Token
+
+**Can I run this locally instead of Colab?**
+
+Not directly — the UI uses Colab-specific widgets (ipywidgets for Colab). However, the underlying tools (yt-dlp, aria2) work locally if you want to adapt it.
+
+**Can I use this on mobile?**
+
+Yes! Colab works in mobile browsers. The UI is functional on phones/tablets, though a larger screen is more comfortable.
+
+---
+
 ## 📁 File Structure
 
 ```
 Ultimate Downloader/
 ├── ultimate_downloader.py          # Latest version (always current)
-├── ultimate_downloader_v4.30.py    # Versioned snapshot
+├── ultimate_downloader_v4.31.py    # Versioned snapshot
+├── Ultimate_Downloader.ipynb       # Jupyter notebook launcher
+├── Ultimate Downloader.url         # Windows shortcut to Colab
 ├── CHANGELOG.md                    # Version history
 ├── README.md                       # This file
 ├── LICENSE                         # MIT License
+├── banner_2x1.png                  # GitHub banner image
+├── .gitignore                      # Git ignore rules
 └── archive/                        # Previous versions
 ```
 
