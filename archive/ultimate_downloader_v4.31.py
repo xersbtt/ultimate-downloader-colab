@@ -2074,7 +2074,11 @@ def execute_batch(mode: str, resume: bool = False):
             for url in mega_urls:
                 all_tasks.append(DownloadTask(url=url, filename="", source="mega", link_type="mega"))
             for url in rd_urls:
-                all_tasks.append(DownloadTask(url=url, filename="", source="rd", link_type="rd"))
+                # Distinguish between magnet links and other RD-related links
+                if "magnet:?" in url:
+                    all_tasks.append(DownloadTask(url=url, filename="", source="rd", link_type="magnet"))
+                else:
+                    all_tasks.append(DownloadTask(url=url, filename="", source="rd", link_type="rd"))
             
             # Save initial session
             save_session(all_tasks, gofile_token, rd_key, show_name_override.value.strip(), playlist_selection.value.strip())

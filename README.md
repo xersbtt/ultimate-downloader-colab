@@ -11,6 +11,7 @@ A powerful Google Colab-based tool for downloading media from multiple sources d
 - **Queue Management**: Preview, reorder, and select which files to download
 - **Download History**: Persistent log of completed downloads for debugging
 - **Real-Debrid Integration**: Unrestrict premium links and process magnet links
+- **Magnet File Selection**: Preview individual torrent files and choose which to download
 - **Smart Media Sorting**: Automatically organizes into Plex-compatible folder structures
   - TV Shows: `Show Name/Season XX/Show Name - S01E01.mkv`
   - Movies: `Movie Name/Movie Name.mkv`
@@ -103,7 +104,7 @@ Files will be organized and saved to your Google Drive.
 |--------|----------|---------------|
 | **Gofile** | Public/private folders, cookie auth | Parallel |
 | **Pixeldrain** | Direct file downloads | Parallel |
-| **Real-Debrid** | Link unrestricting, magnet processing | Parallel |
+| **Real-Debrid** | Link unrestricting, file selection from magnets | Parallel (cached) / Sequential (uncached) |
 | **Direct HTTP** | Any direct download URL | Parallel |
 | **Mega.nz** | Full download support | Sequential |
 | **YouTube** | Videos, playlists, subtitles | Sequential |
@@ -250,7 +251,7 @@ Yes! Colab works in mobile browsers. The UI is functional on phones/tablets, tho
 ```
 Ultimate Downloader/
 ├── ultimate_downloader.py          # Latest version (always current)
-├── ultimate_downloader_v4.31.py    # Versioned snapshot
+├── ultimate_downloader_v4.32.py    # Versioned snapshot
 ├── Ultimate_Downloader.ipynb       # Jupyter notebook launcher
 ├── Ultimate Downloader.url         # Windows shortcut to Colab
 ├── CHANGELOG.md                    # Version history

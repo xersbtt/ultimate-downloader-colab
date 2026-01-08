@@ -1,10 +1,32 @@
 # Ultimate Downloader Changelog
 
-Comprehensive changelog documenting all changes from v1.0 to v4.31.
+Comprehensive changelog documenting all changes from v1.0 to v4.32.
 
 ---
 
-## v4.31 (Latest)
+## v4.32 (Latest)
+**Theme: Magnet File Selection & Progress Bar Improvements**
+
+### ✨ New Features
+- **Magnet File Selection**: Magnet links are now resolved during queue preview
+  - Individual files from torrent are displayed with size info (e.g., "Episode.01.mkv (1.5 GB)")
+  - Select/deselect specific files before downloading
+  - Only downloads selected files (saves bandwidth and storage)
+  - Automatically filters out small files (<1MB) except subtitles
+
+### 🐛 Bug Fixes
+- **Fixed magnet links not downloading**: Magnet links were being incorrectly stored with `link_type="rd"` instead of `link_type="magnet"`, causing them to be completely skipped during processing
+- **Fixed aria2 progress not showing**: Removed `--console-log-level=warn` which was suppressing progress output
+
+### 🔧 Improvements
+- **Real-Debrid progress bar updates**: Progress bar now actively updates during magnet processing
+  - Shows RD caching progress (e.g., "RD: 45% cached") while torrent is being cached
+  - Shows download progress during file transfer (e.g., "DL: 67% (5.2MiB/s)")
+  - Extended cache timeout from 1 minute to 4 minutes for larger torrents
+
+---
+
+## v4.31
 **Theme: Configurable Download Directories & UI Polish**
 
 ### ✨ New Features
@@ -502,4 +524,5 @@ Comprehensive changelog documenting all changes from v1.0 to v4.31.
 | v4.29 | Playlist individual video tracking and resume fix |
 | v4.30 | Trailing number episode detection for Chinese releases |
 | v4.31 | Configurable download directories with folder browser |
+| v4.32 | Critical fix for magnet link downloads |
 
