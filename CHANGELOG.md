@@ -1,10 +1,42 @@
-# Ultimate Downloader Changelog
+# Changelog
 
-Comprehensive changelog documenting all changes from v1.0 to v4.32.
+All notable changes to the Ultimate Downloader will be documented in this file.
 
 ---
 
-## v4.32 (Latest)
+## v4.33 (Latest)
+**Theme: Streamlined Organization UI & Anime Mode**
+
+### ✨ New Features
+- **Auto-Organization Toggle**: Checkbox in main UI to enable/disable automatic file renaming
+  - When disabled, files download to a single "Downloads" folder with original filenames
+  - Force Name and Media Type options hide when disabled (not applicable)
+  - Setting persists across sessions
+- **Media Type Toggle**: Switch between "Movies/TV" and "Anime" modes
+  - Movies/TV: Organizes to `Movies/` and `TV Shows/` folders
+  - Anime: Organizes to `Anime Movies/` and `Anime Series/` folders
+  - All folder paths are configurable in Settings
+- **Force Name Enhancement**: "Force Name" field now works with all media types
+  - For TV shows: Forces the show name (e.g., `Force Name - S01E01.mkv`)
+  - For movies: Forces the folder and filename (e.g., `Force Name/Force Name.mkv`)
+
+### 🔧 Improvements
+- **Improved Movie Renaming**: Movie files are now renamed to match their folder name
+  - Before: `The.Matrix.1999.1080p.BluRay.mkv` in folder `The Matrix/`
+  - After: `The Matrix (1999).mkv` in folder `The Matrix (1999)/`
+  - Folder names now include the year for better Plex/media server compatibility
+- **Cleaner Main UI**: 
+  - Moved API token fields to Settings panel
+  - Removed duplicate auto-organise toggle from Settings
+  - Reorganised main UI for better workflow
+
+### 🐛 Bug Fixes
+- **Session Resume Data Loss**: Fixed critical bug where YouTube download stats were reset to 0 when parallel downloads completed during a session, causing inaccurate resume counts
+- **Subtitle Persistence**: Subtitle language selection is now saved to session and restored on resume
+
+---
+
+## v4.32
 **Theme: Magnet File Selection & Progress Bar Improvements**
 
 ### ✨ New Features
@@ -525,4 +557,5 @@ Comprehensive changelog documenting all changes from v1.0 to v4.32.
 | v4.30 | Trailing number episode detection for Chinese releases |
 | v4.31 | Configurable download directories with folder browser |
 | v4.32 | Critical fix for magnet link downloads |
+| v4.33 | Optional auto-organization toggle, anime mode |
 
