@@ -73,9 +73,9 @@ Files will be organized and saved to your Google Drive.
 
 | Field | Description |
 |-------|-------------|
-| **Gofile Token** | API token for private Gofile folders |
-| **RD Token** | Real-Debrid API key for premium links/magnets |
-| **Show Name** | Override auto-detected show name for all files |
+| **Auto-organise** | Toggle automatic file renaming and organisation (uncheck to save with original filenames to Downloads) |
+| **Force Name** | Override auto-detected name for folder/filename (works for both TV shows and movies) |
+| **Movies/TV \| Anime** | Toggle between regular folders (Movies, TV Shows) and anime folders (Anime Movies, Anime Series) |
 | **Playlist Range** | Select specific YouTube playlist items: `1,3,5-10` or leave empty for all. **Note:** Ignored when downloading multiple playlist URLs (single videos are unaffected). |
 | **Parallel DLs** | Number of concurrent downloads (1-5, applies to Gofile/Pixeldrain/RD/HTTP) |
 
@@ -83,9 +83,14 @@ Files will be organized and saved to your Google Drive.
 
 **Default locations** (customizable via ⚙️ Settings):
 - `My Drive/TV Shows/` - Files with detected episode patterns (S01E01, Ep 1, 第5集, etc.)
-- `My Drive/Movies/` - Files without episode patterns (including downloads from Gofile, Pixeldrain, RD, etc.)
+- `My Drive/Movies/` - Files without episode patterns
 - `My Drive/YouTube/` - YouTube downloads without episode patterns
+- `My Drive/Anime Series/` - TV shows when Anime mode is enabled
+- `My Drive/Anime Movies/` - Movies when Anime mode is enabled
+- `My Drive/Downloads/` - All files when Auto-organise is disabled (original filenames)
 - `My Drive/Ultimate Downloader/` - Config files (session.json, history.json, settings.json)
+
+> **API Keys**: Gofile and Real-Debrid tokens are configured in ⚙️ Settings. For security, use Colab Secrets (see Quick Start).
 
 **Customizing Download Directories:**
 1. Click ⚙️ Settings in the main UI
@@ -251,7 +256,7 @@ Yes! Colab works in mobile browsers. The UI is functional on phones/tablets, tho
 ```
 Ultimate Downloader/
 ├── ultimate_downloader.py          # Latest version (always current)
-├── ultimate_downloader_v4.32.py    # Versioned snapshot
+├── ultimate_downloader_v4.33.py    # Versioned snapshot
 ├── Ultimate_Downloader.ipynb       # Jupyter notebook launcher
 ├── Ultimate Downloader.url         # Windows shortcut to Colab
 ├── CHANGELOG.md                    # Version history
