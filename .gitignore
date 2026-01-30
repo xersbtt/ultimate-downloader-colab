@@ -60,3 +60,6 @@ cookies.txt
 
 # Antigravity workflows (local only)
 .agent/
+
+# UI Designer tool (local only)
+ui_designer.html

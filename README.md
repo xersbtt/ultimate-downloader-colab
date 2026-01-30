@@ -43,7 +43,7 @@ Run the cell and the UI will appear automatically.
 ### 2. Configure API Keys (Optional)
 
 **Option A: Manual Entry**  
-Enter your API keys directly in the UI fields when the widget appears.
+Click ⚙️ Settings and enter your Gofile/Real-Debrid tokens in the API Key fields.
 
 **Option B: Colab Secrets (Recommended)**  
 Store your keys securely in Colab Secrets:
@@ -61,9 +61,9 @@ magnet:?xt=urn:btih:...
 https://www.youtube.com/playlist?list=...
 ```
 
-### 4. Click "Start Download"
+### 4. Click "Resolve Links"
 
-Files will be organized and saved to your Google Drive.
+Review the queue preview, then click "Start Download". Files will be organized and saved to your Google Drive.
 
 ---
 
@@ -74,9 +74,9 @@ Files will be organized and saved to your Google Drive.
 | Field | Description |
 |-------|-------------|
 | **Auto-organise** | Toggle automatic file renaming and organisation (uncheck to save with original filenames to Downloads) |
-| **Force Name** | Override auto-detected name for folder/filename (works for both TV shows and movies) |
+| **Name** | Override auto-detected name for folder/filename (works for both TV shows and movies) |
 | **Movies/TV \| Anime** | Toggle between regular folders (Movies, TV Shows) and anime folders (Anime Movies, Anime Series) |
-| **Playlist Range** | Select specific YouTube playlist items: `1,3,5-10` or leave empty for all. **Note:** Ignored when downloading multiple playlist URLs (single videos are unaffected). |
+| **Category** | Force Movie or Series classification (Auto: detect from filename) |
 | **Parallel DLs** | Number of concurrent downloads (1-5, applies to Gofile/Pixeldrain/RD/HTTP) |
 
 ### Drive Folders
@@ -115,6 +115,7 @@ Files will be organized and saved to your Google Drive.
 | **YouTube** | Videos, playlists, subtitles | Sequential |
 | **Twitch** | VODs and clips | Sequential |
 | **Vimeo** | Video downloads | Sequential |
+| **Archive.org** | Videos, audio, documents (no DRM) | Sequential |
 | **TikTok** | Video downloads | Sequential |
 | **Dailymotion** | Video downloads | Sequential |
 | **SoundCloud** | Audio downloads | Sequential |
@@ -160,10 +161,12 @@ For Premium quality or members-only content:
 
 ## 🔤 Subtitle Languages
 
-When using the Queue Preview, you can select which subtitle languages to download:
+When YouTube videos are detected in the Queue Preview, you can select which subtitle languages to download:
 - Default: English + Vietnamese
 - Available: 12 languages (en, vi, zh, ja, ko, th, id, es, fr, de, pt, ru)
 - Works for both video downloads and subtitles-only mode
+
+**Playlist Range:** Also appears in Queue Preview when a YouTube playlist is detected. Use `1,3,5-10` syntax to select specific videos.
 
 ---
 
@@ -171,8 +174,9 @@ When using the Queue Preview, you can select which subtitle languages to downloa
 
 | Button | Action |
 |--------|--------|
-| **Start Download** | Download videos and organize to Drive |
-| **Download Subtitles Only** | Fetch subtitles from YouTube without downloading videos |
+| **Resolve Links** | Parse links and show Queue Preview for review |
+| **Start Download** | (In Queue) Download videos and organize to Drive |
+| **Download Subtitles** | (In Queue) Fetch subtitles from YouTube without downloading videos |
 | **Resume Previous Session** | Resume interrupted session (appears when session exists) |
 | **🔄 Restart Runtime** | Restart Colab runtime (appears after failures for easy resume) |
 | **📜 (History)** | View last 10 downloads from history log |
@@ -256,7 +260,7 @@ Yes! Colab works in mobile browsers. The UI is functional on phones/tablets, tho
 ```
 Ultimate Downloader/
 ├── ultimate_downloader.py          # Latest version (always current)
-├── ultimate_downloader_v4.33.py    # Versioned snapshot
+├── ultimate_downloader_v4.34.py    # Versioned snapshot
 ├── Ultimate_Downloader.ipynb       # Jupyter notebook launcher
 ├── Ultimate Downloader.url         # Windows shortcut to Colab
 ├── CHANGELOG.md                    # Version history

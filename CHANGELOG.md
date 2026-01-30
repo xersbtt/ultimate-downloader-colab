@@ -4,7 +4,37 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 
 ---
 
-## v4.33 (Latest)
+## v4.34 (Latest)
+**Theme: Archive.org Support & Category Override**
+
+### ✨ New Features
+- **Archive.org Support**: Download videos, audio, and documents from the Internet Archive
+  - `/details/` pages use yt-dlp for stream selection
+  - `/download/` direct links use aria2 for fast parallel downloads (up to 200MB/s!)
+  - No DRM, no authentication required
+- **Category Override**: New dropdown to force Movie or Series classification
+  - **Auto**: Detect from filename (default behavior)
+  - **Movie**: Force as movie regardless of episode patterns in filename
+  - **Series**: Force as series (uses S01E01 if no episode detected)
+  - Perfect for anime movies with episode-like numbers (e.g., "Dragon Ball - 1")
+
+### 🔧 Improvements
+- **Conditional Playlist Range Selector**: Moved playlist selection from main UI to queue preview
+  - Now only appears when a YouTube playlist is detected
+  - Reduces main UI clutter for the common case (single video downloads)
+- **Streamlined Download Flow**: Renamed and reorganized buttons for clarity
+  - "Start Download" → "Resolve Links" (reflects that it resolves and queues first)
+  - "Download Subtitles Only" moved to queue preview as "Download Subtitles"
+  - Queue now has separate "Start Download" and "Download Subtitles" buttons
+
+### 🐛 Bug Fixes
+- **Session Persistence**: Fixed subtitle selection and YouTube stats not persisting in Mega/RD sequential loops
+  - All `save_session` calls now include `subtitle_langs.value` and cumulative stats
+  - Resuming a session will now correctly restore the selected subtitle languages
+
+---
+
+## v4.33
 **Theme: Streamlined Organization UI & Anime Mode**
 
 ### ✨ New Features
@@ -558,4 +588,5 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 | v4.31 | Configurable download directories with folder browser |
 | v4.32 | Critical fix for magnet link downloads |
 | v4.33 | Optional auto-organization toggle, anime mode |
+| v4.34 | Archive.org support |
 
