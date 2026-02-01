@@ -4,7 +4,34 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 
 ---
 
-## v4.34 (Latest)
+## v5.0 (Latest)
+**Theme: Quick Download, Batch Detection & Global Episode Support**
+
+### ✨ New Features
+- **Quick Download Button**: New "Quick Download" button next to Resolve Links
+  - Download immediately without queue preview — minimal friction from pasting to downloading
+  - Respects auto-organise settings (Name, Category, Movies/TV toggle)
+  - Subtitle settings in Settings panel (checkbox + language selector, persist across sessions)
+- **Batch Episode Detection**: Smart detection analyzes all files in a batch together
+  - Finds varying patterns (episode numbers) vs constants (resolution, codec)
+  - Example: In `[1080P]...[01]..` through `[1080P]...[24]..`, identifies `[01]` as episode
+  - Much more reliable than single-file heuristics
+- **Fansub Episode Detection**: New `sxe_bracket` pattern for `[01]`, `[02]` format
+  - Correctly ignores resolution tags `[1080P]`, codec suffixes `[HEVC-10b]`
+  - High priority alongside S01E01 format
+
+### 🐛 Bug Fixes
+- **International Episode Detection**: Enhanced patterns for global naming
+  - Added Japanese `第X話` (e.g., `第1085話` → Episode 1085)
+  - Added Portuguese `Episodio X`, Vietnamese `Tập X`, Korean `X화`
+  - Fixed "Part X" in movie titles incorrectly detected as episodes
+  - Added 4-digit episode support, underscore-dash `_-_01_` format, space-separated `Show 01 Title` format
+- **Show Name Extraction**: Stops stripping brackets when content contains spaces (multi-word = show name)
+- **Subtitle Naming**: Fixed subtitle files including video ID in filename
+
+---
+
+## v4.34
 **Theme: Archive.org Support & Category Override**
 
 ### ✨ New Features
@@ -22,7 +49,7 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 - **Conditional Playlist Range Selector**: Moved playlist selection from main UI to queue preview
   - Now only appears when a YouTube playlist is detected
   - Reduces main UI clutter for the common case (single video downloads)
-- **Streamlined Download Flow**: Renamed and reorganized buttons for clarity
+- **Streamlined Download Flow**: Renamed and reorganised buttons for clarity
   - "Start Download" → "Resolve Links" (reflects that it resolves and queues first)
   - "Download Subtitles Only" moved to queue preview as "Download Subtitles"
   - Queue now has separate "Start Download" and "Download Subtitles" buttons
@@ -43,8 +70,8 @@ All notable changes to the Ultimate Downloader will be documented in this file.
   - Force Name and Media Type options hide when disabled (not applicable)
   - Setting persists across sessions
 - **Media Type Toggle**: Switch between "Movies/TV" and "Anime" modes
-  - Movies/TV: Organizes to `Movies/` and `TV Shows/` folders
-  - Anime: Organizes to `Anime Movies/` and `Anime Series/` folders
+  - Movies/TV: Organises to `Movies/` and `TV Shows/` folders
+  - Anime: Organises to `Anime Movies/` and `Anime Series/` folders
   - All folder paths are configurable in Settings
 - **Force Name Enhancement**: "Force Name" field now works with all media types
   - For TV shows: Forces the show name (e.g., `Force Name - S01E01.mkv`)
@@ -92,7 +119,7 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 **Theme: Configurable Download Directories & UI Polish**
 
 ### ✨ New Features
-- **Configurable Download Directories**: Customize where downloads are saved
+- **Configurable Download Directories**: Customise where downloads are saved
   - New input fields in Settings for TV Shows, Movies, and YouTube paths
   - Paths are relative to Google Drive root (e.g., `Media/TV Shows`)
   - **Desktop-like Folder Browser**: Click 📁 to browse Drive folders
@@ -429,7 +456,7 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 - **Show Name Override**: UI field to force a specific show name for all files
 - **Mega.nz Support**: Full support via `megadl` command with progress tracking
 - **Progress Bar**: Visual progress indicator for all download operations
-- **Multi-Part Detection**: Recognizes Chinese multi-part suffixes (上篇, 中篇, 下篇) and Part 1/2
+- **Multi-Part Detection**: Recognises Chinese multi-part suffixes (上篇, 中篇, 下篇) and Part 1/2
 - **Download Subtitles Only Button**: Separate mode for subtitle-only downloads
 - **Asian Episode Pattern**: Supports `第X集` format for Chinese drama naming
 
@@ -488,7 +515,7 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 **Theme: Asian Drama Support & Reporting**
 
 ### ✨ New Features
-- **Asian Drama Episode Pattern**: Recognizes `Ep01`, `E01`, `Episode 01` formats (implies Season 1)
+- **Asian Drama Episode Pattern**: Recognises `Ep01`, `E01`, `Episode 01` formats (implies Season 1)
 - **Mission Report**: Detailed summary at end showing TV/Movie/Failed counts with file lists
 - **Junk Filter**: Configurable `MIN_FILE_SIZE_MB` (15MB) to skip sample files, NFOs, text files
 

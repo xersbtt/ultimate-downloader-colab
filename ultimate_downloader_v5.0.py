@@ -130,11 +130,13 @@ auto_organize_checkbox = widgets.Checkbox(value=True, description='Auto-organise
 
 text_area = widgets.Textarea(description='Links:', placeholder='Paste Links Here (Transfer.it, Mega, YouTube, etc.)...', layout=widgets.Layout(width='98%', height='150px'))
 btn = widgets.Button(description="Resolve Links", button_style='success', icon='search')
+btn_quick = widgets.Button(description="Quick Download", button_style='primary', icon='bolt', tooltip='Download immediately without queue preview', layout=widgets.Layout(width='140px'))
 btn_subs = widgets.Button(description="Download Subtitles", button_style='info', icon='closed-captioning', layout=widgets.Layout(width='150px'))
 btn_resume = widgets.Button(description="Resume Previous Session", button_style='warning', icon='play', layout=widgets.Layout(display='none', width='180px'))
 btn_restart = widgets.Button(description="🔄 Restart Runtime", button_style='danger', tooltip='Restart runtime then Resume Previous Session', layout=widgets.Layout(display='none'))
 btn_history = widgets.Button(description="📜", button_style='', tooltip='View Download History', layout=widgets.Layout(width='40px'))
 btn_settings = widgets.Button(description="⚙️", button_style='', tooltip='Settings & Manage Files', layout=widgets.Layout(width='40px'))
+btn_about = widgets.Button(description="ℹ️", button_style='', tooltip='About', layout=widgets.Layout(width='40px'))
 progress_bar = widgets.FloatProgress(value=0.0, min=0.0, max=100.0, description='Idle', bar_style='info', layout=widgets.Layout(width='98%'))
 status_label = widgets.HTML(value="")
 
@@ -149,6 +151,17 @@ settings_status = widgets.HTML(value="")
 btn_upload_cookies = widgets.Button(description="📤 Upload Cookies", button_style='info', tooltip='Upload cookies.txt for YouTube Premium (experimental)', layout=widgets.Layout(width='140px'))
 btn_clear_cookies = widgets.Button(description="🗑️ Clear Cookies", button_style='warning', tooltip='Delete cookies.txt (fixes format errors)', layout=widgets.Layout(width='130px'))
 cookie_status = widgets.HTML(value="")
+
+# Quick Download subtitle settings
+quick_dl_subs_checkbox = widgets.Checkbox(value=False, description='Include Subtitles in Quick Downloads', indent=False, layout=widgets.Layout(width='250px'))
+quick_dl_subtitle_langs = widgets.SelectMultiple(
+    options=[('English', 'en'), ('Vietnamese', 'vi'), ('Chinese', 'zh'), ('Japanese', 'ja'), ('Korean', 'ko'), 
+             ('Thai', 'th'), ('Indonesian', 'id'), ('Spanish', 'es'), ('French', 'fr'), ('German', 'de'), ('Portuguese', 'pt'), ('Russian', 'ru')],
+    value=['en', 'vi'],
+    description='Languages:',
+    layout=widgets.Layout(width='220px', height='80px'),
+    style={'description_width': '70px'}
+)
 
 # Secrets status UI
 secrets_status = widgets.HTML(value="")
@@ -308,7 +321,7 @@ btn_browser_select.on_click(on_browser_select)
 btn_browser_close.on_click(on_browser_close)
 btn_create_folder.on_click(on_create_folder)
 
-# Organized folder config (shown when auto-organize is enabled)
+# Organised folder config (shown when auto-organise is enabled)
 organized_dir_config = widgets.VBox([
     widgets.HBox([dir_tv_input, btn_browse_tv]),
     widgets.HBox([dir_movie_input, btn_browse_movie]),
@@ -318,7 +331,7 @@ organized_dir_config = widgets.VBox([
     browser_ui
 ])
 
-# Simple downloads folder config (shown when auto-organize is disabled)
+# Simple downloads folder config (shown when auto-organise is disabled)
 downloads_dir_config = widgets.VBox([
     widgets.HBox([dir_downloads_input, btn_browse_downloads]),
     browser_ui
@@ -343,11 +356,54 @@ settings_ui = widgets.VBox([
     dir_status,
     widgets.HTML("<small><b>🍪 YouTube Cookies (Experimental):</b></small>"),
     cookie_row,
+    widgets.HTML("<small><b>⚡ Quick Download Options:</b></small>"),
+    widgets.HBox([quick_dl_subs_checkbox, quick_dl_subtitle_langs]),
     widgets.HTML("<small><b>🗑️ Clear Data:</b></small>"),
     settings_buttons,
     confirm_box,
     settings_status
 ], layout=widgets.Layout(display='none', padding='10px', border='1px solid #ccc', margin='5px 0'))
+
+# --- ABOUT UI ---
+btn_about_close = widgets.Button(description="Close", button_style='', layout=widgets.Layout(width='80px'))
+about_ui = widgets.VBox([
+    widgets.HTML("""
+        <div style='padding: 10px;'>
+            <h3>ℹ️ About Ultimate Downloader</h3>
+            <p><strong>Version:</strong> 5.0</p>
+            <p><strong>Author:</strong> xersbtt</p>
+            <p><strong>Repository:</strong> <a href='https://github.com/xersbtt/ultimate-downloader-colab' target='_blank'>github.com/xersbtt/ultimate-downloader-colab</a></p>
+            <hr>
+            <p><strong>Copyright © 2025-2026 xersbtt</strong></p>
+            <p><small>
+                Permission is hereby granted, free of charge, to any person obtaining a copy
+                of this software and associated documentation files (the "Software"), to deal
+                in the Software without restriction, including without limitation the rights
+                to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+                copies of the Software, and to permit persons to whom the Software is
+                furnished to do so, subject to the following conditions:<br><br>
+                The above copyright notice and this permission notice shall be included in all
+                copies or substantial portions of the Software.<br><br>
+                THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+                IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+                FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+            </small></p>
+            <p><strong>Licence:</strong> MIT</p>
+        </div>
+    """),
+    btn_about_close
+], layout=widgets.Layout(display='none', padding='10px', border='1px solid #ccc', margin='5px 0'))
+
+def toggle_about(b=None):
+    """Toggle about panel visibility."""
+    if about_ui.layout.display == 'none':
+        about_ui.layout.display = 'block'
+        settings_ui.layout.display = 'none'  # Close settings if open
+    else:
+        about_ui.layout.display = 'none'
+
+btn_about.on_click(toggle_about)
+btn_about_close.on_click(lambda b: setattr(about_ui.layout, 'display', 'none'))
 
 # Helper functions to get current directory paths from widgets
 def get_tv_path():
@@ -396,7 +452,9 @@ def save_dir_settings():
             'anime_series_path': dir_anime_series_input.value.strip(),
             'anime_movies_path': dir_anime_movies_input.value.strip(),
             'auto_organize': auto_organize_checkbox.value,
-            'media_type': media_type_toggle.value
+            'media_type': media_type_toggle.value,
+            'quick_dl_subs': quick_dl_subs_checkbox.value,
+            'quick_dl_langs': list(quick_dl_subtitle_langs.value)
         }
         with open(SETTINGS_FILE, 'w') as f:
             json.dump(settings, f)
@@ -432,12 +490,16 @@ def load_dir_settings(skip_ui_state=False):
                     auto_organize_checkbox.value = settings['auto_organize']
                 if settings.get('media_type'):
                     media_type_toggle.value = settings['media_type']
+                if 'quick_dl_subs' in settings:
+                    quick_dl_subs_checkbox.value = settings['quick_dl_subs']
+                if 'quick_dl_langs' in settings:
+                    quick_dl_subtitle_langs.value = tuple(settings['quick_dl_langs'])
             update_main_ui_visibility()
     except Exception:
         pass  # Use defaults if file doesn't exist or is invalid
 
 def update_folder_config_visibility():
-    """Show/hide appropriate folder config based on auto-organize checkbox."""
+    """Show/hide appropriate folder config based on auto-organise checkbox."""
     if auto_organize_checkbox.value:
         organized_dir_config.layout.display = 'block'
         downloads_dir_config.layout.display = 'none'
@@ -446,7 +508,7 @@ def update_folder_config_visibility():
         downloads_dir_config.layout.display = 'block'
 
 def update_main_ui_visibility():
-    """Show/hide Force Name and Media Type based on auto-organize checkbox."""
+    """Show/hide Force Name and Media Type based on auto-organise checkbox."""
     if auto_organize_checkbox.value:
         organize_options_row.layout.display = 'flex'
     else:
@@ -454,7 +516,7 @@ def update_main_ui_visibility():
     update_folder_config_visibility()
 
 def on_auto_organize_change(change):
-    """Handle auto-organize checkbox change."""
+    """Handle auto-organise checkbox change."""
     if change['type'] == 'change' and change['name'] == 'value':
         update_main_ui_visibility()
         save_dir_settings()
@@ -473,6 +535,8 @@ dir_downloads_input.observe(on_dir_change, names='value')
 dir_anime_series_input.observe(on_dir_change, names='value')
 dir_anime_movies_input.observe(on_dir_change, names='value')
 media_type_toggle.observe(on_dir_change, names='value')
+quick_dl_subs_checkbox.observe(on_dir_change, names='value')
+quick_dl_subtitle_langs.observe(on_dir_change, names='value')
 
 # Try to load settings on startup (will work if Drive already mounted)
 load_dir_settings()
@@ -520,13 +584,14 @@ organize_options_row = widgets.HBox([show_name_override, media_type_toggle, cate
     layout=widgets.Layout(display='flex' if auto_organize_checkbox.value else 'none'))
 
 input_ui = widgets.VBox([
-    widgets.HTML("<h3>🚀 Ultimate Downloader v4.34</h3>"),
+    widgets.HTML("<h3>🚀 Ultimate Downloader v5.0</h3>"),
     widgets.HBox([auto_organize_checkbox]),
     organize_options_row,
     widgets.HBox([concurrent_slider]),
     text_area,
-    widgets.HBox([btn, btn_resume, btn_restart, btn_history, btn_settings]),
+    widgets.HBox([btn, btn_quick, btn_resume, btn_restart, btn_history, btn_settings, btn_about]),
     settings_ui,
+    about_ui,
     queue_ui,
     progress_bar,
     status_label,
@@ -555,7 +620,7 @@ def save_session(tasks: List[DownloadTask], gofile_token: str = "", rd_token: st
     """Persist current download state to Drive."""
     try:
         session = {
-            "version": "4.34",
+            "version": "5.0",
             "started_at": datetime.now().isoformat(),
             "gofile_token": gofile_token,
             "rd_token": rd_token,
@@ -804,6 +869,15 @@ def show_queue_preview(tasks: List[DownloadTask], mode: str):
     global pending_queue, queue_mode
     pending_queue = tasks.copy()
     queue_mode = mode
+    
+    # Run batch episode analysis to improve episode detection accuracy
+    # This analyzes all filenames together to find the varying number (episode) vs constants
+    filenames = [t.filename for t in tasks if t.filename]
+    if len(filenames) >= 2:
+        batch_results = analyze_batch_episodes(filenames)
+        if batch_results:
+            print(f"   🎯 Batch analysis detected episode numbers in {len(batch_results)} files")
+    
     update_queue_display()
     
     # Hide subtitle and playlist options initially to prevent flash of old content
@@ -984,6 +1058,47 @@ def sanitize_filename(name: str) -> str:
     return name
 
 def clean_show_name(name: str) -> str:
+    # Strip leading bracketed content that looks like technical tags (not show names)
+    # Technical tags: resolutions, codecs, release groups (usually single words or known patterns)
+    # Show names: usually contain spaces (multiple words)
+    technical_pattern = r'(?i)^\s*\[(?:' \
+        r'\d{3,4}[pP]|' \
+        r'(?:HEVC|H\.?264|H\.?265|x264|x265|AVC|VP9|AV1)(?:-\d+bit)?|' \
+        r'(?:AAC|AC3|DTS|FLAC|MP3|Opus|TrueHD|Atmos)(?:\d\.\d)?|' \
+        r'(?:WEB-?DL|WEBRip|BluRay|BDRip|HDRip|DVDRip|HDTV|RAW)|' \
+        r'(?:HDR|HDR10|DV|Dolby\s*Vision|10bit|10-bit|8bit)|' \
+        r'[A-Za-z0-9_-]{1,20}' \
+        r')\]\s*'
+    
+    # Keep stripping technical-looking brackets from the start
+    while True:
+        # Check if next bracket is a technical tag (no spaces inside, or matches known patterns)
+        match = re.match(r'^\s*\[([^\]]*)\]', name)
+        if not match:
+            break
+        content = match.group(1)
+        # If bracket contains spaces, it's likely a show name - stop stripping
+        if ' ' in content and not re.match(r'(?i)^(WEB-?DL|Dolby\s*Vision|10\s*bit)$', content):
+            break
+        # Strip this bracket
+        name = name[match.end():]
+    
+    # Also strip leading parenthetical technical tags like (Hi10), (480p), (DragonFox)
+    while True:
+        match = re.match(r'^\s*\(([^)]*)\)', name)
+        if not match:
+            break
+        content = match.group(1)
+        # If parentheses contain spaces, might be show name - stop stripping
+        if ' ' in content:
+            break
+        # Known technical patterns to strip
+        if re.match(r'(?i)^(Hi10|10bit|x264|x265|HEVC|AVC|\d{3,4}p|WEB-?DL|BluRay|[A-Za-z0-9_-]{1,15})$', content):
+            name = name[match.end():]
+            continue
+        # Unknown single word - stop to be safe
+        break
+    
     # Remove common YouTube prefixes (VIETSUB, ENGSUB, THUYẾT MINH, etc.)
     name = re.sub(r'(?i)^\s*(?:VIETSUB|VietSub|ENGSUB|EngSub|ENG\s*SUB|VIET\s*SUB|THUYẾT\s*MINH|RAW|FULL|HD)\s*[|｜:：\-–—]\s*', '', name)
     # Remove technical tags in brackets or standalone
@@ -1006,6 +1121,138 @@ def is_safe_path(base_dir: str, filename: str) -> bool:
     except Exception:
         return False
 
+# --- BATCH EPISODE DETECTION ---
+# Global cache for batch analysis results
+_batch_episode_cache: Dict[str, int] = {}  # filename -> detected episode number
+
+def analyze_batch_episodes(filenames: List[str]) -> Dict[str, int]:
+    """
+    Analyze a batch of filenames to detect episode numbers by finding varying patterns.
+    
+    Strategy: Find number patterns that vary sequentially across files (likely episodes)
+    vs patterns that are constant (resolutions, codecs, etc).
+    
+    Returns dict mapping filename -> detected episode number (or None if not found).
+    """
+    global _batch_episode_cache
+    _batch_episode_cache.clear()
+    
+    if len(filenames) < 2:
+        return {}  # Need at least 2 files for batch analysis
+    
+    # Extract all bracketed numbers from each file with their positions
+    def extract_bracket_numbers(filename: str) -> List[Tuple[int, int, str]]:
+        """Returns list of (position_index, number_value, matched_text) for bracketed numbers."""
+        results = []
+        for i, m in enumerate(re.finditer(r'\[(\d{1,4})\]', filename)):
+            num = int(m.group(1))
+            results.append((i, num, m.group(0)))
+        return results
+    
+    # Also extract dash-separated numbers like "Show - 01" or "Show_-_01_"
+    def extract_dash_numbers(filename: str) -> List[Tuple[int, int, str]]:
+        """Returns list of (position_index, number_value, matched_text) for dash-separated numbers."""
+        results = []
+        # Pattern handles: "- 01 ", "- 01.", "_-_01_", "- 01("
+        for i, m in enumerate(re.finditer(r'[-–—]_?(\d{1,3})(?:[_\s\.(\[]|$)', filename)):
+            num = int(m.group(1))
+            results.append((i + 100, num, m.group(0)))  # offset to distinguish from brackets
+        return results
+    
+    # Also extract space-separated numbers like "Show Name 01 Title" or "Slam Dunk 100"
+    def extract_space_numbers(filename: str) -> List[Tuple[int, int, str]]:
+        """Returns list of (position_index, number_value, matched_text) for space-separated episode numbers."""
+        results = []
+        # Match numbers that are surrounded by spaces (or start of string), followed by more text
+        # Avoid matching years (1900-2099) or resolutions (1080, 720, etc.)
+        for i, m in enumerate(re.finditer(r'(?:^|\s)(\d{1,3})(?=\s+[A-Za-z])', filename)):
+            num = int(m.group(1))
+            # Skip resolutions and other technical numbers
+            if num in (360, 480, 540, 720, 1080, 1440, 2160, 4320):
+                continue
+            if 1900 <= num <= 2099:  # Skip years
+                continue
+            results.append((i + 200, num, m.group(0)))  # offset to distinguish
+        return results
+    
+    # Pre-clean filenames to remove file size info like "(126.7 MiB)"
+    def clean_for_analysis(filename: str) -> str:
+        return re.sub(r'\s*\([^)]*[MG]i?B\s*\)\s*$', '', filename)
+    
+    # Collect patterns from all files
+    all_patterns = []
+    for fname in filenames:
+        clean_name = clean_for_analysis(fname)
+        patterns = extract_bracket_numbers(clean_name) + extract_dash_numbers(clean_name) + extract_space_numbers(clean_name)
+        all_patterns.append((fname, patterns))  # Keep original filename as key
+    
+    if not all_patterns or not all_patterns[0][1]:
+        return {}  # No patterns found
+    
+    # Find which position index has varying values (likely episode numbers)
+    # Group by position index
+    position_values: Dict[int, List[Tuple[str, int]]] = {}
+    for fname, patterns in all_patterns:
+        for pos_idx, num_val, _ in patterns:
+            if pos_idx not in position_values:
+                position_values[pos_idx] = []
+            position_values[pos_idx].append((fname, num_val))
+    
+    # Find positions where values vary AND form a reasonable sequence
+    episode_position = None
+    best_score = 0
+    
+    for pos_idx, file_nums in position_values.items():
+        if len(file_nums) < len(filenames) * 0.8:
+            continue  # Skip if not present in most files
+        
+        values = [n for _, n in file_nums]
+        unique_values = set(values)
+        
+        # Skip if all same value (constant like 1080, 264, etc.)
+        if len(unique_values) == 1:
+            continue
+        
+        # Skip known non-episode numbers (resolutions, years, bit depths)
+        if any(v in (360, 480, 540, 720, 1080, 1440, 2160, 4320, 264, 265, 10) for v in unique_values):
+            if len(unique_values) == 1 or max(unique_values) > 500:
+                continue
+        
+        # Check if values form a reasonable episode sequence
+        sorted_vals = sorted(unique_values)
+        is_sequential = all(sorted_vals[i+1] - sorted_vals[i] <= 2 for i in range(len(sorted_vals)-1))
+        starts_low = min(unique_values) <= 10  # Episodes usually start from 1-10
+        reasonable_range = max(unique_values) <= 500  # Episodes rarely exceed 500
+        
+        # Score this position
+        score = 0
+        if is_sequential: score += 3
+        if starts_low: score += 2
+        if reasonable_range: score += 1
+        if len(unique_values) > 1: score += 1
+        
+        if score > best_score:
+            best_score = score
+            episode_position = pos_idx
+    
+    if episode_position is None:
+        return {}
+    
+    # Map filenames to their episode numbers at the detected position
+    result = {}
+    for fname, patterns in all_patterns:
+        for pos_idx, num_val, _ in patterns:
+            if pos_idx == episode_position:
+                result[fname] = num_val
+                break
+    
+    _batch_episode_cache = result
+    return result
+
+def get_batch_episode(filename: str) -> Optional[int]:
+    """Get batch-detected episode number for a filename, if available."""
+    return _batch_episode_cache.get(filename)
+
 def check_duplicate_in_drive(filename: str, source: str = "generic", playlist_index: Optional[int] = None) -> bool:
     """Check if file already exists in Drive to avoid re-downloading"""
     dest_path, category = determine_destination_path(filename, source, dry_run=True, playlist_index=playlist_index)
@@ -1018,7 +1265,7 @@ def check_duplicate_in_drive(filename: str, source: str = "generic", playlist_in
 def determine_destination_path(filename: str, source: str = "generic", dry_run: bool = False, playlist_index: Optional[int] = None) -> Tuple[str, str]:
     filename = sanitize_filename(filename)
     
-    # If auto-organize is disabled, just return Downloads folder with original filename
+    # If auto-organise is disabled, just return Downloads folder with original filename
     if not is_auto_organize_enabled():
         downloads_dir = os.path.join(DRIVE_BASE, get_downloads_path())
         if not dry_run and not os.path.exists(downloads_dir):
@@ -1033,60 +1280,127 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
     manual_show_name = show_name_override.value.strip()
     show_name = "Unknown Show" 
     
-    sxe_strict = re.search(r'(?i)\bS(\d{1,2})E(\d{1,2})\b', filename)
-    # Added Vietnamese "Tập", Korean "화", and more flexible episode patterns
-    sxe_loose = re.search(r'(?i)(?:\b(?:Ep?|Episode|Tập|Tập phim|Folge|Capitulo|Cap)[ .\-_]?(\d{1,3})\b|[|\-–—]\s*(?:Ep?|Episode|Tập)?\s*(\d{1,3})\s*[|\]]?)', filename)
-    sxe_asian = re.search(r'(?:第(\d+)集|(\d+)화)', filename)
+    sxe_strict = re.search(r'(?i)\bS(\d{1,2})E(\d{1,4})\b', filename)
+    # Added Vietnamese "Tập", Korean "화", Portuguese "Episodio", and more flexible episode patterns
+    sxe_loose = re.search(r'(?i)(?:\b(?:Ep?|Episode|Episodio|Tập|Tập phim|Folge|Capitulo|Cap)[ .\-_]?(\d{1,4})\b|[|\-–—]\s*(?:Ep?|Episode|Tập)?\s*(\d{1,4})\s*[|\]]?)', filename)
+    sxe_asian = re.search(r'(?:第(\d+)[集話]|(\d+)화)', filename)
+    
+    # Bracketed episode pattern: matches [01], [02], etc. common in fansub releases
+    # Filters out resolution tags [1080P/720P/etc], codec tags [HEVC-10b/x265/etc], and source tags
+    sxe_bracket = None
+    bracket_matches = list(re.finditer(r'\[(\d{1,3})\]', filename))
+    for bm in bracket_matches:
+        num = int(bm.group(1))
+        # Skip if it looks like a resolution (360, 480, 720, 1080, 2160, etc.) 
+        # or a year (1900-2099) or a bit depth suffix like "10b" in [HEVC-10b]
+        if num in (360, 480, 540, 720, 1080, 1440, 2160, 4320):
+            continue
+        if 1900 <= num <= 2099:
+            continue
+        # Check if this bracket is part of a codec tag like [HEVC-10b] or [x264-10bit]
+        # Look for pattern where number is preceded by hyphen inside the bracket context
+        bracket_content_before = filename[max(0, bm.start()-20):bm.start()]
+        if re.search(r'\[[^\]]*-$', bracket_content_before):
+            continue  # Skip, it's likely a suffix like -10b
+        # This looks like a valid episode number
+        sxe_bracket = bm
+        break
+    
     # Trailing number pattern: catches "HD 01", "Show Name 05", "filename - 03" before extension
     # Uses negative lookbehind to avoid matching years (19xx, 20xx) and resolutions (1080, 720, etc.)
     base_name = os.path.splitext(filename)[0]  # Remove extension for cleaner matching
-    sxe_trailing = re.search(r'(?<![12]\d{2})(?<!x)\b(\d{1,3})\s*$', base_name)
+    sxe_trailing = re.search(r'(?<![12]\d{2})(?<!x)\b(\d{1,4})\s*$', base_name)
     # Filter out likely years or resolutions captured by trailing pattern
     if sxe_trailing:
         num = int(sxe_trailing.group(1))
         # Reject if it looks like a year (1900-2099) or resolution (360, 480, 720, 1080, 2160, etc.)
         if 1900 <= num <= 2099 or num in (360, 480, 540, 720, 1080, 1440, 2160, 4320):
             sxe_trailing = None
+    
+    # Underscore-dash pattern: handles _-_01_ or - 1042 format (common in high-episode anime)
+    sxe_underscore = re.search(r'[-–—]_?(\d{1,4})(?:_|\(|\s|$)', filename)
+    
+    # Space-separated pattern: handles "Show Name 01 Title" format
+    # Exclude "Part X" which indicates movie sequels, not episodes
+    sxe_space = re.search(r'(?:^|[\s_])(\d{1,3})(?=\s+[A-Za-z])', filename)
+    if sxe_space:
+        num = int(sxe_space.group(1))
+        # Check if preceded by "Part" - indicates movie, not episode
+        pre_match = filename[:sxe_space.start() + 1]
+        if re.search(r'(?i)\bPart\s*$', pre_match):
+            sxe_space = None
+        elif num in (360, 480, 540, 720, 1080, 1440, 2160, 4320) or 1900 <= num <= 2099:
+            sxe_space = None
 
     season_num, episode_num = 1, 1
     is_tv = False
     episode_detected = False
 
-    # Collect all valid matches and find the earliest one to split correctly
-    matches = []
-    if sxe_strict: matches.append({'m': sxe_strict, 'type': 'strict', 'idx': sxe_strict.start(), 'priority': 1})
-    if sxe_loose: matches.append({'m': sxe_loose, 'type': 'loose', 'idx': sxe_loose.start(), 'priority': 2})
-    if sxe_asian: matches.append({'m': sxe_asian, 'type': 'asian', 'idx': sxe_asian.start(), 'priority': 2})
-    # Trailing pattern is lowest priority - only use if no other patterns found
-    if sxe_trailing and not matches: 
-        matches.append({'m': sxe_trailing, 'type': 'trailing', 'idx': sxe_trailing.start(), 'priority': 3})
-    
-    if matches:
-        # Sort by start index to find the FIRST occurrence (splitting show name from episode info)
-        best = min(matches, key=lambda x: x['idx'])
-        match, m_type = best['m'], best['type']
-        
-        if m_type == 'strict':
-            season_num, episode_num = int(match.group(1)), int(match.group(2))
-        elif m_type == 'loose':
-            ep_num = match.group(1) or match.group(2)
-            episode_num = int(ep_num) if ep_num else 1
-        elif m_type == 'asian':
-            ep_num = match.group(1) or match.group(2)
-            episode_num = int(ep_num) if ep_num else 1
-        elif m_type == 'trailing':
-            episode_num = int(match.group(1))
-            
-        # For trailing pattern, use base_name (without extension) for show name extraction
-        name_source = base_name if m_type == 'trailing' else filename
-        show_name = clean_show_name(name_source[:match.start()])
-        # If show name is too short/empty, try looking after the match (rare case)
-        if len(show_name) < 2 and m_type == 'loose': 
-            parts = os.path.splitext(filename[match.end():])[0]
-            if len(parts) > 2: show_name = clean_show_name(parts)
-            
+    # PRIORITY 1: Use batch-detected episode if available (most reliable)
+    batch_ep = get_batch_episode(filename)
+    if batch_ep is not None:
+        episode_num = batch_ep
         is_tv = True
         episode_detected = True
+        # For show name, find the episode marker position
+        # Handle: [01], " 01 ", "- 01", "_-_01_"
+        ep_marker = re.search(r'\[0*' + str(batch_ep) + r'\]|(?:^|\s)0*' + str(batch_ep) + r'(?=\s+[A-Za-z])|[-–—]_?0*' + str(batch_ep) + r'(?:[_\s\.\(\[]|$)', filename)
+        if ep_marker:
+            show_name = clean_show_name(filename[:ep_marker.start()])
+        else:
+            show_name = clean_show_name(filename)
+    
+    # PRIORITY 2: Fall back to regex pattern matching if batch detection didn't find it
+    if not episode_detected:
+        # Collect all valid matches and find the earliest one to split correctly
+        matches = []
+        if sxe_strict: matches.append({'m': sxe_strict, 'type': 'strict', 'idx': sxe_strict.start(), 'priority': 1})
+        # Bracketed episode numbers have high priority (common in fansub releases)
+        if sxe_bracket: matches.append({'m': sxe_bracket, 'type': 'bracket', 'idx': sxe_bracket.start(), 'priority': 1})
+        if sxe_loose: matches.append({'m': sxe_loose, 'type': 'loose', 'idx': sxe_loose.start(), 'priority': 2})
+        if sxe_asian: matches.append({'m': sxe_asian, 'type': 'asian', 'idx': sxe_asian.start(), 'priority': 2})
+        # Underscore pattern: use if higher priority patterns not found
+        if sxe_underscore and not matches: 
+            matches.append({'m': sxe_underscore, 'type': 'underscore', 'idx': sxe_underscore.start(), 'priority': 3})
+        # Space pattern: use if higher priority patterns not found
+        if sxe_space and not matches: 
+            matches.append({'m': sxe_space, 'type': 'space', 'idx': sxe_space.start(), 'priority': 3})
+        # Trailing pattern is lowest priority - only use if no other patterns found
+        if sxe_trailing and not matches: 
+            matches.append({'m': sxe_trailing, 'type': 'trailing', 'idx': sxe_trailing.start(), 'priority': 4})
+    
+        if matches:
+            # Sort by start index to find the FIRST occurrence (splitting show name from episode info)
+            best = min(matches, key=lambda x: x['idx'])
+            match, m_type = best['m'], best['type']
+            
+            if m_type == 'strict':
+                season_num, episode_num = int(match.group(1)), int(match.group(2))
+            elif m_type == 'bracket':
+                episode_num = int(match.group(1))
+            elif m_type == 'loose':
+                ep_num = match.group(1) or match.group(2)
+                episode_num = int(ep_num) if ep_num else 1
+            elif m_type == 'asian':
+                ep_num = match.group(1) or match.group(2)
+                episode_num = int(ep_num) if ep_num else 1
+            elif m_type == 'underscore':
+                episode_num = int(match.group(1))
+            elif m_type == 'space':
+                episode_num = int(match.group(1))
+            elif m_type == 'trailing':
+                episode_num = int(match.group(1))
+                
+            # For trailing pattern, use base_name (without extension) for show name extraction
+            name_source = base_name if m_type == 'trailing' else filename
+            show_name = clean_show_name(name_source[:match.start()])
+            # If show name is too short/empty, try looking after the match (rare case)
+            if len(show_name) < 2 and m_type == 'loose': 
+                parts = os.path.splitext(filename[match.end():])[0]
+                if len(parts) > 2: show_name = clean_show_name(parts)
+                
+            is_tv = True
+            episode_detected = True
     
     # Apply category override if set
     cat_override = category_override.value
@@ -1317,7 +1631,10 @@ def process_youtube_link(url, mode="video", apply_playlist_range=True) -> Tuple[
     playlist_items = normalize_playlist_range(playlist_selection.value) if apply_playlist_range else None
     
     ydl_opts = {
-        'outtmpl': f'{COLAB_ROOT}%(title)s.%(ext)s', 
+        'outtmpl': {
+            'default': f'{COLAB_ROOT}%(title)s.%(ext)s',
+            'subtitle': f'{COLAB_ROOT}%(title)s.%(ext)s',  # Match video naming for subtitles
+        },
         'quiet': True, 'no_warnings': True, 
         'restrictfilenames': False, 
         'ignoreerrors': True, 
@@ -2455,18 +2772,20 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str):
         print(f"\n❌ Critical Error: {e}")
     finally:
         btn.disabled = False
+        btn_quick.disabled = False
         btn_subs.disabled = False
         btn_resume.disabled = False
         reset_progress()
         check_resume_available()
 
 
-def execute_batch(mode: str, resume: bool = False):
+def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False):
     global yt_success_cumulative, yt_fail_cumulative  # Must be at function start
     clear_output(wait=True)
     display(input_ui)
     settings_ui.layout.display = 'none'  # Close settings panel if open
     btn.disabled = True
+    btn_quick.disabled = True
     btn_subs.disabled = True
     btn_resume.disabled = True
     print(f"\n🚀 Initializing... (Mode: {mode}, Resume: {resume})")
@@ -2586,8 +2905,13 @@ def execute_batch(mode: str, resume: bool = False):
             # Save initial session
             save_session(all_tasks, gofile_token, rd_key, show_name_override.value.strip(), playlist_selection.value.strip())
             
-            # Show queue preview instead of immediate download
-            show_queue_preview(all_tasks, mode)
+            if quick_mode:
+                # Quick Download: Skip queue preview, start immediately
+                print(f"⚡ Quick Download: Starting {len(all_tasks)} items...")
+                execute_selected_tasks(all_tasks, mode)
+            else:
+                # Show queue preview instead of immediate download
+                show_queue_preview(all_tasks, mode)
             return  # Wait for user to click "Start Selected"
         
         # This code only runs for RESUME mode (preview was skipped)
@@ -2718,12 +3042,29 @@ def execute_batch(mode: str, resume: bool = False):
         print(f"\n❌ Critical Error: {e}")
     finally: 
         btn.disabled = False
+        btn_quick.disabled = False
         btn_resume.disabled = False
         reset_progress()
         check_resume_available()
 
+# --- QUICK DOWNLOAD ---
+def on_quick_download(b=None):
+    """Quick Download - bypass queue preview and download immediately."""
+    urls = text_area.value.strip()
+    if not urls:
+        print("⚠️ No links to download!")
+        return
+    
+    # Setup subtitle languages for Quick Download if enabled
+    if quick_dl_subs_checkbox.value:
+        subtitle_langs.value = quick_dl_subtitle_langs.value
+    
+    # Call execute_batch with quick_mode to skip queue preview
+    execute_batch("video", quick_mode=True)
+
 # --- BINDINGS ---
 btn.on_click(lambda b: execute_batch("video"))
+btn_quick.on_click(on_quick_download)
 btn_resume.on_click(lambda b: execute_batch("video", resume=True))
 btn_restart.on_click(restart_runtime)
 btn_history.on_click(view_history)

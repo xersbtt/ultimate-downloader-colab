@@ -12,7 +12,7 @@ A powerful Google Colab-based tool for downloading media from multiple sources d
 - **Download History**: Persistent log of completed downloads for debugging
 - **Real-Debrid Integration**: Unrestrict premium links and process magnet links
 - **Magnet File Selection**: Preview individual torrent files and choose which to download
-- **Smart Media Sorting**: Automatically organizes into Plex-compatible folder structures
+- **Smart Media Sorting**: Automatically organises into Plex-compatible folder structures
   - TV Shows: `Show Name/Season XX/Show Name - S01E01.mkv`
   - Movies: `Movie Name/Movie Name.mkv`
 - **Archive Extraction**: Handles RAR, ZIP, 7Z with sequential extraction to save Colab disk space
@@ -61,9 +61,19 @@ magnet:?xt=urn:btih:...
 https://www.youtube.com/playlist?list=...
 ```
 
-### 4. Click "Resolve Links"
+### 4. Start Downloading
 
-Review the queue preview, then click "Start Download". Files will be organized and saved to your Google Drive.
+**Option A: Resolve Links** (Recommended for playlists or batches)
+- Click **Resolve Links** to preview the queue
+- Review detected files, adjust naming/organisation if needed
+- Click **Start Download** to begin
+
+**Option B: Quick Download** (Fastest for single videos)
+- Click **Quick Download** to start immediately
+- Skips the queue preview — downloads begin right away
+- Enable subtitles via ⚙️ Settings → "Include subtitles in quick downloads"
+
+Files are automatically organised and saved to your Google Drive.
 
 ---
 
@@ -91,6 +101,8 @@ Review the queue preview, then click "Start Download". Files will be organized a
 - `My Drive/Ultimate Downloader/` - Config files (session.json, history.json, settings.json)
 
 > **API Keys**: Gofile and Real-Debrid tokens are configured in ⚙️ Settings. For security, use Colab Secrets (see Quick Start).
+
+> **Quick Download Subtitles**: Enable "Include subtitles in quick downloads" in ⚙️ Settings to automatically fetch subtitles when using the Quick Download button.
 
 **Customizing Download Directories:**
 1. Click ⚙️ Settings in the main UI
@@ -124,21 +136,45 @@ Review the queue preview, then click "Start Download". Files will be organized a
 
 ## 🎬 Episode Detection Patterns
 
-The downloader recognizes these naming patterns:
+The downloader recognises these naming patterns:
 
 | Pattern | Example | Result |
 |---------|---------|--------|
 | Standard | `Show.Name.S01E05.mkv` | Season 01, Episode 05 |
 | Asian Drama | `Drama EP01.mkv` | Season 01, Episode 01 |
 | Chinese | `电视剧 第5集.mkv` | Season 01, Episode 05 |
+| Japanese | `アニメ 第10話.mkv` | Season 01, Episode 10 |
 | Vietnamese | `Phim Tập 3.mkv` | Season 01, Episode 03 |
 | Korean | `드라마 5화.mkv` | Season 01, Episode 05 |
 | German | `Serie Folge 2.mkv` | Season 01, Episode 02 |
 | Spanish | `Serie Capitulo 4.mkv` | Season 01, Episode 04 |
+| Portuguese | `Serie Episodio 8.mkv` | Season 01, Episode 08 |
+| Fansub Bracket | `[Group] Show - 01 [1080p].mkv` | Season 01, Episode 01 |
+| Underscore-Dash | `Show_Name_-_03_(480p).mkv` | Season 01, Episode 03 |
+| High Episode | `One Piece - 1042 [1080p].mkv` | Season 01, Episode 1042 |
 | Pipe/Dash | `Show Name \| 7.mkv` | Season 01, Episode 07 |
 | Asian Multi-Part | `Movie 上篇.mkv` | Adds `-pt1` suffix |
 
 > **Tip**: When using "Show Name" override with playlists, the playlist position (1, 2, 3...) will be used as the episode number if no pattern matches.
+
+### Limitations & Workarounds
+
+The auto-organise feature works well for ~95% of standard naming conventions, but some edge cases require manual overrides:
+
+| Edge Case | Issue | Workaround |
+|-----------|-------|------------|
+| Numbers in movie title | `21 Jump Street` detected as Episode 21 | Set **Category** to "Movie" |
+| "Part X" in movie title | `Movie Part 2` may detect as Episode 2 | Set **Category** to "Movie" |
+| No episode pattern | `Random_Video_Name.mkv` detected as Movie | Set **Category** to "Series" + use **Name** field |
+| Unusual separator | `Show.Name.01.Title.mkv` (no dash) | Use **Name** field to set show name |
+| Decimal episodes | `Show - 01.5 [OVA].mkv` | Detected as Episode 1 (decimal ignored) |
+| Season in title | `Show Season 2 - 01.mkv` | Season not extracted; files go to Season 01 |
+
+**Best Practices:**
+- For consistent batch naming (e.g., fansub releases), auto-detect is very accurate
+- For mixed or unusual filenames, use **Name** + **Category** overrides before downloading
+- For movies with sequel numbers (`Toy Story 3`), auto-detect works if year is present (`2010`)
+- If unsure about a filename, set the **Name** and **Category** fields to guarantee correct organization
 
 ---
 
@@ -175,12 +211,13 @@ When YouTube videos are detected in the Queue Preview, you can select which subt
 | Button | Action |
 |--------|--------|
 | **Resolve Links** | Parse links and show Queue Preview for review |
-| **Start Download** | (In Queue) Download videos and organize to Drive |
-| **Download Subtitles** | (In Queue) Fetch subtitles from YouTube without downloading videos |
+| **Quick Download** | Download immediately without queue preview (respects auto-organise settings) |
+| **Start Download** | (In Queue) Download videos and organise to Drive |
+| **Download Subtitles** | (In Queue) Fetch subtitles from YouTube/streaming sources only. Non-streaming links (Gofile, Mega, etc.) in mixed batches will still download normally. |
 | **Resume Previous Session** | Resume interrupted session (appears when session exists) |
 | **🔄 Restart Runtime** | Restart Colab runtime (appears after failures for easy resume) |
 | **📜 (History)** | View last 10 downloads from history log |
-| **⚙️ (Settings)** | Configure download directories, manage cookies, view API key status, clear data files |
+| **⚙️ (Settings)** | Configure download directories, manage cookies, Quick Download subtitle options, clear data files |
 
 ---
 
@@ -209,7 +246,7 @@ Stremio is for streaming; this is for downloading. Use this when you want to:
 - Build a permanent media library on Drive
 - Download for offline access or archival
 - Grab YouTube playlists, Mega links, or other sources Stremio doesn't support
-- Organize downloads into Plex-friendly folder structures automatically
+- Organise downloads into Plex-friendly folder structures automatically
 
 **Isn't this just a wrapper for yt-dlp/aria2?**
 
@@ -260,15 +297,15 @@ Yes! Colab works in mobile browsers. The UI is functional on phones/tablets, tho
 ```
 Ultimate Downloader/
 ├── ultimate_downloader.py          # Latest version (always current)
-├── ultimate_downloader_v4.34.py    # Versioned snapshot
+├── ultimate_downloader_v5.0.py     # Current versioned snapshot
 ├── Ultimate_Downloader.ipynb       # Jupyter notebook launcher
 ├── Ultimate Downloader.url         # Windows shortcut to Colab
 ├── CHANGELOG.md                    # Version history
 ├── README.md                       # This file
-├── LICENSE                         # MIT License
+├── LICENSE                         # MIT Licence
 ├── banner_2x1.png                  # GitHub banner image
 ├── .gitignore                      # Git ignore rules
-└── archive/                        # Previous versions
+└── archive/                        # Previous versions (v4.34 and earlier)
 ```
 
 ---

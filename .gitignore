@@ -63,3 +63,11 @@ cookies.txt
 
 # UI Designer tool (local only)
 ui_designer.html
+
+# Test and debug files (local only)
+test_*.py
+test_*.txt
+debug_*.py
+
+# Previous versions archive
+archive/
