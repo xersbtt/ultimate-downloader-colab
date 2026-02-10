@@ -69,5 +69,4 @@ test_*.py
 test_*.txt
 debug_*.py
 
-# Previous versions archive
-archive/
+
