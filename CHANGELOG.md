@@ -4,7 +4,27 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 
 ---
 
-## v5.0 (Latest)
+## v5.1 (Latest)
+**Theme: Code Quality & Reliability**
+
+### 🔧 Improvements
+- **Refactored Download Pipeline**: Extracted shared download orchestration into `_run_download_pipeline()` function
+  - Eliminated ~230 lines of code duplication between `execute_batch()` and `execute_selected_tasks()`
+  - Both parallel and sequential download logic now uses the same code path
+- **Configuration Constants**: Added `REQUEST_TIMEOUT`, `GOFILE_WEBSITE_TOKEN`, `KNOWN_RESOLUTIONS`, `YEAR_RANGE`
+  - Eliminates magic numbers and centralizes configuration
+- **Keyword-Only Arguments**: `save_session()` refactored to use explicit keyword arguments
+  - Prevents positional argument ordering bugs and improves code readability
+
+### 🐛 Bug Fixes
+- **Mega Download Status**: `process_mega_link()` now returns success/failure boolean
+  - Downloads correctly marked as "failed" when Mega errors occur (was always "done" before)
+- **Pixeldrain Crash Fix**: Added null check in `resolve_pixeldrain()` to prevent crash on malformed URLs
+- **Removed Dead Code**: Deleted unused `technical_pattern` regex variable from `clean_show_name()`
+
+---
+
+## v5.0
 **Theme: Quick Download, Batch Detection & Global Episode Support**
 
 ### ✨ New Features
