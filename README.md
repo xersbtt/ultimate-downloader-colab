@@ -8,7 +8,7 @@ A powerful Google Colab-based tool for downloading media from multiple sources d
 - **35+ Premium Hosts via Real-Debrid**: MediaFire, 1fichier, Rapidgator, Nitroflare, etc.
 - **Parallel Downloads**: Download up to 5 files concurrently for Gofile, Pixeldrain, Real-Debrid, and direct HTTP links
 - **Session Resume**: Automatically resume interrupted downloads after runtime restart
-- **Queue Management**: Preview, reorder, and select which files to download
+- **Queue Management**: Preview, reorder, sort (A-Z/Z-A), and select which files to download
 - **Download History**: Persistent log of completed downloads for debugging
 - **Real-Debrid Integration**: Unrestrict premium links and process magnet links
 - **Magnet File Selection**: Preview individual torrent files and choose which to download
@@ -85,6 +85,7 @@ Files are automatically organised and saved to your Google Drive.
 |-------|-------------|
 | **Auto-organise** | Toggle automatic file renaming and organisation (uncheck to save with original filenames to Downloads) |
 | **Name** | Override auto-detected name for folder/filename (works for both TV shows and movies) |
+| **Year** | Append `(YYYY)` to folder name for movies and TV shows (file name unchanged) |
 | **Movies/TV \| Anime** | Toggle between regular folders (Movies, TV Shows) and anime folders (Anime Movies, Anime Series) |
 | **Category** | Force Movie or Series classification (Auto: detect from filename) |
 | **Parallel DLs** | Number of concurrent downloads (1-5, applies to Gofile/Pixeldrain/RD/HTTP) |
@@ -297,7 +298,7 @@ Yes! Colab works in mobile browsers. The UI is functional on phones/tablets, tho
 ```
 Ultimate Downloader/
 ├── ultimate_downloader.py          # Latest version (always current)
-├── ultimate_downloader_v5.0.py     # Current versioned snapshot
+├── ultimate_downloader_v5.2.py     # Current versioned snapshot
 ├── Ultimate_Downloader.ipynb       # Jupyter notebook launcher
 ├── Ultimate Downloader.url         # Windows shortcut to Colab
 ├── CHANGELOG.md                    # Version history

@@ -4,7 +4,41 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 
 ---
 
-## v5.1 (Latest)
+## v5.2 (Latest)
+**Theme: Session Persistence & Detection Fixes**
+
+### ✨ New Features
+- **Queue Sort**: New "Sort A-Z/Z-A" button in queue preview to sort resolved links alphabetically by filename
+  - Useful for batch downloads where links resolve in arbitrary order
+  - Sorts case-insensitively; falls back to URL when filename is unavailable
+- **Year Field**: New text input next to Force Name to append `(YYYY)` to folder names
+  - TV shows: `Show Name (2008)/Season 01/Show Name - S01E01.mkv`
+  - Movies: `Movie Name (2010)/Movie Name.mkv`
+  - File names remain unchanged — only the folder gets the year suffix
+  - Year value persists in session and restores on resume
+
+### 🐛 Bug Fixes
+- **MEGA Folder/File Links Not Downloading**: Fixed `mega.nz/folder/.../file/...` URLs silently reporting "Download Complete" without actually downloading anything
+  - `megadl` doesn't support folder/file URL format and exits with code 0
+  - Now tries Real-Debrid first; if RD fails (e.g. Colab IP blocked), falls back to megadl
+  - Folder/file URLs are auto-converted to folder-only URLs for megadl compatibility
+  - Post-download validation detects when megadl downloads nothing and reports failure
+- **Session Resume Settings Loss**: Fixed media type (Movies/TV vs Anime) and category override (Auto/Movie/Series) not persisting when resuming a previous session
+  - Both values now saved to `settings.json` (with auto-save on change) and `session.json`
+  - Resume flow now restores media type and category before processing downloads
+- **Version Suffix Detection**: Fixed `S01E01v2` pattern not being detected as a valid episode
+  - The `v2`/`v3` version suffix (common in fansub re-releases) caused the regex word boundary to fail
+  - Now correctly matches `S01E01v2.mkv` as Season 1, Episode 1
+- **Resume Skipping Active Downloads**: Fixed downloads that were in-progress when runtime disconnected being silently skipped on resume
+  - Tasks with `downloading` status are now included in resume (previously only `pending` and `failed` were retried)
+- **4-Digit Space-Separated Episodes Not Detected**: Fixed auto-organise failing for filenames like `[Fabre-RAW] Detective Conan 0724 [NetflixJP] [1080]`
+  - Space-separated number patterns were limited to 3 digits — expanded to support 4-digit episode numbers
+  - Lookahead in space-number regex only accepted letters after the number — now also accepts `[` for fansub bracket tags like `[NetflixJP]`
+  - Same fixes applied to batch detection, individual fallback, and bracket episode patterns
+
+---
+
+## v5.1
 **Theme: Code Quality & Reliability**
 
 ### 🔧 Improvements
