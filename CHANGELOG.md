@@ -670,4 +670,7 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 | v4.32 | Critical fix for magnet link downloads |
 | v4.33 | Optional auto-organization toggle, anime mode |
 | v4.34 | Archive.org support |
+| v5.0 | Quick Download, batch episode detection, fansub support |
+| v5.1 | Code quality refactoring, download pipeline extraction |
+| v5.2 | Queue sort, year field, MEGA & session persistence fixes |
 
