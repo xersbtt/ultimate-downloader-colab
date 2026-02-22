@@ -4,7 +4,36 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 
 ---
 
-## v5.2 (Latest)
+## v5.3 (Latest)
+**Theme: Episode Detection & Runtime Stability**
+
+### ⚡ Performance
+- **Progress-Reporting File Transfers**: Large files (100MB+) moved to Drive now show real-time progress
+  - Transfer progress printed every 500MB with percentage, size, and speed
+  - Final summary with total time and average speed (e.g., "✅ Transfer complete: 4200 MB in 85s (49.4 MB/s)")
+
+### ✨ New Features
+- **Colab Anti-Idle Keep-Alive**: Background thread prevents Google Colab from disconnecting during long downloads
+  - Periodically executes a no-op JavaScript call to reset Colab's idle timer
+  - Runs every 5 minutes during active downloads (zero performance impact)
+  - Starts automatically when downloads begin, stops when they finish
+  - Covers all download phases: link resolution, parallel downloads, and sequential processing
+
+### 🐛 Bug Fixes
+- **NNxNN Episode Format Not Detected**: Fixed auto-organise incorrectly mapping all files to S01E01 for filenames using `NNxNN` format like `Death Note - 01x05 - Tactics.mkv`
+  - Added dedicated `sxe_nxn` regex for `NNxNN` season×episode format (matches `01x05`, `1x03`, `02x15`, etc.)
+  - Correctly extracts both season and episode numbers (e.g., `02x07` → S02E07)
+  - Fixed `sxe_underscore` and batch `extract_dash_numbers` matching the season part (`01`) by adding negative lookahead to skip `NNxNN` patterns
+  - Added `extract_nxn_numbers` to batch analysis for multi-file NNxNN detection
+- **Incorrect Part Suffix on SxxExx Episodes**: Fixed `(Part 1)` in filenames like `Cowboy Bebop - S01E25 - The Real Folk Blues (Part 1).mkv` incorrectly adding `-pt1` suffix to the episode number
+  - `S01E25` already uniquely identifies the episode — Part 2 is typically `S01E26`, not `S01E25-pt2`
+  - English "Part X" suffix now only applied when no standard `SxxExx` or `NxN` pattern is detected
+  - CJK multi-part markers (上篇/下篇/中篇) still always apply as they genuinely split episodes
+- **Season 00 Folder Named "Specials"**: `S00Exx` episodes now go into a `Specials` folder instead of `Season 00`, matching Plex/media server conventions
+
+---
+
+## v5.2
 **Theme: Session Persistence & Detection Fixes**
 
 ### ✨ New Features
@@ -673,4 +702,5 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 | v5.0 | Quick Download, batch episode detection, fansub support |
 | v5.1 | Code quality refactoring, download pipeline extraction |
 | v5.2 | Queue sort, year field, MEGA & session persistence fixes |
+| v5.3 | NNxNN episode detection, anti-idle keep-alive |
 
