@@ -4,7 +4,23 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 
 ---
 
-## v5.3 (Latest)
+## v5.4 (Latest)
+**Theme: Colab Stability**
+
+### 🐛 Bug Fixes
+- **Colab Anti-Idle Not Working**: Fixed keep-alive failing to prevent disconnection after ~45 minutes
+  - Root cause: `Javascript('void(0)')` runs a no-op in the output cell context, which Colab ignores for idle detection
+  - Fix: Now simulates clicking the Colab connect button via JavaScript, which is the standard method to reset the idle timer
+  - Reduced keep-alive interval from 5 minutes to 2 minutes for more reliable coverage
+  - Added console logging (`Colab keep-alive: HH:MM:SS`) for debugging in browser DevTools
+- **Real-Debrid Magnet Rate Limiting**: Fixed multiple magnet links triggering RD fair-use policy blocks
+  - Adaptive pacing: magnets resolve at full speed until RD returns `too_many_requests`, then auto-paces at 2s intervals
+  - Rate-limited requests retry with exponential backoff (5s → 10s → 20s), up to 4 attempts
+  - Added 2-second delay between `unrestrict/link` API calls when processing multi-file torrents
+
+---
+
+## v5.3
 **Theme: Episode Detection & Runtime Stability**
 
 ### ⚡ Performance
@@ -703,4 +719,5 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 | v5.1 | Code quality refactoring, download pipeline extraction |
 | v5.2 | Queue sort, year field, MEGA & session persistence fixes |
 | v5.3 | NNxNN episode detection, anti-idle keep-alive |
+| v5.4 | Fixed Colab anti-idle, RD magnet rate limiting |
 
