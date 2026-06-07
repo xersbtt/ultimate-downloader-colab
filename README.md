@@ -4,7 +4,7 @@ A powerful Google Colab-based tool for downloading media from multiple sources d
 
 ## ✨ Features
 
-- **Multi-Source Downloads**: Gofile, Pixeldrain, Mega.nz, YouTube, Twitch, Vimeo, and more
+- **Multi-Source Downloads**: Gofile, Pixeldrain, Mega.nz, FShare, YouTube, OK.ru, Twitch, Vimeo, and more
 - **35+ Premium Hosts via Real-Debrid**: MediaFire, 1fichier, Rapidgator, Nitroflare, etc.
 - **Parallel Downloads**: Download up to 5 files concurrently for Gofile, Pixeldrain, Real-Debrid, and direct HTTP links
 - **Session Resume**: Automatically resume interrupted downloads after runtime restart
@@ -49,7 +49,8 @@ Click ⚙️ Settings and enter your Gofile/Real-Debrid tokens in the API Key fi
 Store your keys securely in Colab Secrets:
 1. Click the 🔑 key icon in Colab's left sidebar
 2. Add secrets named `GOFILE_TOKEN` and `RD_TOKEN`
-3. Keys will auto-populate on each run
+3. For FShare: Add `FSHARE_EMAIL` and `FSHARE_PASSWORD`
+4. Keys will auto-populate on each run
 
 ### 3. Paste Your Links
 
@@ -123,9 +124,11 @@ Files are automatically organised and saved to your Google Drive.
 | **Gofile** | Public/private folders, cookie auth | Parallel |
 | **Pixeldrain** | Direct file downloads | Parallel |
 | **Real-Debrid** | Link unrestricting, file selection from magnets | Parallel (cached) / Sequential (uncached) |
+| **FShare** ⚠️ | VIP file/folder downloads (experimental) | Sequential |
 | **Direct HTTP** | Any direct download URL | Parallel |
 | **Mega.nz** | Full download support | Sequential |
 | **YouTube** | Videos, playlists, subtitles | Sequential |
+| **OK.ru** | Videos from Odnoklassniki | Sequential |
 | **Twitch** | VODs and clips | Sequential |
 | **Vimeo** | Video downloads | Sequential |
 | **Archive.org** | Videos, audio, documents (no DRM) | Sequential |
@@ -134,6 +137,14 @@ Files are automatically organised and saved to your Google Drive.
 | **SoundCloud** | Audio downloads | Sequential |
 
 ---
+
+## 📜 Changelog
+
+| Version | Highlights |
+|---------|------------|
+| v5.3 | NNxNN episode detection, anti-idle keep-alive |
+| v5.4 | Fixed Colab anti-idle, RD magnet rate limiting |
+| v5.5 | FShare VIP support, OK.ru video support |
 
 ## 🎬 Episode Detection Patterns
 
@@ -196,6 +207,48 @@ For Premium quality or members-only content:
 
 ---
 
+## 🔗 FShare Support (Experimental)
+
+> ⚠️ **Warning**: FShare support is experimental and relies on web scraping. It may break without notice if FShare changes their website.
+
+Download files from [fshare.vn](https://www.fshare.vn) using your VIP account. Supports both single file links and folder links.
+
+### Setup
+
+1. You need a **VIP FShare account** (free accounts cannot generate download links)
+2. Enter your FShare email and password in ⚙️ Settings, or add `FSHARE_EMAIL` and `FSHARE_PASSWORD` to Colab Secrets
+
+### How It Works
+
+**Single file** (`fshare.vn/file/...`): Resolves the download link immediately during Resolve Links phase.
+
+**Folder** (`fshare.vn/folder/...`):
+1. **Resolve Links** → Lists all files in the folder (free, no download cost)
+2. **Review queue** → Remove unwanted files to save your daily download limit
+3. **Start Download** → Resolves download links only for remaining files, then downloads
+
+> 💡 **Tip**: For folders, download links are NOT resolved until you click Start Download. This means you can review the queue and remove files you don't want — only files you keep will count toward your daily download limit.
+
+### Known Issues & Workarounds
+
+| Issue | Cause | Workaround |
+|-------|-------|------------|
+| Login fails on first 1-2 attempts | FShare session warm-up | Click Resolve Links again — it usually works on the 2nd or 3rd attempt |
+| `policydownload` error | FShare server-side restriction (transient) | Wait a few minutes and try again; not related to your download quota |
+| Folder shows fewer files than expected | FShare paginates at 50 items | Handled automatically — the downloader fetches all pages |
+| `Max retries exceeded` errors | Too many rapid requests to FShare | The downloader auto-stops after 3 consecutive failures; wait and retry |
+| Download link resolution fails | Session expired or CSRF token stale | Clear the session by restarting the Colab runtime and trying again |
+| All files fail to resolve | VIP account may have expired | Check your FShare account status at fshare.vn |
+
+### Limitations
+
+- Each resolved download link counts toward your **daily FShare download limit**, even if you don't proceed with the actual download (single file links only — folder listing is free)
+- FShare's web scraping approach is inherently fragile and may require updates when FShare changes their website
+- Download speeds depend on your FShare VIP tier and the Colab server's network conditions
+- The FShare API is officially suspended; this feature uses web-based session scraping as a workaround
+
+---
+
 ## 🔤 Subtitle Languages
 
 When YouTube videos are detected in the Queue Preview, you can select which subtitle languages to download:
@@ -232,6 +285,9 @@ When YouTube videos are detected in the Queue Preview, you can select which subt
 | Files not detected as TV | Use "Show Name" override field |
 | YouTube videos skipping | Clear YT archive via ⚙️ Settings |
 | **"Requested format is not available"** | **yt-dlp auto-updates on each run. If persists, clear cookies via ⚙️ Settings** |
+| FShare login fails | Try clicking Resolve Links again (2-3 attempts); restart runtime if persistent |
+| FShare `policydownload` error | Transient FShare server issue — wait a few minutes and retry |
+| FShare `Max retries exceeded` | Too many rapid requests — downloader auto-stops after 3 failures; retry later |
 
 ---
 

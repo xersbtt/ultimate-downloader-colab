@@ -4,7 +4,37 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 
 ---
 
-## v5.4 (Latest)
+## v5.5 (Latest)
+**Theme: FShare VIP & OK.ru Support**
+
+### ✨ New Features
+- **OK.ru (Odnoklassniki) Support**: Download videos from ok.ru
+  - Uses yt-dlp's native Odnoklassniki extractor for reliable video downloads
+  - Supports single videos (best quality, auto-merged with ffmpeg)
+  - Queue preview shows video titles fetched via yt-dlp metadata extraction
+  - Works with subtitle downloads when available
+  - Some content may be region-restricted — use a proxy if needed
+
+### ⚠️ Experimental Features
+- **FShare VIP Download Support**: Download files from fshare.vn using your VIP account
+  - Supports both single file links (`fshare.vn/file/...`) and folder links (`fshare.vn/folder/...`)
+  - Web-based session scraping (official FShare API is suspended)
+  - Persistent session caching — logs in once and reuses across all links in a batch
+  - Folder listing uses free API endpoint (no download quota cost)
+  - **Deferred download link resolution**: Folder files are listed instantly during Resolve Links, but download links are only resolved when you click Start Download — review and remove unwanted files first to save your daily download limit
+  - Smart error handling: Detects `policydownload` restriction and auto-stops after 3 consecutive failures to avoid wasting requests
+  - Folder pagination support — automatically fetches all pages (FShare paginates at 50 items)
+  - FShare credentials configurable via ⚙️ Settings or Colab Secrets (`FSHARE_EMAIL`, `FSHARE_PASSWORD`)
+
+### ⚠️ Known Limitations (FShare)
+- FShare web scraping is inherently fragile and may break when FShare updates their website
+- Login may fail on the first 1-2 attempts (click Resolve Links again)
+- `policydownload` errors are transient server-side restrictions — wait and retry
+- Each resolved single-file download link counts toward your daily FShare download limit
+
+---
+
+## v5.4
 **Theme: Colab Stability**
 
 ### 🐛 Bug Fixes
@@ -720,4 +750,5 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 | v5.2 | Queue sort, year field, MEGA & session persistence fixes |
 | v5.3 | NNxNN episode detection, anti-idle keep-alive |
 | v5.4 | Fixed Colab anti-idle, RD magnet rate limiting |
+| v5.5 | FShare VIP support, OK.ru video support |
 
