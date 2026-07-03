@@ -6,7 +6,7 @@ import subprocess
 import shutil
 import time
 from typing import Optional, Tuple, List, Dict, Any
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, fields, asdict
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
@@ -14,7 +14,10 @@ from uuid import uuid4
 import ipywidgets as widgets
 from IPython.display import display, clear_output
 from urllib.parse import urlparse, unquote
-from google.colab import drive
+try:
+    from google.colab import drive
+except ImportError:
+    drive = None  # Running outside Colab (local testing) — Drive mount disabled
 
 # --- COLAB SECRETS HELPER ---
 def get_colab_secret(key: str, default: str = "") -> str:
@@ -32,44 +35,26 @@ def check_and_load_secrets():
     """Re-check secrets and populate fields if they were empty on initial load."""
     try:
         from google.colab import userdata
-        # Try to load RD_TOKEN if field is empty
-        if not token_rd.value:
-            try:
-                rd_val = userdata.get('RD_TOKEN')
-                if rd_val:
-                    token_rd.value = rd_val
-                    print("🔑 RD_TOKEN loaded from Colab Secrets")
-            except Exception:
-                pass
-        # Try to load GOFILE_TOKEN if field is empty
-        if not token_gf.value:
-            try:
-                gf_val = userdata.get('GOFILE_TOKEN')
-                if gf_val:
-                    token_gf.value = gf_val
-                    print("🔑 GOFILE_TOKEN loaded from Colab Secrets")
-            except Exception:
-                pass
-        # Try to load FSHARE_EMAIL if field is empty
-        if not token_fshare_email.value:
-            try:
-                fs_email = userdata.get('FSHARE_EMAIL')
-                if fs_email:
-                    token_fshare_email.value = fs_email
-                    print("🔑 FSHARE_EMAIL loaded from Colab Secrets")
-            except Exception:
-                pass
-        # Try to load FSHARE_PASSWORD if field is empty
-        if not token_fshare_password.value:
-            try:
-                fs_pass = userdata.get('FSHARE_PASSWORD')
-                if fs_pass:
-                    token_fshare_password.value = fs_pass
-                    print("🔑 FSHARE_PASSWORD loaded from Colab Secrets")
-            except Exception:
-                pass
     except (ImportError, ModuleNotFoundError):
-        pass
+        return
+    # (widget, secret name) pairs — widgets are defined below in the UI section
+    secret_fields = [
+        (token_rd, 'RD_TOKEN'),
+        (token_tb, 'TB_TOKEN'),
+        (token_gf, 'GOFILE_TOKEN'),
+        (token_fshare_email, 'FSHARE_EMAIL'),
+        (token_fshare_password, 'FSHARE_PASSWORD'),
+    ]
+    for widget, secret_name in secret_fields:
+        if widget.value:
+            continue
+        try:
+            val = userdata.get(secret_name)
+            if val:
+                widget.value = val
+                print(f"🔑 {secret_name} loaded from Colab Secrets")
+        except Exception:
+            pass
 
 # --- CONFIGURATION ---
 COLAB_ROOT = "/content/"
@@ -93,13 +78,14 @@ MAX_CONCURRENT_DEFAULT = 3
 # API Configuration
 REQUEST_TIMEOUT = 30  # Default timeout for HTTP requests
 GOFILE_WEBSITE_TOKEN = "4fd6sg89d7s6"  # Website token for Gofile API - update if authentication fails
+TORBOX_API_BASE = "https://api.torbox.app/v1/api"  # TorBox API base URL
 
 # Known resolution values (for filename parsing)
 KNOWN_RESOLUTIONS = {360, 480, 540, 720, 1080, 1440, 2160, 4320}
 YEAR_RANGE = range(1900, 2100)
 
-# Real-Debrid supported file hosts (route through RD when token available)
-RD_SUPPORTED_HOSTS = {
+# Debrid-supported file hosts (route through selected debrid service when token available)
+DEBRID_SUPPORTED_HOSTS = {
     '1fichier.com', '4shared.com', 'alfafile.net', 'clicknupload.org', 'ddownload.com',
     'dailymotion.com', 'dropbox.com', 'filefactory.com', 'hexupload.net', 'hitfile.net',
     'k2s.cc', 'keep2share.cc', 'mediafire.com', 'mega.nz', 'mixdrop.co', 'nitroflare.com',
@@ -108,6 +94,7 @@ RD_SUPPORTED_HOSTS = {
     'upload.ee', 'uploaded.net', 'uptobox.com', 'userscloud.com', 'vidoza.net',
     'vimeo.com', 'wetransfer.com', 'wipfiles.net', 'worldbytez.com', 'youporn.com',
 }
+RD_SUPPORTED_HOSTS = DEBRID_SUPPORTED_HOSTS  # Backward-compatible alias
 
 # --- DOWNLOAD TASK DATACLASS ---
 @dataclass
@@ -115,31 +102,45 @@ class DownloadTask:
     url: str  # Direct download URL (may be resolved API URL)
     filename: str
     source: str
-    link_type: str  # gofile, pixeldrain, direct, youtube, mega, rd
+    link_type: str  # gofile, pixeldrain, direct, youtube, mega, rd, tb
     id: str = field(default_factory=lambda: str(uuid4()))  # Unique ID for tracking
     status: str = "pending"  # pending, downloading, done, failed, skipped
     error: Optional[str] = None
     cookie: Optional[str] = None
     original_url: Optional[str] = None  # Original user-provided URL (for re-resolving on resume)
-    retry_count: int = 0  # Number of retry attempts
+
+_TASK_FIELDS = {f.name for f in fields(DownloadTask)}
+
+# Link types with dedicated sequential processors. Every other link type (gofile,
+# pixeldrain, direct, rd, tb, fshare, mediafire, 1fichier, ...) downloads through
+# the parallel aria2 pool — partitioning by exclusion so new resolver types are
+# never silently dropped.
+SEQUENTIAL_LINK_TYPES = {'youtube', 'mega', 'magnet', 'magnet_file', 'tb_magnet_file'}
+
+def task_from_dict(data: Dict[str, Any]) -> DownloadTask:
+    """Build a DownloadTask from a session dict, ignoring unknown keys from older versions."""
+    return DownloadTask(**{k: v for k, v in data.items() if k in _TASK_FIELDS})
 
 # --- THREAD SAFETY ---
 progress_lock = Lock()
 print_lock = Lock()  # Prevent interleaved print output from parallel threads
-active_downloads: Dict[str, str] = {}  # task_id -> status string (e.g. "45% (5.2MiB/s)")
-download_stats: Dict[str, Dict[str, Any]] = {}  # task_id -> {start_time, speed_bytes, last_update}
+download_stats: Dict[str, Dict[str, float]] = {}  # task_id -> {'pct': 0-100, 'speed_mbs': MB/s}
+# Sentinel returned by download_with_aria2 when the file is already in Drive (a skip,
+# not a failure). Callers must check `is DUPLICATE_SKIP` before treating a falsy result
+# as failed, so resume doesn't retry already-complete files forever.
+DUPLICATE_SKIP = "__duplicate_skip__"
 stop_monitor = False  # Flag to stop progress monitor thread
 batch_start_time: Optional[float] = None  # Track when batch started for overall ETA
 last_display_speed: float = 0.0  # Persist last known speed to prevent flickering
 
 # --- COLAB KEEP-ALIVE ---
 _keep_alive_stop = False
+_keep_alive_thread = None  # Handle to the running keep-alive thread (only one at a time)
 _rd_magnet_delay = 0  # Adaptive delay (seconds) between RD addMagnet calls; auto-set when rate-limited
 
 def _keep_alive_worker(interval: int = 120):
     """Background thread: simulate Colab interaction to prevent idle timeout."""
     from IPython.display import display as ipy_display, Javascript
-    global _keep_alive_stop
     while not _keep_alive_stop:
         try:
             ipy_display(Javascript('''
@@ -152,15 +153,22 @@ def _keep_alive_worker(interval: int = 120):
             '''))
         except Exception:
             pass
-        time.sleep(interval)
+        # Sleep in short increments so stop_keep_alive() takes effect promptly
+        waited = 0
+        while waited < interval and not _keep_alive_stop:
+            time.sleep(5)
+            waited += 5
 
 def start_keep_alive():
-    """Start background keep-alive thread to prevent Colab idle disconnection."""
-    global _keep_alive_stop
+    """Start background keep-alive thread to prevent Colab idle disconnection.
+    Idempotent: does nothing if a keep-alive thread is already running."""
+    global _keep_alive_stop, _keep_alive_thread
+    if _keep_alive_thread is not None and _keep_alive_thread.is_alive():
+        return
     _keep_alive_stop = False
     import threading
-    t = threading.Thread(target=_keep_alive_worker, daemon=True)
-    t.start()
+    _keep_alive_thread = threading.Thread(target=_keep_alive_worker, daemon=True)
+    _keep_alive_thread.start()
 
 def stop_keep_alive():
     """Stop the background keep-alive thread."""
@@ -170,6 +178,15 @@ def stop_keep_alive():
 # --- UI ELEMENTS ---
 token_gf = widgets.Text(description='Gofile:', placeholder='Optional', value=get_colab_secret('GOFILE_TOKEN'), style={'description_width': '80px'}, layout=widgets.Layout(width='270px'))
 token_rd = widgets.Text(description='RD Token:', placeholder='Real-Debrid API Key', value=get_colab_secret('RD_TOKEN'), style={'description_width': '100px'}, layout=widgets.Layout(width='290px'))
+token_tb = widgets.Text(description='TB Token:', placeholder='TorBox API Key', value=get_colab_secret('TB_TOKEN'), style={'description_width': '100px'}, layout=widgets.Layout(width='290px'))
+debrid_service_toggle = widgets.Dropdown(
+    options=['None', 'Real-Debrid', 'TorBox'],
+    value='None',
+    description='Debrid:',
+    tooltip='Select debrid service for premium links & magnets',
+    style={'description_width': '50px'},
+    layout=widgets.Layout(width='170px', margin='0 0 0 150px')
+)
 token_fshare_email = widgets.Text(description='FShare:', placeholder='Email', value=get_colab_secret('FSHARE_EMAIL'), style={'description_width': '80px'}, layout=widgets.Layout(width='250px'))
 token_fshare_password = widgets.Password(description='Password:', placeholder='FShare Password', value=get_colab_secret('FSHARE_PASSWORD'), style={'description_width': '80px'}, layout=widgets.Layout(width='250px'))
 show_name_override = widgets.Text(description='Name:', placeholder='Optional (Forces folder/file name)', layout=widgets.Layout(width='280px'))
@@ -196,7 +213,6 @@ auto_organize_checkbox = widgets.Checkbox(value=True, description='Auto-organise
 text_area = widgets.Textarea(description='Links:', placeholder='Paste Links Here (Transfer.it, Mega, YouTube, etc.)...', layout=widgets.Layout(width='98%', height='150px'))
 btn = widgets.Button(description="Resolve Links", button_style='success', icon='search')
 btn_quick = widgets.Button(description="Quick Download", button_style='primary', icon='bolt', tooltip='Download immediately without queue preview', layout=widgets.Layout(width='140px'))
-btn_subs = widgets.Button(description="Download Subtitles", button_style='info', icon='closed-captioning', layout=widgets.Layout(width='150px'))
 btn_resume = widgets.Button(description="Resume Previous Session", button_style='warning', icon='play', layout=widgets.Layout(display='none', width='180px'))
 btn_restart = widgets.Button(description="🔄 Restart Runtime", button_style='danger', tooltip='Restart runtime then Resume Previous Session', layout=widgets.Layout(display='none'))
 btn_history = widgets.Button(description="📜", button_style='', tooltip='View Download History', layout=widgets.Layout(width='40px'))
@@ -410,12 +426,14 @@ dir_status = widgets.HTML("")
 
 settings_buttons = widgets.HBox([btn_clear_history, btn_clear_ytarchive, btn_clear_session, btn_settings_close])
 cookie_row = widgets.HBox([btn_upload_cookies, btn_clear_cookies, cookie_status])
-api_keys_row = widgets.HBox([token_gf, token_rd])
+api_keys_row = widgets.HBox([token_gf, token_rd, token_tb])
 fshare_keys_row = widgets.HBox([token_fshare_email, token_fshare_password])
+debrid_row = widgets.HBox([debrid_service_toggle])
 settings_ui = widgets.VBox([
     widgets.HTML("<b>⚙️ Settings & File Management</b>"),
     widgets.HTML("<small><b>🔑 API Keys:</b></small>"),
     api_keys_row,
+    debrid_row,
     widgets.HTML("<small><b>🇻🇳 FShare Account:</b></small>"),
     fshare_keys_row,
     secrets_status,
@@ -438,7 +456,7 @@ about_ui = widgets.VBox([
     widgets.HTML("""
         <div style='padding: 10px;'>
             <h3>ℹ️ About Ultimate Downloader</h3>
-            <p><strong>Version:</strong> 5.5</p>
+            <p><strong>Version:</strong> 6.0</p>
             <p><strong>Author:</strong> xersbtt</p>
             <p><strong>Repository:</strong> <a href='https://github.com/xersbtt/ultimate-downloader-colab' target='_blank'>github.com/xersbtt/ultimate-downloader-colab</a></p>
             <hr>
@@ -524,13 +542,17 @@ def save_dir_settings():
             'category': category_override.value,
             'quick_dl_subs': quick_dl_subs_checkbox.value,
             'quick_dl_langs': list(quick_dl_subtitle_langs.value),
+            # FShare password is intentionally NOT saved — plaintext credentials
+            # don't belong on Drive. Use Colab Secrets (FSHARE_PASSWORD) instead.
             'fshare_email': token_fshare_email.value.strip(),
-            'fshare_password': token_fshare_password.value.strip()
+            'debrid_service': debrid_service_toggle.value
         }
         with open(SETTINGS_FILE, 'w') as f:
             json.dump(settings, f)
-    except Exception:
-        pass  # Silently fail if Drive not mounted yet
+    except Exception as e:
+        # Expected before Drive is mounted; warn only if Drive is available but the write failed
+        if os.path.exists(DRIVE_BASE):
+            print(f"⚠️ Could not save settings: {e}")
 
 def load_dir_settings(skip_ui_state=False):
     """Load directory settings from settings.json.
@@ -557,7 +579,10 @@ def load_dir_settings(skip_ui_state=False):
                 dir_anime_movies_input.value = settings['anime_movies_path']
             if settings.get('fshare_email'):
                 token_fshare_email.value = settings['fshare_email']
-            if settings.get('fshare_password'):
+            # Legacy: older versions stored the password in settings.json.
+            # Still read it so existing users aren't locked out, but it is
+            # no longer written back (use Colab Secrets FSHARE_PASSWORD).
+            if settings.get('fshare_password') and not token_fshare_password.value:
                 token_fshare_password.value = settings['fshare_password']
             # Only load UI state on initial load, not when re-loading after Drive mount
             if not skip_ui_state:
@@ -571,9 +596,13 @@ def load_dir_settings(skip_ui_state=False):
                     quick_dl_subs_checkbox.value = settings['quick_dl_subs']
                 if 'quick_dl_langs' in settings:
                     quick_dl_subtitle_langs.value = tuple(settings['quick_dl_langs'])
+                if settings.get('debrid_service'):
+                    debrid_service_toggle.value = settings['debrid_service']
             update_main_ui_visibility()
-    except Exception:
-        pass  # Use defaults if file doesn't exist or is invalid
+    except Exception as e:
+        # Use defaults if the file doesn't exist; warn if it exists but is unreadable
+        if os.path.exists(SETTINGS_FILE):
+            print(f"⚠️ Could not load settings (using defaults): {e}")
 
 def update_folder_config_visibility():
     """Show/hide appropriate folder config based on auto-organise checkbox."""
@@ -617,6 +646,7 @@ quick_dl_subs_checkbox.observe(on_dir_change, names='value')
 quick_dl_subtitle_langs.observe(on_dir_change, names='value')
 token_fshare_email.observe(on_dir_change, names='value')
 token_fshare_password.observe(on_dir_change, names='value')
+debrid_service_toggle.observe(on_dir_change, names='value')
 
 # Try to load settings on startup (will work if Drive already mounted)
 load_dir_settings()
@@ -666,8 +696,8 @@ organize_options_row = widgets.HBox([show_name_override, year_input, media_type_
     layout=widgets.Layout(display='flex' if auto_organize_checkbox.value else 'none'))
 
 input_ui = widgets.VBox([
-    widgets.HTML("<h3>🚀 Ultimate Downloader v5.5</h3>"),
-    widgets.HBox([auto_organize_checkbox]),
+    widgets.HTML("<h3>🚀 Ultimate Downloader v6.0</h3>"),
+    widgets.HBox([auto_organize_checkbox, debrid_service_toggle]),
     organize_options_row,
     widgets.HBox([concurrent_slider]),
     text_area,
@@ -698,25 +728,35 @@ def load_session() -> Optional[Dict[str, Any]]:
         print(f"⚠️ Could not load session: {e}")
     return None
 
+_last_session_save = 0.0
+SESSION_SAVE_MIN_INTERVAL = 5.0  # seconds between throttled session writes (Drive FUSE is slow)
+
 def save_session(
     tasks: List[DownloadTask],
     *,  # Force all following parameters to be keyword-only
-    gofile_token: str = "",
-    rd_token: str = "",
     show_name: str = "",
     year: str = "",
     playlist_range: str = "",
     yt_success: int = 0,
     yt_fail: int = 0,
-    subtitle_langs_value: list = None
+    subtitle_langs_value: list = None,
+    throttle: bool = False
 ):
-    """Persist current download state to Drive."""
+    """Persist current download state to Drive.
+
+    API tokens and passwords are intentionally NOT saved — on resume they are
+    re-read from the widgets / Colab Secrets instead of plaintext on Drive.
+
+    With throttle=True, writes are skipped if the last write was less than
+    SESSION_SAVE_MIN_INTERVAL seconds ago (per-task saves during large batches).
+    """
+    global _last_session_save
+    if throttle and time.time() - _last_session_save < SESSION_SAVE_MIN_INTERVAL:
+        return
     try:
         session = {
-            "version": "5.5",
+            "version": "6.0",
             "started_at": datetime.now().isoformat(),
-            "gofile_token": gofile_token,
-            "rd_token": rd_token,
             "show_name_override": show_name,
             "year": year,
             "playlist_range": playlist_range,
@@ -729,6 +769,7 @@ def save_session(
         }
         with open(SESSION_FILE, 'w') as f:
             json.dump(session, f, indent=2)
+        _last_session_save = time.time()
     except Exception as e:
         print(f"⚠️ Could not save session: {e}")
 
@@ -780,7 +821,7 @@ def view_history(b=None):
         try:
             with open(HISTORY_FILE, 'r') as f:
                 history = json.load(f)
-            print(f"\\n📊 Last 10 downloads (times in UTC):")
+            print(f"\n📊 Last 10 downloads (times in UTC):")
             for i, entry in enumerate(history[:10], 1):
                 ts = entry.get('timestamp', '')[:16].replace('T', ' ')
                 fn = entry.get('filename', 'Unknown')[:40]
@@ -796,8 +837,11 @@ def check_secrets_status():
     """Check Colab secrets status and update display."""
     gf_status = "✅" if token_gf.value.strip() else "❌"
     rd_status = "✅" if token_rd.value.strip() else "❌"
+    tb_status = "✅" if token_tb.value.strip() else "❌"
     fs_status = "✅" if token_fshare_email.value.strip() and token_fshare_password.value.strip() else "❌"
-    secrets_status.value = f"<span style='font-size:12px'>{gf_status} Gofile &nbsp; {rd_status} Real-Debrid &nbsp; {fs_status} FShare</span>"
+    debrid = debrid_service_toggle.value
+    debrid_label = f"<b>[{debrid}]</b>"
+    secrets_status.value = f"<span style='font-size:12px'>{gf_status} Gofile &nbsp; {rd_status} Real-Debrid &nbsp; {tb_status} TorBox &nbsp; {fs_status} FShare &nbsp; | Debrid: {debrid_label}</span>"
 
 def check_cookie_status():
     """Check if cookies.txt exists and update status display."""
@@ -947,15 +991,14 @@ def _do_clear_session():
 
 # --- QUEUE MANAGEMENT ---
 pending_queue: List[DownloadTask] = []  # Global queue state
-queue_mode: str = ""  # "video" or "subs_only"
 
 def update_queue_display():
     """Update the queue list widget with current pending_queue."""
     options = []
     for i, task in enumerate(pending_queue):
-        source_icon = {"gofile": "📁", "pixeldrain": "💾", "rd": "⚡", "direct": "🔗", 
+        source_icon = {"gofile": "📁", "pixeldrain": "💾", "rd": "⚡", "tb": "📦", "tb_host": "📦", "direct": "🔗", 
                        "youtube": "▶️", "mega": "☁️", "mediafire": "🔥", "1fichier": "📦",
-                       "magnet": "🧲", "magnet_file": "🧲", "archive": "📚",
+                       "magnet": "🧲", "magnet_file": "🧲", "tb_magnet_file": "🧲", "archive": "📚",
                        "fshare": "🇻🇳", "okru": "🟠"}.get(task.link_type, "📄")
         name = task.filename[:50] if task.filename else task.url[:50]
         options.append(f"{i+1}. {source_icon} {name}")
@@ -964,9 +1007,8 @@ def update_queue_display():
 
 def show_queue_preview(tasks: List[DownloadTask], mode: str):
     """Show queue UI with resolved tasks."""
-    global pending_queue, queue_mode
+    global pending_queue
     pending_queue = tasks.copy()
-    queue_mode = mode
     
     # Run batch episode analysis to improve episode detection accuracy
     # This analyzes all filenames together to find the varying number (episode) vs constants
@@ -1044,6 +1086,7 @@ def show_queue_preview(tasks: List[DownloadTask], mode: str):
         btn_queue_start_subs.layout.display = 'none'
     
     btn.disabled = True
+    btn_quick.disabled = True
     print(f"📋 Queue loaded with {len(tasks)} items. Review and click 'Start Download' or 'Download Subtitles' to begin.")
 
 def hide_queue():
@@ -1055,6 +1098,7 @@ def hide_queue():
     playlist_options.layout.display = 'none'
     btn_queue_start_subs.layout.display = 'none'
     btn.disabled = False
+    btn_quick.disabled = False
 
 def queue_move_up(b=None):
     """Move selected items up in the queue."""
@@ -1143,8 +1187,6 @@ def queue_cancel(b=None):
 
 def start_from_queue(b=None, mode="video"):
     """Start downloading selected items from queue."""
-    global pending_queue, queue_mode
-    
     selected = list(queue_list.value)
     if not selected:
         print("⚠️ No items selected! Select items to download.")
@@ -1251,7 +1293,13 @@ def is_safe_path(base_dir: str, filename: str) -> bool:
 
 # --- BATCH EPISODE DETECTION ---
 # Global cache for batch analysis results
-_batch_episode_cache: Dict[str, int] = {}  # filename -> detected episode number
+_batch_episode_cache: Dict[str, int] = {}  # stripped filename -> detected episode number
+
+def _strip_size_suffix(filename: str) -> str:
+    """Remove trailing file-size annotations like ' (126.7 MB)' added for queue display.
+    Cache keys use the stripped form so lookups work both at queue time (with suffix)
+    and at download time (without)."""
+    return re.sub(r'\s*\([^)]*[MG]i?B\s*\)\s*$', '', filename)
 
 def analyze_batch_episodes(filenames: List[str]) -> Dict[str, int]:
     """
@@ -1314,14 +1362,10 @@ def analyze_batch_episodes(filenames: List[str]) -> Dict[str, int]:
             results.append((i + 300, ep_num, m.group(0)))  # offset to distinguish
         return results
     
-    # Pre-clean filenames to remove file size info like "(126.7 MiB)"
-    def clean_for_analysis(filename: str) -> str:
-        return re.sub(r'\s*\([^)]*[MG]i?B\s*\)\s*$', '', filename)
-    
-    # Collect patterns from all files
+    # Collect patterns from all files (pre-cleaned of file size info like "(126.7 MiB)")
     all_patterns = []
     for fname in filenames:
-        clean_name = clean_for_analysis(fname)
+        clean_name = _strip_size_suffix(fname)
         patterns = extract_bracket_numbers(clean_name) + extract_dash_numbers(clean_name) + extract_space_numbers(clean_name) + extract_nxn_numbers(clean_name)
         all_patterns.append((fname, patterns))  # Keep original filename as key
     
@@ -1377,20 +1421,21 @@ def analyze_batch_episodes(filenames: List[str]) -> Dict[str, int]:
     if episode_position is None:
         return {}
     
-    # Map filenames to their episode numbers at the detected position
+    # Map filenames to their episode numbers at the detected position.
+    # Keys are stripped of size suffixes so download-time filenames still match.
     result = {}
     for fname, patterns in all_patterns:
         for pos_idx, num_val, _ in patterns:
             if pos_idx == episode_position:
-                result[fname] = num_val
+                result[_strip_size_suffix(fname)] = num_val
                 break
-    
+
     _batch_episode_cache = result
     return result
 
 def get_batch_episode(filename: str) -> Optional[int]:
     """Get batch-detected episode number for a filename, if available."""
-    return _batch_episode_cache.get(filename)
+    return _batch_episode_cache.get(_strip_size_suffix(filename))
 
 def check_duplicate_in_drive(filename: str, source: str = "generic", playlist_index: Optional[int] = None) -> bool:
     """Check if file already exists in Drive to avoid re-downloading"""
@@ -1401,16 +1446,14 @@ def check_duplicate_in_drive(filename: str, source: str = "generic", playlist_in
         return True
     return False
 
-def determine_destination_path(filename: str, source: str = "generic", dry_run: bool = False, playlist_index: Optional[int] = None) -> Tuple[str, str]:
-    filename = sanitize_filename(filename)
-    
-    # If auto-organise is disabled, just return Downloads folder with original filename
-    if not is_auto_organize_enabled():
-        downloads_dir = os.path.join(DRIVE_BASE, get_downloads_path())
-        if not dry_run and not os.path.exists(downloads_dir):
-            os.makedirs(downloads_dir, exist_ok=True)
-        return os.path.join(downloads_dir, filename), "Downloads"
-    
+def detect_episode_info(filename: str) -> Dict[str, Any]:
+    """Parse a filename for episode/season/show-name markers.
+
+    Pure function (no widget/UI access) so the detection logic can be
+    unit-tested directly. Returns a dict with keys: episode_detected,
+    is_tv, season, episode, show_name, part_suffix (CJK multi-part),
+    english_part_suffix ("Part X"), has_sxe (strict SxxExx/NxN present).
+    """
     # CJK multi-part markers always apply (these genuinely split one episode into parts)
     part_suffix = ""
     if "上篇" in filename: part_suffix = "-pt1"
@@ -1422,8 +1465,6 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
     if re.search(r'(?i)(?:Part|Pt)\.?\s*1\b', filename): english_part_suffix = "-pt1"
     elif re.search(r'(?i)(?:Part|Pt)\.?\s*2\b', filename): english_part_suffix = "-pt2"
 
-    manual_show_name = show_name_override.value.strip()
-    manual_year = year_input.value.strip()
     show_name = "Unknown Show" 
     
     sxe_strict = re.search(r'(?i)\bS(\d{1,2})E(\d{1,4})(?:v\d+)?\b', filename)
@@ -1559,7 +1600,40 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
                 
             is_tv = True
             episode_detected = True
+
+    return {
+        'episode_detected': episode_detected,
+        'is_tv': is_tv,
+        'season': season_num,
+        'episode': episode_num,
+        'show_name': show_name,
+        'part_suffix': part_suffix,
+        'english_part_suffix': english_part_suffix,
+        'has_sxe': bool(sxe_strict or sxe_nxn),
+    }
+
+def determine_destination_path(filename: str, source: str = "generic", dry_run: bool = False, playlist_index: Optional[int] = None) -> Tuple[str, str]:
+    filename = sanitize_filename(filename)
     
+    # If auto-organise is disabled, just return Downloads folder with original filename
+    if not is_auto_organize_enabled():
+        downloads_dir = os.path.join(DRIVE_BASE, get_downloads_path())
+        if not dry_run and not os.path.exists(downloads_dir):
+            os.makedirs(downloads_dir, exist_ok=True)
+        return os.path.join(downloads_dir, filename), "Downloads"
+    
+    # Parse episode/show info from the filename (pure logic, unit-testable)
+    info = detect_episode_info(filename)
+    part_suffix = info['part_suffix']
+    english_part_suffix = info['english_part_suffix']
+    show_name = info['show_name']
+    season_num, episode_num = info['season'], info['episode']
+    is_tv = info['is_tv']
+    episode_detected = info['episode_detected']
+
+    manual_show_name = show_name_override.value.strip()
+    manual_year = year_input.value.strip()
+
     # Apply category override if set
     cat_override = category_override.value
     if cat_override == 'Movie':
@@ -1619,7 +1693,7 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
     _, ext = os.path.splitext(filename)
     # Apply English part suffix only when no SxxExx/NxN pattern was detected
     # (SxxExx already uniquely identifies the episode — Part 2 is typically the next episode)
-    if english_part_suffix and not sxe_strict and not sxe_nxn:
+    if english_part_suffix and not info['has_sxe']:
         part_suffix = part_suffix or english_part_suffix
     new_filename = f"{show_name} - S{season_num:02d}E{episode_num:02d}{part_suffix}{ext}"
     season_folder = "Specials" if season_num == 0 else f"Season {season_num:02d}"
@@ -1641,7 +1715,7 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
 # --- CORE LOGIC ---
 def setup_environment(needs_mega, needs_ytdlp, needs_aria):
     drive_path = f"{COLAB_ROOT}drive"
-    if not os.path.exists(drive_path): drive.mount(drive_path)
+    if drive is not None and not os.path.exists(drive_path): drive.mount(drive_path)
     
     # Try to load secrets again (may not have been accessible on initial load)
     check_and_load_secrets()
@@ -2016,101 +2090,115 @@ def process_mega_link(url) -> bool:
         progress_bar.bar_style = 'info'
     return success
 
-def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optional[str] = None, task_id: Optional[str] = None) -> Optional[str]:
-    """Thread-safe aria2 download with progress tracking."""
+def _speed_to_mbs(value: float, unit: str) -> float:
+    """Convert a speed value with a K/M/G unit prefix to MB/s."""
+    if unit == 'K': return value / 1024
+    if unit == 'G': return value * 1024
+    return value
+
+def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optional[str] = None,
+                        task_id: Optional[str] = None, update_bar: bool = True) -> Optional[str]:
+    """Thread-safe aria2 download with progress tracking.
+
+    update_bar=False leaves the shared progress bar to the batch monitor thread
+    (parallel downloads); sequential callers keep direct bar updates.
+    """
     filename = sanitize_filename(filename)
-    
+
     # Safeguard: if filename is empty, extract from URL
     if not filename or not filename.strip():
         filename = os.path.basename(unquote(urlparse(url).path)) or "download"
         filename = sanitize_filename(filename)
         if not filename or not filename.strip():
             filename = f"download_{int(time.time())}"
-    
+
     if check_duplicate_in_drive(filename):
-        return None
-    
+        return DUPLICATE_SKIP
+
     final_path = os.path.join(dest_folder, filename)
     if os.path.exists(final_path) and os.path.getsize(final_path) > 1024*1024: return final_path
     with print_lock:
         print(f"   ⬇️ Downloading: {filename}")
-    
+
     with progress_lock:
         if task_id:
-            active_downloads[task_id] = "starting"
-        progress_bar.value = 0
-        progress_bar.bar_style = 'info'
-        progress_bar.description = "Starting..."
-    
-    cmd = ['aria2c', url, '-d', dest_folder, '-o', filename, '-x', '16', '-s', '16', '-k', '1M', 
-           '-c', '--file-allocation=none', '--user-agent', 'Mozilla/5.0', 
+            download_stats[task_id] = {'pct': 0.0, 'speed_mbs': 0.0}
+        if update_bar:
+            progress_bar.value = 0
+            progress_bar.bar_style = 'info'
+            progress_bar.description = "Starting..."
+
+    cmd = ['aria2c', url, '-d', dest_folder, '-o', filename, '-x', '16', '-s', '16', '-k', '1M',
+           '-c', '--file-allocation=none', '--user-agent', 'Mozilla/5.0',
            '--connect-timeout=30', '--timeout=60', '--max-tries=3', '--retry-wait=2',
            '--summary-interval=1', '--show-console-readout=true']
     if cookie: cmd.extend(['--header', f'Cookie: accountToken={cookie}'])
-    
+
     for attempt in range(1, 4):
         try:
+            dl_start = time.time()
+            completed_path = None  # Path reported by aria2's "Download complete:" line
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
             last_speed = ""
+            last_speed_mbs = 0.0
             for line in process.stdout:
+                complete_match = re.search(r'Download complete:\s*(\S.*)', line)
+                if complete_match:
+                    completed_path = complete_match.group(1).strip()
                 match = re.search(r'\((\d+)%\)', line)
                 # aria2 outputs speed as "DL:5.2MiB" or "DL: 5.2MiB/s" - capture various formats
-                speed_match = re.search(r'DL:\s*(\d+\.?\d*)\s*([KMG]i?B)', line)
+                speed_match = re.search(r'DL:\s*(\d+\.?\d*)\s*([KMG])i?B', line)
                 if match:
-                    try: 
+                    try:
                         val = float(match.group(1))
                         if speed_match:
-                            speed_str = f"{speed_match.group(1)}{speed_match.group(2)}/s"
-                            last_speed = speed_str
-                        else:
-                            speed_str = last_speed
+                            last_speed = f"{speed_match.group(1)}{speed_match.group(2)}iB/s"
+                            last_speed_mbs = _speed_to_mbs(float(speed_match.group(1)), speed_match.group(2))
                         with progress_lock:
                             if task_id:
-                                active_downloads[task_id] = f"{int(val)}% ({speed_str})"
-                            # Also update progress bar directly for sequential downloads
-                            progress_bar.value = val
-                            progress_bar.description = f"DL: {int(val)}% ({speed_str})" if speed_str else f"DL: {int(val)}%"
+                                download_stats[task_id] = {'pct': val, 'speed_mbs': last_speed_mbs}
+                            if update_bar:
+                                progress_bar.value = val
+                                progress_bar.description = f"DL: {int(val)}% ({last_speed})" if last_speed else f"DL: {int(val)}%"
                     except Exception: pass
             process.wait()
-            file_exists = os.path.exists(final_path)
-            if process.returncode == 0 and file_exists: 
-                with progress_lock:
-                    if task_id:
-                        active_downloads[task_id] = "done"
+            if process.returncode == 0 and os.path.exists(final_path):
                 return final_path
-            else:
-                # Check if aria2 succeeded but saved with a different filename (common with URL-encoded names)
-                if process.returncode == 0:
-                    # Look for recently created files in dest folder matching the extension
-                    _, ext = os.path.splitext(filename)
-                    for f in os.listdir(dest_folder):
-                        candidate = os.path.join(dest_folder, f)
-                        if f.endswith(ext) and os.path.isfile(candidate):
-                            # Check if this file was created in the last 60 seconds
-                            if time.time() - os.path.getmtime(candidate) < 60:
-                                with print_lock:
-                                    print(f"      ✓ Found downloaded file: {f}")
-                                with progress_lock:
-                                    if task_id:
-                                        active_downloads[task_id] = "done"
-                                return candidate
-                with print_lock:
-                    if not os.path.exists(final_path):
-                        print(f"      ⚠️ Retry {attempt}/3 - File not found at expected path")
-                        print(f"         Expected: {final_path}")
-                    else:
-                        print(f"      ⚠️ Retry {attempt}/3 - aria2 returned code {process.returncode}")
-                time.sleep(2**attempt)
+            if process.returncode == 0:
+                # aria2 succeeded but saved under a different name (common with URL-encoded names).
+                # Most reliable: the path aria2 itself reported as complete.
+                if completed_path and os.path.isfile(completed_path):
+                    with print_lock:
+                        print(f"      ✓ Found downloaded file: {os.path.basename(completed_path)}")
+                    return completed_path
+                # Fallback: a matching file created by THIS attempt. Files with an .aria2
+                # control file belong to another still-running worker - never take those.
+                _, ext = os.path.splitext(filename)
+                for f in os.listdir(dest_folder):
+                    candidate = os.path.join(dest_folder, f)
+                    if not (f.endswith(ext) and os.path.isfile(candidate)):
+                        continue
+                    if os.path.exists(candidate + '.aria2'):
+                        continue  # in-progress download owned by another task
+                    if os.path.getmtime(candidate) < dl_start:
+                        continue  # existed before this attempt started
+                    with print_lock:
+                        print(f"      ✓ Found downloaded file: {f}")
+                    return candidate
+            with print_lock:
+                if not os.path.exists(final_path):
+                    print(f"      ⚠️ Retry {attempt}/3 - File not found at expected path")
+                    print(f"         Expected: {final_path}")
+                else:
+                    print(f"      ⚠️ Retry {attempt}/3 - aria2 returned code {process.returncode}")
+            time.sleep(2**attempt)
         except Exception as e:
             with print_lock:
                 print(f"      ❌ Download error (attempt {attempt}/3): {str(e)[:80]}")
             break
-    
+
     with print_lock:
         print(f"   ❌ Download failed after 3 attempts - Check URL validity or network connection")
-    with progress_lock:
-        if task_id:
-            active_downloads[task_id] = "failed"
     return None
 
 def move_with_progress(src: str, dest: str):
@@ -2188,17 +2276,27 @@ def handle_file_processing(file_path, source="generic"):
         if ext == '.srt':
             parts = filename.split('.')
             if len(parts) >= 3 and len(parts[-2]) in [2, 3]: processing_name = ".".join(parts[:-2]) + ext
-        
+
         final_dest, cat = determine_destination_path(processing_name, source)
-        
+
         if ext == '.srt':
             parts = filename.split('.')
             lang = parts[-2] if len(parts) >= 3 and len(parts[-2]) in [2, 3] else ""
             base = os.path.splitext(final_dest)[0]
             final_dest = f"{base}.{lang}.srt" if lang else f"{base}.srt"
-        
-        if os.path.exists(final_dest): os.remove(final_dest)
-        
+
+        if os.path.exists(final_dest):
+            # Subtitles are cheap and re-downloading them is an explicit user action - refresh.
+            # Anything else: keep the existing Drive copy, consistent with duplicate skipping.
+            if ext in KEEP_EXTENSIONS:
+                os.remove(final_dest)
+            else:
+                size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                print(f"   ⏭️  Already in Drive (kept existing): {os.path.basename(final_dest)}")
+                os.remove(file_path)
+                log_download(os.path.basename(final_dest), source, size_mb, final_dest, status="skipped")
+                return
+
         if not os.path.exists(os.path.dirname(final_dest)): os.makedirs(os.path.dirname(final_dest))
         size_mb = os.path.getsize(file_path) / (1024 * 1024)
         move_with_progress(file_path, final_dest)
@@ -2220,57 +2318,79 @@ def handle_file_processing(file_path, source="generic"):
             res = subprocess.run(['7z', 'l', '-ba', '-slt', file_path], capture_output=True, text=True)
             if res.returncode == 0:
                 for line in res.stdout.splitlines():
-                    if line.strip().startswith('Path = '): archive_files.append(line.split(' = ')[1])
+                    if line.strip().startswith('Path = '): archive_files.append(line.split(' = ', 1)[1])
     except Exception as e:
         print(f"   ❌ Failed to read archive: {str(e)[:80]}")
         return
-    
-    total_files = len(archive_files)
-    print(f"   📄 Extracting {total_files} files sequentially...")
-    extracted_count = 0
-    
+
+    # Filter the listing to extractable, safe entries
+    wanted = []
+    excluded = False
     for f_path in archive_files:
-        if f_path.endswith(('/', '\\')) or '__MACOSX' in f_path: continue
-        
+        if f_path.endswith(('/', '\\')) or '__MACOSX' in f_path:
+            excluded = True
+            continue
         if not is_safe_path(extract_temp, f_path):
             print(f"      ⚠️ SKIPPING UNSAFE PATH: {f_path}")
+            excluded = True
+            continue
+        wanted.append(f_path)
+
+    if not wanted:
+        print("   ⚠️ No extractable files found in archive")
+        shutil.rmtree(extract_temp, ignore_errors=True)
+        return
+
+    # Extract in a single pass - per-file extraction re-decompresses solid RAR archives
+    # from the start each time (O(N^2)). Pass an explicit file list only when some
+    # entries were excluded above; otherwise extract everything.
+    total_files = len(wanted)
+    print(f"   📄 Extracting {total_files} files...")
+    with progress_lock:
+        progress_bar.description = f"Extracting {total_files} files..."
+        progress_bar.value = 0
+    if '.rar' in ext:
+        cmd = ['unrar', 'x', '-o+', file_path] + (wanted if excluded else []) + [extract_temp + '/']
+    else:
+        cmd = ['7z', 'x', '-y', file_path, f'-o{extract_temp}'] + (wanted if excluded else [])
+    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if res.returncode != 0:
+        print(f"      ⚠️ Extractor exited with code {res.returncode} - some files may be missing")
+
+    processed_count = 0
+    for idx, f_path in enumerate(wanted, 1):
+        with progress_lock:
+            progress_bar.description = f"Organise: {idx}/{total_files}"
+            progress_bar.value = (idx / total_files) * 100
+
+        extracted_full = os.path.join(extract_temp, f_path)
+        if not os.path.exists(extracted_full) or os.path.isdir(extracted_full):
+            continue
+        if os.path.getsize(extracted_full) < MIN_FILE_SIZE_MB * 1024 * 1024 and not f_path.endswith(tuple(KEEP_EXTENSIONS)):
+            os.remove(extracted_full)
+            continue
+        final_dest, cat = determine_destination_path(f_path, source)
+
+        if os.path.exists(final_dest):
+            print(f"      -> ⚠️ Duplicate in Drive (kept existing): {os.path.basename(final_dest)}")
+            os.remove(extracted_full)
             continue
 
-        extracted_count += 1
-        with progress_lock:
-            progress_bar.description = f"Extract: {extracted_count}/{total_files}"
-            progress_bar.value = (extracted_count / total_files) * 100
-        
-        cmd = []
-        if '.rar' in ext: cmd = ['unrar', 'x', '-o+', file_path, f_path, extract_temp]
-        else: cmd = ['7z', 'x', '-y', file_path, f'-o{extract_temp}', f_path]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
-        extracted_full = os.path.join(extract_temp, f_path)
-        if os.path.exists(extracted_full) and not os.path.isdir(extracted_full):
-            if os.path.getsize(extracted_full) < MIN_FILE_SIZE_MB * 1024 * 1024 and not f_path.endswith(tuple(KEEP_EXTENSIONS)):
-                os.remove(extracted_full); continue
-            final_dest, cat = determine_destination_path(f_path, source)
-            
-            if os.path.exists(final_dest):
-                print(f"      -> ⚠️ Duplicate in Drive (Deleted): {os.path.basename(final_dest)}")
-                os.remove(extracted_full)
-                continue
+        if not os.path.exists(os.path.dirname(final_dest)): os.makedirs(os.path.dirname(final_dest))
+        size_mb = os.path.getsize(extracted_full) / (1024 * 1024)
+        move_with_progress(extracted_full, final_dest)
+        print(f"      [{idx}/{total_files}] -> {os.path.basename(final_dest)}")
+        log_download(os.path.basename(final_dest), source, size_mb, final_dest)
+        processed_count += 1
 
-            if not os.path.exists(os.path.dirname(final_dest)): os.makedirs(os.path.dirname(final_dest))
-            size_mb = os.path.getsize(extracted_full) / (1024 * 1024)
-            move_with_progress(extracted_full, final_dest)
-            print(f"      [{extracted_count}/{total_files}] -> {os.path.basename(final_dest)}")
-            log_download(os.path.basename(final_dest), source, size_mb, final_dest)
-        
-        if os.path.exists(extract_temp): shutil.rmtree(extract_temp, ignore_errors=True)
-        os.makedirs(extract_temp)
-
-    os.remove(file_path)
-    if os.path.exists(extract_temp): shutil.rmtree(extract_temp)
+    shutil.rmtree(extract_temp, ignore_errors=True)
+    if processed_count == 0 and res.returncode != 0:
+        print(f"   ❌ Extraction failed - archive kept for manual retry: {file_path}")
+    else:
+        os.remove(file_path)
+        print(f"   ✅ Extraction complete: {processed_count} files processed")
     with progress_lock:
         progress_bar.description = "Idle"
-    print(f"   ✅ Extraction complete: {extracted_count} files processed")
 
 def get_gofile_session(token: Optional[str]) -> Tuple[requests.Session, dict]:
     """Create authenticated Gofile session."""
@@ -2312,7 +2432,9 @@ def resolve_pixeldrain(url, s) -> List[Tuple[str, str]]:
         print(f"   ❌ Pixeldrain Error: {str(e)[:80]} - File may not exist or be private")
     return []
 
-def process_rd_link(link, key):
+def process_rd_link(link, key) -> bool:
+    """Download an RD link or magnet. Returns True on success (or duplicate skip),
+    False on any error/timeout/failed download so the caller can mark it for retry."""
     h = {"Authorization": f"Bearer {key}"}
     if "magnet:?" in link:
         print("   🧲 Resolving Magnet...")
@@ -2320,69 +2442,67 @@ def process_rd_link(link, key):
             r = requests.post("https://api.real-debrid.com/rest/1.0/torrents/addMagnet", data={"magnet": link}, headers=h, timeout=30).json()
             if 'error' in r:
                 print(f"   ❌ RD Magnet Error: {r.get('error', 'Unknown')} - Check token or magnet validity")
-                return
+                return False
             requests.post(f"https://api.real-debrid.com/rest/1.0/torrents/selectFiles/{r['id']}", data={"files": "all"}, headers=h, timeout=30)
-            
+
             # Poll for torrent status with progress updates
             with progress_lock:
                 progress_bar.value = 0
                 progress_bar.bar_style = 'info'
                 progress_bar.description = "RD: Caching..."
-            
+
             for poll_count in range(60):  # 2 minutes max (60 * 2s)
                 i = requests.get(f"https://api.real-debrid.com/rest/1.0/torrents/info/{r['id']}", headers=h, timeout=30).json()
-                
+
                 # Update progress bar with RD caching progress
                 progress_pct = i.get('progress', 0)
                 status = i.get('status', 'unknown')
-                with progress_lock:
-                    progress_bar.value = progress_pct
-                    if status == 'downloading':
-                        progress_bar.description = f"RD: {int(progress_pct)}% cached"
-                    elif status == 'waiting_files_selection':
-                        progress_bar.description = "RD: Selecting files..."
-                    elif status == 'queued':
-                        progress_bar.description = "RD: Queued..."
-                    else:
-                        progress_bar.description = f"RD: {status}"
-                
+                _update_torrent_progress("RD", status, progress_pct,
+                                         state_labels={'waiting_files_selection': 'Selecting files...'})
+
                 if status == 'downloaded':
                     with progress_lock:
                         progress_bar.value = 100
                         progress_bar.description = "RD: Cached ✓"
                     print(f"   ✅ Torrent cached - {len(i.get('links', []))} file(s)")
+                    all_ok = True
                     for idx, l in enumerate(i['links'], 1):
                         print(f"   📥 Downloading file {idx}/{len(i['links'])}...")
-                        process_rd_link(l, key)
-                    return
+                        if not process_rd_link(l, key):
+                            all_ok = False  # One failed file fails the magnet; retry re-skips the done ones
+                    return all_ok
                 time.sleep(2)
-            
+
             print("   ❌ RD Timeout - Torrent took too long to cache (2 min limit)")
         except Exception as e:
             print(f"   ❌ RD Magnet Error: {str(e)[:80]}")
         finally:
-            with progress_lock:
-                progress_bar.description = "Idle"
-                progress_bar.bar_style = 'info'
-        return
-    
+            _reset_progress_bar()
+        return False
+
     # Regular RD link (unrestrict and download)
     try:
         d = requests.post("https://api.real-debrid.com/rest/1.0/unrestrict/link", data={"link": link}, headers=h, timeout=30).json()
         if 'error' in d:
             print(f"   ❌ RD Unrestrict Error: {d.get('error', 'Unknown')} - Check if link is supported")
-            return
-        
+            return False
+
         # Generate a task_id for progress tracking
         task_id = f"rd_{str(uuid4())[:8]}"
         with progress_lock:
             progress_bar.value = 0
             progress_bar.bar_style = 'info'
-        
+
         f = download_with_aria2(d['download'], d['filename'], COLAB_ROOT, task_id=task_id)
-        if f: handle_file_processing(f)
+        if f is DUPLICATE_SKIP:
+            return True  # Already in Drive
+        if f:
+            handle_file_processing(f)
+            return True
+        return False
     except Exception as e:
         print(f"   ❌ RD Error: {str(e)[:80]}")
+        return False
 
 def resolve_rd_link(url: str, rd_key: str) -> List[Tuple[str, str]]:
     """Unrestrict a Real-Debrid link and return (download_url, filename) tuple."""
@@ -2459,21 +2579,11 @@ def resolve_magnet_files(magnet_url: str, rd_key: str) -> List[DownloadTask]:
                     file_id = f.get('id')
                     file_path = f.get('path', '').lstrip('/')
                     file_name = os.path.basename(file_path) if file_path else f"file_{file_id}"
-                    file_size = f.get('bytes', 0)
-                    size_mb = file_size / (1024 * 1024)
-                    
-                    # Skip very small files (likely samples or NFOs)
-                    if size_mb < 1 and not file_name.endswith(('.srt', '.ass', '.sub', '.vtt')):
-                        continue
-                    
-                    tasks.append(DownloadTask(
-                        url=magnet_url,  # Store original magnet
-                        filename=f"{file_name} ({size_mb:.1f} MB)" if size_mb > 0 else file_name,
-                        source="magnet",
-                        link_type="magnet_file",
-                        original_url=f"{torrent_id}:{file_id}",  # Store torrent_id:file_id for later selection
-                    ))
-                
+                    task = _make_torrent_file_task(magnet_url, "magnet_file", torrent_id,
+                                                   file_id, file_name, f.get('bytes', 0))
+                    if task:
+                        tasks.append(task)
+
                 return tasks
             
             elif status == 'downloaded':
@@ -2533,19 +2643,14 @@ def process_magnet_file_tasks(tasks: List[DownloadTask], rd_key: str) -> int:
     
     h = {"Authorization": f"Bearer {rd_key}"}
     success_count = 0
-    
-    # Group tasks by torrent_id (stored as torrent_id:file_id in original_url)
-    torrent_files: Dict[str, List[Tuple[str, DownloadTask]]] = {}  # torrent_id -> [(file_id, task), ...]
-    
-    for task in tasks:
-        if task.original_url and ':' in task.original_url:
-            torrent_id, file_id = task.original_url.split(':', 1)
-            if torrent_id not in torrent_files:
-                torrent_files[torrent_id] = []
-            torrent_files[torrent_id].append((file_id, task))
-    
-    # Process each torrent
-    for torrent_id, file_list in torrent_files.items():
+
+    # Process each torrent (tasks grouped by torrent_id from original_url)
+    for torrent_id, file_list in _group_tasks_by_torrent(tasks).items():
+        # Default to failed; upgraded to done/skipped per file below. This way a
+        # torrent error or cache timeout leaves the tasks failed (retryable on resume).
+        for _fid, task in file_list:
+            task.status = "failed"
+            task.error = "Not downloaded"
         try:
             file_ids = [fid for fid, _ in file_list]
             print(f"\n   🧲 Processing torrent with {len(file_ids)} selected file(s)...")
@@ -2574,16 +2679,9 @@ def process_magnet_file_tasks(tasks: List[DownloadTask], rd_key: str) -> int:
                 
                 status = info.get('status', '')
                 progress_pct = info.get('progress', 0)
-                
-                with progress_lock:
-                    progress_bar.value = progress_pct
-                    if status == 'downloading':
-                        progress_bar.description = f"RD: {int(progress_pct)}% cached"
-                    elif status == 'queued':
-                        progress_bar.description = "RD: Queued..."
-                    else:
-                        progress_bar.description = f"RD: {status}"
-                
+
+                _update_torrent_progress("RD", status, progress_pct)
+
                 if status == 'downloaded':
                     links = info.get('links', [])
                     print(f"   ✅ Cached! Downloading {len(links)} file(s)...")
@@ -2592,27 +2690,38 @@ def process_magnet_file_tasks(tasks: List[DownloadTask], rd_key: str) -> int:
                         progress_bar.value = 100
                         progress_bar.description = "RD: Cached ✓"
                     
-                    # Download each link
+                    # Download each link. RD returns links in selected-file order,
+                    # so links[k] maps to file_list[k].
                     for idx, link in enumerate(links, 1):
                         # Rate limit: delay between unrestrict calls to avoid RD fair-use blocks
                         if idx > 1:
                             time.sleep(2)
+                        task = file_list[idx-1][1] if idx-1 < len(file_list) else None
                         try:
                             d = requests.post(
                                 "https://api.real-debrid.com/rest/1.0/unrestrict/link",
                                 data={"link": link}, headers=h, timeout=30
                             ).json()
-                            
+
                             if 'download' in d:
                                 print(f"   📥 [{idx}/{len(links)}] {d.get('filename', 'file')[:50]}")
-                                task_id = f"rd_{str(uuid4())[:8]}"
+                                task_id = task.id if task else f"rd_{str(uuid4())[:8]}"
                                 f = download_with_aria2(d['download'], d['filename'], COLAB_ROOT, task_id=task_id)
-                                if f:
-                                    handle_file_processing(f, source="magnet")
+                                if f is DUPLICATE_SKIP:
+                                    if task: task.status, task.error = "skipped", None
                                     success_count += 1
+                                elif f:
+                                    handle_file_processing(f, source="magnet")
+                                    if task: task.status, task.error = "done", None
+                                    success_count += 1
+                                else:
+                                    if task: task.error = "Download failed"
+                            else:
+                                if task: task.error = f"Unrestrict error: {d.get('error', 'unknown')}"
                         except Exception as e:
                             print(f"   ❌ Failed to download: {str(e)[:60]}")
-                    
+                            if task: task.error = str(e)[:100]
+
                     break
                 
                 elif status in ['magnet_error', 'error', 'dead']:
@@ -2626,11 +2735,397 @@ def process_magnet_file_tasks(tasks: List[DownloadTask], rd_key: str) -> int:
         except Exception as e:
             print(f"   ❌ Error processing torrent: {str(e)[:80]}")
         finally:
-            with progress_lock:
-                progress_bar.description = "Idle"
-                progress_bar.bar_style = 'info'
-    
+            _reset_progress_bar()
+
     return success_count
+
+# --- DEBRID SERVICE HELPERS ---
+# Shared building blocks for the Real-Debrid and TorBox flows. Both services follow
+# the same shape (add magnet → poll until cached → request per-file links), so the
+# structural pieces live here and only the API specifics stay per-service.
+
+def _reset_progress_bar():
+    """Reset the shared progress bar to idle (used in debrid finally blocks)."""
+    with progress_lock:
+        progress_bar.description = "Idle"
+        progress_bar.bar_style = 'info'
+
+def _update_torrent_progress(prefix: str, status: str, progress_pct: float,
+                             downloading_states=('downloading',), state_labels=None):
+    """Update the shared progress bar while a debrid service caches a torrent."""
+    with progress_lock:
+        progress_bar.value = progress_pct
+        if status in downloading_states:
+            progress_bar.description = f"{prefix}: {int(progress_pct)}% cached"
+        elif state_labels and status in state_labels:
+            progress_bar.description = f"{prefix}: {state_labels[status]}"
+        elif status == 'queued':
+            progress_bar.description = f"{prefix}: Queued..."
+        else:
+            progress_bar.description = f"{prefix}: {status}"
+
+def _make_torrent_file_task(magnet_url: str, link_type: str, torrent_id, file_id,
+                            file_name: str, size_bytes: int) -> Optional[DownloadTask]:
+    """Build a queue task for one file inside a debrid torrent.
+    Returns None for tiny files (samples/NFOs) unless they are subtitles."""
+    size_mb = size_bytes / (1024 * 1024)
+    if size_mb < 1 and not file_name.endswith(tuple(KEEP_EXTENSIONS)):
+        return None
+    return DownloadTask(
+        url=magnet_url,
+        filename=f"{file_name} ({size_mb:.1f} MB)" if size_mb > 0 else file_name,
+        source="magnet",
+        link_type=link_type,
+        original_url=f"{torrent_id}:{file_id}",  # torrent_id:file_id for later selection
+    )
+
+def _group_tasks_by_torrent(tasks: List[DownloadTask]) -> Dict[str, List[Tuple[str, DownloadTask]]]:
+    """Group magnet-file tasks by torrent id (original_url stores 'torrent_id:file_id')."""
+    grouped: Dict[str, List[Tuple[str, DownloadTask]]] = {}
+    for task in tasks:
+        if task.original_url and ':' in task.original_url:
+            torrent_id, file_id = task.original_url.split(':', 1)
+            grouped.setdefault(torrent_id, []).append((file_id, task))
+    return grouped
+
+def get_active_debrid() -> Tuple[str, str, str]:
+    """Return (service_name, rd_key, tb_key) based on debrid toggle selection.
+    service_name: 'rd', 'tb', or 'none'
+    rd_key: Real-Debrid API key (empty if TorBox selected or None)
+    tb_key: TorBox API key (empty if Real-Debrid selected or None)
+    """
+    service = debrid_service_toggle.value
+    if service == 'TorBox':
+        return ('tb', '', token_tb.value.strip())
+    elif service == 'Real-Debrid':
+        return ('rd', token_rd.value.strip(), '')
+    return ('none', '', '')
+
+# --- TORBOX API FUNCTIONS ---
+def _get_tb_headers(tb_key: str) -> dict:
+    """Return authorization headers for TorBox API."""
+    return {"Authorization": f"Bearer {tb_key}"}
+
+def _tb_fetch_item(endpoint: str, item_id, tb_key: str) -> Optional[dict]:
+    """Fetch one entry from a TorBox mylist endpoint ('torrents' or 'webdl').
+    Returns the item dict, or None if not available yet (caller keeps polling)."""
+    try:
+        r = requests.get(f"{TORBOX_API_BASE}/{endpoint}/mylist",
+                         params={"id": item_id}, headers=_get_tb_headers(tb_key), timeout=30)
+        data = r.json()
+        if not data.get('success'):
+            return None
+        item = data.get('data')
+        if isinstance(item, list):
+            item = next((x for x in item if x.get('id') == item_id), None)
+        return item
+    except Exception:
+        return None  # Transient poll error — caller retries until its poll limit
+
+def _tb_progress_pct(item: dict) -> float:
+    """TorBox reports progress as 0-1 or 0-100 depending on endpoint — normalise to 0-100."""
+    progress = item.get('progress', 0)
+    return progress * 100 if progress <= 1 else progress
+
+def _tb_extract_download_url(dl_data: dict) -> str:
+    """Extract the download URL from a TorBox requestdl response ('' if missing)."""
+    if not (dl_data.get('success') and dl_data.get('data')):
+        return ''
+    data = dl_data['data']
+    if isinstance(data, str):
+        return data
+    return data.get('download_url', data.get('url', ''))
+
+def resolve_tb_link(url: str, tb_key: str) -> List[Tuple[str, str]]:
+    """Unrestrict a link via TorBox Web Downloads.
+    Creates a web download, polls until completed, then gets download URL.
+    Returns [(download_url, filename)] list matching RD's return format.
+    """
+    if not tb_key:
+        print(f"   ❌ TorBox Token required for: {url}")
+        return []
+    
+    h = _get_tb_headers(tb_key)
+    
+    try:
+        # Step 1: Create web download
+        r = requests.post(f"{TORBOX_API_BASE}/webdl/createwebdownload",
+                         json={"url": url}, headers=h, timeout=30)
+        data = r.json()
+        
+        if not data.get('success'):
+            err = data.get('detail', data.get('error', 'Unknown error'))
+            print(f"   ❌ TorBox Web DL Error: {err}")
+            return []
+        
+        webdl_id = data['data'].get('webdownload_id') or data['data'].get('id')
+        if not webdl_id:
+            print(f"   ❌ TorBox: No download ID returned")
+            return []
+        
+        # Step 2: Poll for completion
+        print(f"   ⏳ TorBox: Processing download...")
+        with progress_lock:
+            progress_bar.value = 0
+            progress_bar.bar_style = 'info'
+            progress_bar.description = "TB: Processing..."
+        
+        for poll_count in range(90):  # 3 minutes max (90 * 2s)
+            item = _tb_fetch_item('webdl', webdl_id, tb_key)
+            if not item:
+                time.sleep(2)
+                continue
+
+            status = item.get('download_state', item.get('status', ''))
+            progress_pct = _tb_progress_pct(item)
+
+            with progress_lock:
+                progress_bar.value = progress_pct
+                progress_bar.description = f"TB: {int(progress_pct)}%"
+
+            if status in ['completed', 'cached', 'done']:
+                filename = item.get('name', item.get('filename', 'download'))
+
+                # Step 3: Get download URL (first/main file)
+                files = item.get('files', [])
+                file_id = files[0].get('id', 0) if files else 0
+
+                dl_r = requests.get(f"{TORBOX_API_BASE}/webdl/requestdl",
+                                   params={"token": tb_key, "web_download_id": webdl_id,
+                                          "file_id": file_id},
+                                   headers=h, timeout=30)
+                download_url = _tb_extract_download_url(dl_r.json())
+                if download_url:
+                    with progress_lock:
+                        progress_bar.value = 100
+                        progress_bar.description = "TB: Ready ✓"
+                    return [(download_url, sanitize_filename(filename))]
+
+                print(f"   ❌ TorBox: Could not get download URL")
+                return []
+            
+            elif status in ['error', 'failed']:
+                err = item.get('error', 'Unknown error')
+                print(f"   ❌ TorBox download error: {err}")
+                return []
+            
+            time.sleep(2)
+        
+        print("   ❌ TorBox: Timeout waiting for download (3 min)")
+        return []
+        
+    except Exception as e:
+        print(f"   ❌ TorBox Resolve Error: {str(e)[:80]}")
+        return []
+    finally:
+        _reset_progress_bar()
+
+def resolve_tb_magnet_files(magnet_url: str, tb_key: str) -> List[DownloadTask]:
+    """Add magnet to TorBox and wait for file list.
+    Returns list of DownloadTask objects for each file in the torrent.
+    """
+    if not tb_key:
+        print(f"   ❌ TorBox Token required for magnets")
+        return []
+    
+    h = _get_tb_headers(tb_key)
+    
+    try:
+        print("   🧲 Adding magnet to TorBox...")
+        
+        # Add magnet via createtorrent
+        r = requests.post(f"{TORBOX_API_BASE}/torrents/createtorrent",
+                         data={"magnet": magnet_url}, headers=h, timeout=30)
+        data = r.json()
+        
+        if not data.get('success'):
+            err = data.get('detail', data.get('error', 'Unknown error'))
+            print(f"   ❌ TorBox Magnet Error: {err}")
+            return []
+        
+        torrent_id = data['data'].get('torrent_id') or data['data'].get('id')
+        torrent_name = data['data'].get('name', 'Unknown Torrent')
+        
+        if not torrent_id:
+            print(f"   ❌ TorBox: No torrent ID returned")
+            return []
+        
+        # Poll for torrent to be ready
+        print(f"   ⏳ Waiting for torrent metadata...")
+        for _ in range(60):  # 2 minutes max
+            item = _tb_fetch_item('torrents', torrent_id, tb_key)
+            if not item:
+                time.sleep(2)
+                continue
+
+            status = item.get('download_state', item.get('status', ''))
+
+            if status in ['completed', 'cached', 'done', 'downloading', 'uploading', 'stalled']:
+                files = item.get('files', [])
+                torrent_name = item.get('name', torrent_name)
+
+                if not files:
+                    print(f"   ⚠️ No files found in torrent")
+                    return []
+
+                print(f"   ✅ Found {len(files)} file(s) in: {torrent_name[:50]}")
+
+                tasks = []
+                for f in files:
+                    file_id = f.get('id', 0)
+                    file_name = f.get('name', f.get('short_name', f'file_{file_id}'))
+                    task = _make_torrent_file_task(magnet_url, "tb_magnet_file", torrent_id,
+                                                   file_id, file_name, f.get('size', 0))
+                    if task:
+                        tasks.append(task)
+
+                return tasks
+            
+            elif status in ['error', 'failed', 'magnet_error']:
+                print(f"   ❌ Torrent error: {status}")
+                # Try to clean up
+                try:
+                    requests.post(f"{TORBOX_API_BASE}/torrents/controltorrent",
+                                 json={"torrent_id": torrent_id, "operation": "delete"},
+                                 headers=h, timeout=30)
+                except Exception:
+                    pass
+                return []
+            
+            time.sleep(2)
+        
+        print("   ❌ Timeout waiting for torrent metadata (2 min)")
+        return []
+        
+    except Exception as e:
+        print(f"   ❌ TorBox Magnet Resolve Error: {str(e)[:80]}")
+        return []
+
+def process_tb_magnet_file_tasks(tasks: List[DownloadTask], tb_key: str) -> int:
+    """Process tb_magnet_file tasks - get download links from TorBox and download.
+    Returns number of successfully downloaded files.
+    """
+    if not tasks or not tb_key:
+        return 0
+    
+    success_count = 0
+
+    # Process each torrent (tasks grouped by torrent_id from original_url)
+    for torrent_id, file_list in _group_tasks_by_torrent(tasks).items():
+        # Default to failed; upgraded to done/skipped per file below so a torrent
+        # error or cache timeout leaves the tasks failed (retryable on resume).
+        for _fid, task in file_list:
+            task.status = "failed"
+            task.error = "Not downloaded"
+        try:
+            print(f"\n   🧲 Downloading {len(file_list)} file(s) from TorBox torrent...")
+            
+            # Wait for torrent to be fully cached
+            with progress_lock:
+                progress_bar.value = 0
+                progress_bar.bar_style = 'info'
+                progress_bar.description = "TB: Caching..."
+            
+            for poll_count in range(120):  # 4 minutes max
+                item = _tb_fetch_item('torrents', int(torrent_id), tb_key)
+                if not item:
+                    time.sleep(2)
+                    continue
+
+                status = item.get('download_state', item.get('status', ''))
+                progress_pct = _tb_progress_pct(item)
+
+                _update_torrent_progress("TB", status, progress_pct,
+                                         downloading_states=('downloading', 'uploading'))
+
+                if status in ['completed', 'cached', 'done']:
+                    print(f"   ✅ Torrent ready! Downloading files...")
+                    
+                    with progress_lock:
+                        progress_bar.value = 100
+                        progress_bar.description = "TB: Cached ✓"
+                    
+                    # Download each selected file
+                    for idx, (file_id, task) in enumerate(file_list, 1):
+                        if idx > 1:
+                            time.sleep(1)  # Rate limiting
+                        try:
+                            # Request download link for this specific file
+                            dl_r = requests.get(f"{TORBOX_API_BASE}/torrents/requestdl",
+                                               params={"token": tb_key, "torrent_id": int(torrent_id),
+                                                      "file_id": int(file_id)},
+                                               headers=_get_tb_headers(tb_key), timeout=30)
+                            dl_data = dl_r.json()
+                            download_url = _tb_extract_download_url(dl_data)
+                            if download_url:
+                                # Clean filename (remove size suffix for actual download)
+                                clean_name = _strip_size_suffix(task.filename)
+                                print(f"   📥 [{idx}/{len(file_list)}] {clean_name[:50]}")
+                                f = download_with_aria2(download_url, clean_name, COLAB_ROOT, task_id=task.id)
+                                if f is DUPLICATE_SKIP:
+                                    task.status, task.error = "skipped", None
+                                    success_count += 1
+                                elif f:
+                                    handle_file_processing(f, source="magnet")
+                                    task.status, task.error = "done", None
+                                    success_count += 1
+                                else:
+                                    task.error = "Download failed"
+                            else:
+                                err = dl_data.get('detail', 'Could not get download URL')
+                                print(f"   ❌ TorBox DL error: {err}")
+                                task.error = str(err)[:100]
+                        except Exception as e:
+                            print(f"   ❌ Failed to download: {str(e)[:60]}")
+                            task.error = str(e)[:100]
+                    
+                    break
+                
+                elif status in ['error', 'failed', 'dead']:
+                    print(f"   ❌ Torrent error: {status}")
+                    break
+                
+                time.sleep(2)
+            else:
+                print("   ❌ Timeout waiting for torrent to cache (4 min)")
+                
+        except Exception as e:
+            print(f"   ❌ Error processing torrent: {str(e)[:80]}")
+        finally:
+            _reset_progress_bar()
+
+    return success_count
+
+def process_tb_link(link: str, tb_key: str) -> bool:
+    """Process a link through TorBox (both magnets and regular links).
+    Returns True on success (or duplicate skip), False on any failure."""
+    if "magnet:?" in link:
+        # For magnets, add to TorBox and download all files
+        print("   🧲 Processing magnet via TorBox...")
+        tasks = resolve_tb_magnet_files(link, tb_key)
+        if not tasks:
+            return False
+        success = process_tb_magnet_file_tasks(tasks, tb_key)
+        return success > 0  # At least one file downloaded
+
+    # Regular link - unrestrict via web download
+    resolved = resolve_tb_link(link, tb_key)
+    if not resolved:
+        return False
+    all_ok = True
+    for dl_url, filename in resolved:
+        task_id = f"tb_{str(uuid4())[:8]}"
+        with progress_lock:
+            progress_bar.value = 0
+            progress_bar.bar_style = 'info'
+        f = download_with_aria2(dl_url, filename, COLAB_ROOT, task_id=task_id)
+        if f is DUPLICATE_SKIP:
+            continue  # Already in Drive
+        if f:
+            handle_file_processing(f)
+        else:
+            all_ok = False
+    return all_ok
 
 def resolve_mediafire(url: str, session: requests.Session) -> List[Tuple[str, str]]:
     """Resolve MediaFire link to direct download URL by parsing HTML."""
@@ -3221,8 +3716,11 @@ def download_worker(task: DownloadTask, gofile_token: str) -> DownloadTask:
     """Worker function for parallel downloads. Returns updated task."""
     task.status = "downloading"
     try:
-        f = download_with_aria2(task.url, task.filename, COLAB_ROOT, task.cookie, task_id=task.id)
-        if f:
+        # update_bar=False: the batch monitor thread owns the shared progress bar
+        f = download_with_aria2(task.url, task.filename, COLAB_ROOT, task.cookie, task_id=task.id, update_bar=False)
+        if f is DUPLICATE_SKIP:
+            task.status = "skipped"  # Already in Drive — not a failure, don't retry on resume
+        elif f:
             handle_file_processing(f, source=task.source)
             task.status = "done"
         else:
@@ -3233,136 +3731,211 @@ def download_worker(task: DownloadTask, gofile_token: str) -> DownloadTask:
         task.error = str(e)[:100]
     return task
 
-def resolve_all_links(urls: List[str], session: requests.Session, tokens: dict, rd_key: str) -> Tuple[List[DownloadTask], List[str], List[str], List[str]]:
+# --- URL CLASSIFICATION ---
+STREAMING_HOSTS = ('youtube.com', 'youtu.be', 'vimeo.com', 'twitch.tv', 'ok.ru')
+
+def _url_host(url: str) -> str:
+    """Return the lowercased hostname of a URL ('' if unparseable)."""
+    try:
+        return (urlparse(url).hostname or '').lower()
+    except Exception:
+        return ''
+
+def url_matches_host(url: str, hosts) -> bool:
+    """True if the URL's hostname equals one of `hosts` or is a subdomain of one.
+    Hostname-based (not substring) so 'evil.com/?x=mega.nz' does not match."""
+    host = _url_host(url)
+    if not host:
+        return False
+    return any(host == h or host.endswith('.' + h) for h in hosts)
+
+def _classify_url(url: str, has_debrid: bool) -> str:
+    """Map a URL to a resolver kind (mirrors the historical routing order)."""
+    if url_matches_host(url, ('transfer.it',)):
+        return 'transfer'
+    if url_matches_host(url, ('mega.nz',)):
+        return 'mega'
+    if url_matches_host(url, STREAMING_HOSTS):
+        return 'stream'
+    if url_matches_host(url, ('archive.org',)) and '/details/' in urlparse(url).path:
+        return 'stream'
+    if url_matches_host(url, ('gofile.io',)):
+        return 'gofile'
+    if url_matches_host(url, ('pixeldrain.com',)):
+        return 'pixeldrain'
+    if url_matches_host(url, ('mediafire.com',)):
+        return 'mediafire'
+    if url_matches_host(url, ('1fichier.com',)):
+        return '1fichier'
+    if url.startswith('magnet:'):
+        return 'magnet'
+    if url_matches_host(url, ('real-debrid.com',)) and '/d/' in urlparse(url).path:
+        return 'rd_direct'
+    if url_matches_host(url, ('fshare.vn',)):
+        return 'fshare'
+    if has_debrid and url_matches_host(url, DEBRID_SUPPORTED_HOSTS):
+        return 'debrid_host'
+    if has_debrid and url.startswith('http') and not url_matches_host(url, ('archive.org',)):
+        return 'debrid_generic'
+    return 'direct'
+
+def resolve_all_links(urls: List[str], session: requests.Session, tokens: dict, rd_key: str, tb_key: str = "", debrid_service: str = "rd") -> Tuple[List[DownloadTask], List[str], List[str], List[str]]:
     """
     Pre-resolve all links into DownloadTasks.
-    Returns: (parallel_tasks, youtube_urls, mega_urls, rd_urls)
+    Returns: (parallel_tasks, youtube_urls, mega_urls, debrid_urls)
+    debrid_service: 'rd', 'tb', or 'none'
+
+    Independent HTTP resolvers (Gofile/Pixeldrain and, when no debrid service is
+    active, MediaFire/1fichier) run concurrently. Rate-limited services (debrid
+    APIs, FShare) stay sequential. Results keep the original URL order.
     """
     global _rd_magnet_delay
     _rd_magnet_delay = 0  # Reset adaptive pacing for each new batch
     parallel_tasks: List[DownloadTask] = []
     youtube_urls: List[str] = []
     mega_urls: List[str] = []
-    rd_urls: List[str] = []
-    
-    for url in urls:
-        if "transfer.it" in url:
-            mega_urls.append(url)
-        elif "mega.nz" in url:
-            if rd_key:
-                # Try RD for MEGA (handles all URL formats)
-                resolved = resolve_rd_link(url, rd_key)
+    debrid_urls: List[str] = []
+
+    # Determine which debrid key is active
+    has_debrid = bool((debrid_service == 'rd' and rd_key) or (debrid_service == 'tb' and tb_key))
+
+    classified = [(url, _classify_url(url, has_debrid)) for url in urls]
+
+    # Kick off independent resolvers concurrently (keyed by position - URLs may repeat)
+    futures = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for i, (url, kind) in enumerate(classified):
+            if kind == 'gofile':
+                futures[i] = executor.submit(resolve_gofile, url, session, tokens)
+            elif kind == 'pixeldrain':
+                futures[i] = executor.submit(resolve_pixeldrain, url, session)
+            elif kind == 'mediafire' and not has_debrid:
+                futures[i] = executor.submit(resolve_mediafire, url, session)
+            elif kind == '1fichier' and not has_debrid:
+                futures[i] = executor.submit(resolve_1fichier, url, session)
+
+        for i, (url, kind) in enumerate(classified):
+            if kind == 'transfer':
+                mega_urls.append(url)
+            elif kind == 'mega':
+                if debrid_service == 'rd' and rd_key:
+                    # Try RD for MEGA (handles all URL formats)
+                    resolved = resolve_rd_link(url, rd_key)
+                    if resolved:
+                        for u, n in resolved:
+                            parallel_tasks.append(DownloadTask(
+                                url=u, filename=n, source="mega", link_type="rd",
+                                original_url=url
+                            ))
+                    else:
+                        # RD failed (e.g. ip_not_allowed from Colab) - fall back to megadl
+                        print(f"   ⤴️ Falling back to megadl for: {url[:60]}...")
+                        mega_urls.append(url)
+                elif debrid_service == 'tb' and tb_key:
+                    # Try TorBox for MEGA via web download
+                    resolved = resolve_tb_link(url, tb_key)
+                    if resolved:
+                        for u, n in resolved:
+                            parallel_tasks.append(DownloadTask(
+                                url=u, filename=n, source="mega", link_type="tb",
+                                original_url=url
+                            ))
+                    else:
+                        print(f"   ⤴️ Falling back to megadl for: {url[:60]}...")
+                        mega_urls.append(url)
+                else:
+                    mega_urls.append(url)
+            elif kind == 'stream':
+                youtube_urls.append(url)
+            elif kind == 'gofile':
+                for u, n in futures[i].result():
+                    parallel_tasks.append(DownloadTask(
+                        url=u, filename=n, source="gofile", link_type="gofile",
+                        cookie=tokens.get('token'), original_url=url  # Store original for re-resolve
+                    ))
+            elif kind == 'pixeldrain':
+                for u, n in futures[i].result():
+                    parallel_tasks.append(DownloadTask(
+                        url=u, filename=n, source="pixeldrain", link_type="pixeldrain",
+                        original_url=url  # Store original for re-resolve
+                    ))
+            elif kind in ('mediafire', '1fichier'):
+                # Prefer active debrid service, fall back to the direct resolver
+                if debrid_service == 'rd' and rd_key:
+                    resolved = resolve_rd_link(url, rd_key)
+                    link_type = "rd"
+                elif debrid_service == 'tb' and tb_key:
+                    resolved = resolve_tb_link(url, tb_key)
+                    link_type = "tb"
+                else:
+                    resolved = futures[i].result()
+                    link_type = kind
+                for u, n in resolved:
+                    parallel_tasks.append(DownloadTask(
+                        url=u, filename=n, source=kind, link_type=link_type,
+                        original_url=url
+                    ))
+            elif kind == 'magnet':
+                # Resolve magnet to individual files via active debrid service
+                if debrid_service == 'rd' and rd_key:
+                    # Adaptive pacing: delay only after a rate-limit has been hit
+                    if _rd_magnet_delay > 0:
+                        time.sleep(_rd_magnet_delay)
+                    parallel_tasks.extend(resolve_magnet_files(url, rd_key))
+                elif debrid_service == 'tb' and tb_key:
+                    parallel_tasks.extend(resolve_tb_magnet_files(url, tb_key))
+                else:
+                    print(f"   ❌ Debrid token required for magnet links (select Real-Debrid or TorBox)")
+            elif kind == 'rd_direct':
+                # RD direct links - always use RD regardless of toggle
+                rd_key_for_rd_links = rd_key or token_rd.value.strip()
+                resolved = resolve_rd_link(url, rd_key_for_rd_links)
+                for u, n in resolved:
+                    parallel_tasks.append(DownloadTask(
+                        url=u, filename=n, source="rd", link_type="rd",
+                        original_url=url  # Store original for re-resolve
+                    ))
+            elif kind == 'fshare':
+                # FShare file or folder links - resolve with VIP account
+                fshare_email = token_fshare_email.value.strip()
+                fshare_password = token_fshare_password.value.strip()
+                resolved = resolve_fshare(url, fshare_email, fshare_password)
+                for u, n in resolved:
+                    parallel_tasks.append(DownloadTask(
+                        url=u, filename=n, source="fshare", link_type="fshare",
+                        original_url=url
+                    ))
                 if resolved:
+                    time.sleep(1)  # Rate limit between FShare link resolutions
+            elif kind == 'debrid_host':
+                # Route through active debrid service for supported premium hosts
+                if debrid_service == 'rd' and rd_key:
+                    resolved = resolve_rd_link(url, rd_key)
                     for u, n in resolved:
                         parallel_tasks.append(DownloadTask(
-                            url=u, filename=n, source="mega", link_type="rd",
+                            url=u, filename=n, source="rd_host", link_type="rd",
                             original_url=url
                         ))
-                else:
-                    # RD failed (e.g. ip_not_allowed from Colab) — fall back to megadl
-                    print(f"   ⤴️ Falling back to megadl for: {url[:60]}...")
-                    mega_urls.append(url)
+                elif debrid_service == 'tb' and tb_key:
+                    resolved = resolve_tb_link(url, tb_key)
+                    for u, n in resolved:
+                        parallel_tasks.append(DownloadTask(
+                            url=u, filename=n, source="tb_host", link_type="tb",
+                            original_url=url
+                        ))
+            elif kind == 'debrid_generic':
+                # Other links through debrid - try unrestricting
+                debrid_urls.append(url)
             else:
-                mega_urls.append(url)
-        elif any(h in url for h in ['youtube.com', 'youtu.be', 'vimeo.com', 'twitch.tv', 'ok.ru']) or ('archive.org/details/' in url):
-            youtube_urls.append(url)
-        elif "gofile.io" in url:
-            resolved = resolve_gofile(url, session, tokens)
-            for u, n in resolved:
+                # Direct URL (including archive.org/download/ links)
+                filename = os.path.basename(unquote(urlparse(url).path)) or "download"
+                source = "archive" if url_matches_host(url, ('archive.org',)) else "direct"
                 parallel_tasks.append(DownloadTask(
-                    url=u, filename=n, source="gofile", link_type="gofile",
-                    cookie=tokens.get('token'), original_url=url  # Store original for re-resolve
+                    url=url, filename=filename, source=source, link_type="direct"
                 ))
-        elif "pixeldrain.com" in url:
-            resolved = resolve_pixeldrain(url, session)
-            for u, n in resolved:
-                parallel_tasks.append(DownloadTask(
-                    url=u, filename=n, source="pixeldrain", link_type="pixeldrain",
-                    original_url=url  # Store original for re-resolve
-                ))
-        elif "mediafire.com" in url:
-            # Prefer RD if available, fallback to direct resolve
-            if rd_key:
-                resolved = resolve_rd_link(url, rd_key)
-                for u, n in resolved:
-                    parallel_tasks.append(DownloadTask(
-                        url=u, filename=n, source="mediafire", link_type="rd",
-                        original_url=url
-                    ))
-            else:
-                resolved = resolve_mediafire(url, session)
-                for u, n in resolved:
-                    parallel_tasks.append(DownloadTask(
-                        url=u, filename=n, source="mediafire", link_type="mediafire",
-                        original_url=url
-                    ))
-        elif "1fichier.com" in url:
-            # Prefer RD if available, fallback to direct resolve
-            if rd_key:
-                resolved = resolve_rd_link(url, rd_key)
-                for u, n in resolved:
-                    parallel_tasks.append(DownloadTask(
-                        url=u, filename=n, source="1fichier", link_type="rd",
-                        original_url=url
-                    ))
-            else:
-                resolved = resolve_1fichier(url, session)
-                for u, n in resolved:
-                    parallel_tasks.append(DownloadTask(
-                        url=u, filename=n, source="1fichier", link_type="1fichier",
-                        original_url=url
-                    ))
-        elif "magnet:?" in url:
-            # Resolve magnet to individual files if RD key available
-            if rd_key:
-                # Adaptive pacing: delay only after a rate-limit has been hit
-                if _rd_magnet_delay > 0:
-                    time.sleep(_rd_magnet_delay)
-                magnet_tasks = resolve_magnet_files(url, rd_key)
-                parallel_tasks.extend(magnet_tasks)
-            else:
-                # No RD key - can't process magnet
-                print(f"   ❌ RD Token required for magnet links")
-        elif "real-debrid.com/d/" in url:
-            # RD direct links can be parallelized
-            resolved = resolve_rd_link(url, rd_key)
-            for u, n in resolved:
-                parallel_tasks.append(DownloadTask(
-                    url=u, filename=n, source="rd", link_type="rd",
-                    original_url=url  # Store original for re-resolve
-                ))
-        elif "fshare.vn" in url:
-            # FShare file or folder links - resolve with VIP account
-            fshare_email = token_fshare_email.value.strip()
-            fshare_password = token_fshare_password.value.strip()
-            resolved = resolve_fshare(url, fshare_email, fshare_password)
-            for u, n in resolved:
-                parallel_tasks.append(DownloadTask(
-                    url=u, filename=n, source="fshare", link_type="fshare",
-                    original_url=url
-                ))
-            if resolved:
-                time.sleep(1)  # Rate limit between FShare link resolutions
-        elif rd_key and any(host in url for host in RD_SUPPORTED_HOSTS):
-            # Route through RD for any supported premium host
-            resolved = resolve_rd_link(url, rd_key)
-            for u, n in resolved:
-                parallel_tasks.append(DownloadTask(
-                    url=u, filename=n, source="rd_host", link_type="rd",
-                    original_url=url
-                ))
-        elif rd_key and "http" in url and "archive.org" not in url:
-            # Other links through RD - try unrestricting
-            rd_urls.append(url)
-        else:
-            # Direct URL (including archive.org/download/ links)
-            filename = os.path.basename(unquote(urlparse(url).path)) or "download"
-            source = "archive" if "archive.org" in url else "direct"
-            parallel_tasks.append(DownloadTask(
-                url=url, filename=filename, source=source, link_type="direct"
-            ))
-    
-    return parallel_tasks, youtube_urls, mega_urls, rd_urls
+
+    return parallel_tasks, youtube_urls, mega_urls, debrid_urls
+
 
 def update_progress_display(tasks: List[DownloadTask]):
     """Update progress bar with parallel download status, speed, and ETA."""
@@ -3373,23 +3946,15 @@ def update_progress_display(tasks: List[DownloadTask]):
     failed = sum(1 for t in tasks if t.status == "failed")
     total = len(tasks)
     
-    # Collect speeds and individual progress from active downloads
+    # Collect speeds and individual progress from active downloads (numeric stats
+    # written by download_with_aria2 — no string parsing needed)
     total_speed_mbs = 0.0
     individual_progress = 0.0
     for t in active:
-        status = active_downloads.get(t.id, "0%")
-        # Extract percentage from status like "45% (5.2MiB/s)"
-        pct_match = re.search(r'(\d+)%', status)
-        if pct_match:
-            individual_progress = float(pct_match.group(1))  # Use last active's progress for single downloads
-        # Extract speed from status like "45% (5.2MiB/s)" or "45% (5.2MB/s)"
-        speed_match = re.search(r'\(([\d.]+)([KMG])i?B/s\)', status)
-        if speed_match:
-            speed_val = float(speed_match.group(1))
-            unit = speed_match.group(2)
-            if unit == 'K': total_speed_mbs += speed_val / 1024
-            elif unit == 'M': total_speed_mbs += speed_val
-            elif unit == 'G': total_speed_mbs += speed_val * 1024
+        stats = download_stats.get(t.id)
+        if stats:
+            individual_progress = stats['pct']  # Last active's progress (used for single downloads)
+            total_speed_mbs += stats['speed_mbs']
     
     # Use current speed if available, otherwise keep last known speed
     if total_speed_mbs > 0:
@@ -3452,24 +4017,38 @@ def _run_download_pipeline(
     parallel_tasks: List[DownloadTask],
     youtube_urls: List[str],
     mega_urls: List[str],
-    rd_urls: List[str],
+    debrid_urls: List[str],
     mode: str,
     gofile_token: str,
     rd_key: str,
     max_workers: int,
     magnet_file_tasks: Optional[List[DownloadTask]] = None,
-    enable_retry: bool = True
+    tb_magnet_file_tasks: Optional[List[DownloadTask]] = None,
+    tb_key: str = ""
 ) -> Tuple[int, int]:
     """
     Shared download orchestration for parallel and sequential downloads.
-    
+
     Returns: (total_success, total_failed) counts
     """
     global yt_success_cumulative, yt_fail_cumulative, stop_monitor, batch_start_time
     import threading
-    
+
     start_keep_alive()
-    
+    download_stats.clear()  # Drop progress entries from any previous batch
+
+    def save_progress(throttle: bool = True):
+        """Persist batch state; throttled by default so per-task completions
+        don't hammer the (slow) Drive FUSE mount with JSON writes."""
+        save_session(all_tasks,
+                     show_name=show_name_override.value.strip(),
+                     year=year_input.value.strip(),
+                     playlist_range=playlist_selection.value.strip(),
+                     yt_success=yt_success_cumulative,
+                     yt_fail=yt_fail_cumulative,
+                     subtitle_langs_value=subtitle_langs.value,
+                     throttle=throttle)
+
     # --- PARALLEL DOWNLOADS ---
     if parallel_tasks:
         total_parallel = len(parallel_tasks)
@@ -3496,10 +4075,7 @@ def _run_download_pipeline(
                             if t.id == result.id:
                                 all_tasks[i] = result
                                 break
-                        save_session(all_tasks, gofile_token=gofile_token, rd_token=rd_key, 
-                                   show_name=show_name_override.value.strip(), year=year_input.value.strip(), playlist_range=playlist_selection.value.strip(), 
-                                   yt_success=yt_success_cumulative, yt_fail=yt_fail_cumulative, 
-                                   subtitle_langs_value=subtitle_langs.value)
+                        save_progress()
                     except Exception as e:
                         print(f"   ❌ Task failed: {str(e)[:80]}")
                         task.status = "failed"
@@ -3533,10 +4109,7 @@ def _run_download_pipeline(
                 if task.url == url and task.link_type == 'youtube':
                     task.status = "done" if f == 0 else "failed"
                     break
-            save_session(all_tasks, gofile_token=gofile_token, rd_token=rd_key, 
-                       show_name=show_name_override.value.strip(), playlist_range=playlist_selection.value.strip(), 
-                       yt_success=yt_success_cumulative, yt_fail=yt_fail_cumulative, 
-                       subtitle_langs_value=subtitle_langs.value)
+            save_progress()
         
         if yt_fail > 0:
             print(f"   📊 YouTube: {yt_success_cumulative} succeeded, {yt_fail_cumulative} failed")
@@ -3552,34 +4125,42 @@ def _run_download_pipeline(
                 if t.url == url and t.link_type == 'mega':
                     t.status = "done" if mega_success else "failed"
                     break
-            save_session(all_tasks, gofile_token=gofile_token, rd_token=rd_key, 
-                       show_name=show_name_override.value.strip(), playlist_range=playlist_selection.value.strip(), 
-                       yt_success=yt_success_cumulative, yt_fail=yt_fail_cumulative, 
-                       subtitle_langs_value=subtitle_langs.value)
+            save_progress()
     
-    if rd_urls and rd_key:
-        print(f"\n🔓 Processing {len(rd_urls)} RD links...")
-        for i, url in enumerate(rd_urls, 1):
-            print(f"   [{i}/{len(rd_urls)}] {url[:60]}...")
-            process_rd_link(url, rd_key)
-            for t in all_tasks:
-                if t.url == url and t.link_type == 'magnet':
-                    t.status = "done"
-                    break
-            save_session(all_tasks, gofile_token=gofile_token, rd_token=rd_key, 
-                       show_name=show_name_override.value.strip(), playlist_range=playlist_selection.value.strip(), 
-                       yt_success=yt_success_cumulative, yt_fail=yt_fail_cumulative, 
-                       subtitle_langs_value=subtitle_langs.value)
-    
-    # --- MAGNET FILE TASKS ---
+    if debrid_urls:
+        if rd_key:
+            print(f"\n🔓 Processing {len(debrid_urls)} RD links...")
+            for i, url in enumerate(debrid_urls, 1):
+                print(f"   [{i}/{len(debrid_urls)}] {url[:60]}...")
+                ok = process_rd_link(url, rd_key)
+                for t in all_tasks:
+                    if t.url == url and t.link_type == 'magnet':
+                        t.status = "done" if ok else "failed"
+                        break
+                save_progress()
+        elif tb_key:
+            print(f"\n🔓 Processing {len(debrid_urls)} TorBox links...")
+            for i, url in enumerate(debrid_urls, 1):
+                print(f"   [{i}/{len(debrid_urls)}] {url[:60]}...")
+                ok = process_tb_link(url, tb_key)
+                for t in all_tasks:
+                    if t.url == url:
+                        t.status = "done" if ok else "failed"
+                        break
+                save_progress()
+
+    # --- MAGNET FILE TASKS (RD) --- (process_* sets each task's status per file)
     if magnet_file_tasks and rd_key:
-        print(f"\n🧲 Processing {len(magnet_file_tasks)} selected magnet files...")
+        print(f"\n🧲 Processing {len(magnet_file_tasks)} selected magnet files (RD)...")
         process_magnet_file_tasks(magnet_file_tasks, rd_key)
-        for t in all_tasks:
-            if t.link_type == 'magnet_file':
-                t.status = "done"
+
+    # --- MAGNET FILE TASKS (TorBox) ---
+    if tb_magnet_file_tasks and tb_key:
+        print(f"\n🧲 Processing {len(tb_magnet_file_tasks)} selected magnet files (TorBox)...")
+        process_tb_magnet_file_tasks(tb_magnet_file_tasks, tb_key)
     
     # --- SUMMARY ---
+    save_progress(throttle=False)  # Final state must always hit disk (throttled saves may have skipped it)
     done_count = sum(1 for t in all_tasks if t.status == 'done')
     failed_count = sum(1 for t in all_tasks if t.status == 'failed')
     
@@ -3600,21 +4181,22 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str):
     display(input_ui)
     settings_ui.layout.display = 'none'
     btn.disabled = True
-    btn_subs.disabled = True
+    btn_quick.disabled = True
     btn_resume.disabled = True
-    
+
     start_keep_alive()
     try:
         gofile_token = token_gf.value.strip()
-        rd_key = token_rd.value.strip()
+        debrid_service, rd_key, tb_key = get_active_debrid()
         max_workers = concurrent_slider.value
-        
-        # Separate by type
-        parallel_tasks = [t for t in selected_tasks if t.link_type in ['gofile', 'pixeldrain', 'direct', 'rd', 'fshare']]
+
+        # Separate by type: everything without a sequential processor goes parallel
+        parallel_tasks = [t for t in selected_tasks if t.link_type not in SEQUENTIAL_LINK_TYPES]
         youtube_urls = [t.url for t in selected_tasks if t.link_type == 'youtube']
         mega_urls = [t.url for t in selected_tasks if t.link_type == 'mega']
-        rd_urls = [t.url for t in selected_tasks if t.link_type == 'magnet']
+        debrid_urls = [t.url for t in selected_tasks if t.link_type == 'magnet']
         magnet_file_tasks = [t for t in selected_tasks if t.link_type == 'magnet_file']
+        tb_magnet_file_tasks = [t for t in selected_tasks if t.link_type == 'tb_magnet_file']
         
         # Resolve FShare download links sequentially before parallel download
         # (deferred from Resolve Links phase so user can review queue first)
@@ -3677,7 +4259,7 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str):
         all_tasks = selected_tasks.copy()
         
         total_parallel = len(parallel_tasks)
-        total_sequential = len(youtube_urls) + len(mega_urls) + len(rd_urls) + len(magnet_file_tasks)
+        total_sequential = len(youtube_urls) + len(mega_urls) + len(debrid_urls) + len(magnet_file_tasks) + len(tb_magnet_file_tasks)
         print(f"📊 Starting: {total_parallel} parallel + {total_sequential} sequential\n")
         
         # Run shared download pipeline
@@ -3686,13 +4268,14 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str):
             parallel_tasks=parallel_tasks,
             youtube_urls=youtube_urls,
             mega_urls=mega_urls,
-            rd_urls=rd_urls,
+            debrid_urls=debrid_urls,
             mode=mode,
             gofile_token=gofile_token,
             rd_key=rd_key,
             max_workers=max_workers,
             magnet_file_tasks=magnet_file_tasks,
-            enable_retry=True
+            tb_magnet_file_tasks=tb_magnet_file_tasks,
+            tb_key=tb_key
         )
         
         # Handle results
@@ -3704,8 +4287,9 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str):
             if len(failed_files) > 5:
                 print(f"   ... and {len(failed_files) - 5} more")
             
-            save_session(all_tasks, gofile_token=gofile_token, rd_token=rd_key, 
-                        show_name=show_name_override.value.strip(), year=year_input.value.strip(), playlist_range=playlist_selection.value.strip(), 
+            save_session(all_tasks,
+                        show_name=show_name_override.value.strip(), year=year_input.value.strip(),
+                        playlist_range=playlist_selection.value.strip(),
                         yt_success=yt_success_cumulative, yt_fail=yt_fail_cumulative)
             print(f"\n💾 Session saved. Use 'Resume Previous' to retry later, or 'Clear Session' in Settings to mark complete.")
             btn_restart.layout.display = 'inline-block'
@@ -3722,7 +4306,6 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str):
         stop_keep_alive()
         btn.disabled = False
         btn_quick.disabled = False
-        btn_subs.disabled = False
         btn_resume.disabled = False
         reset_progress()
         check_resume_available()
@@ -3730,19 +4313,19 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str):
 
 def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False):
     global yt_success_cumulative, yt_fail_cumulative  # Must be at function start
+    queue_open = False  # True while the queue preview is waiting for user input
     clear_output(wait=True)
     display(input_ui)
     settings_ui.layout.display = 'none'  # Close settings panel if open
     btn.disabled = True
     btn_quick.disabled = True
-    btn_subs.disabled = True
     btn_resume.disabled = True
     print(f"\n🚀 Initializing... (Mode: {mode}, Resume: {resume})")
     
     start_keep_alive()
     try:
         gofile_token = token_gf.value.strip()
-        rd_key = token_rd.value.strip()
+        debrid_service, rd_key, tb_key = get_active_debrid()
         max_workers = concurrent_slider.value
         
         # Load from session or parse new URLs
@@ -3752,8 +4335,12 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False):
                 print("❌ No session to resume!")
                 return
             
-            gofile_token = session_data.get('gofile_token', gofile_token)
-            rd_key = session_data.get('rd_token', rd_key)
+            # Tokens are not persisted in the session (plaintext on Drive) — use the
+            # current widget/Colab Secrets values. Legacy sessions may still carry
+            # tokens; fall back to those only when nothing is configured now.
+            gofile_token = gofile_token or session_data.get('gofile_token', '')
+            rd_key = rd_key or session_data.get('rd_token', '')
+            tb_key = tb_key or session_data.get('tb_token', '')
             # Restore show name override from session
             saved_show_name = session_data.get('show_name_override', '')
             if saved_show_name:
@@ -3787,27 +4374,27 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False):
             # Only restore success count - reset fail count so previous 403s don't persist
             yt_success_cumulative = session_data.get('yt_success', 0)
             yt_fail_cumulative = 0  # Reset failures - only count failures in current run
-            all_tasks = [DownloadTask(**t) for t in session_data.get('tasks', [])]
+            all_tasks = [task_from_dict(t) for t in session_data.get('tasks', [])]
             
             # Filter to pending/failed/downloading tasks (downloading = was active when runtime crashed)
             pending_tasks = [t for t in all_tasks if t.status in ['pending', 'failed', 'downloading']]
             print(f"📂 Resuming {len(pending_tasks)} of {len(all_tasks)} tasks...")
             
             # Install required tools first
-            needs_pixeldrain_gofile_rd = any(t.link_type in ['gofile', 'pixeldrain', 'rd'] for t in pending_tasks)
+            needs_pixeldrain_gofile_rd_tb = any(t.link_type in ['gofile', 'pixeldrain', 'rd', 'tb'] for t in pending_tasks)
             needs_fshare = any(t.link_type == 'fshare' for t in pending_tasks)
             needs_ytdlp = any(t.link_type in ['youtube', 'archive'] for t in pending_tasks)
             needs_mega = any(t.link_type == 'mega' for t in pending_tasks)
-            needs_aria = any(t.link_type in ['gofile', 'pixeldrain', 'direct', 'rd', 'fshare'] for t in pending_tasks)
+            needs_aria = any(t.link_type not in ['youtube', 'mega', 'magnet'] for t in pending_tasks)
             setup_environment(needs_mega, needs_ytdlp, needs_aria)
             
-            # Re-resolve Gofile/Pixeldrain/RD URLs to get fresh API tokens (bypasses IP rate limits)
-            if needs_pixeldrain_gofile_rd:
+            # Re-resolve Gofile/Pixeldrain/RD/TB URLs to get fresh API tokens (bypasses IP rate limits)
+            if needs_pixeldrain_gofile_rd_tb:
                 print("🔄 Re-resolving links with fresh session...")
                 s, t = get_gofile_session(gofile_token)
                 
                 for task in pending_tasks:
-                    if task.original_url and task.link_type in ['gofile', 'pixeldrain', 'rd']:
+                    if task.original_url and task.link_type in ['gofile', 'pixeldrain', 'rd', 'tb']:
                         try:
                             if task.link_type == 'gofile':
                                 resolved = resolve_gofile(task.original_url, s, t)
@@ -3818,8 +4405,12 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False):
                                 resolved = resolve_pixeldrain(task.original_url, s)
                                 if resolved:
                                     task.url = resolved[0][0]  # Update with fresh API URL
-                            elif task.link_type == 'rd':
+                            elif task.link_type == 'rd' and rd_key:
                                 resolved = resolve_rd_link(task.original_url, rd_key)
+                                if resolved:
+                                    task.url = resolved[0][0]  # Update with fresh API URL
+                            elif task.link_type == 'tb' and tb_key:
+                                resolved = resolve_tb_link(task.original_url, tb_key)
                                 if resolved:
                                     task.url = resolved[0][0]  # Update with fresh API URL
                         except Exception as e:
@@ -3842,30 +4433,34 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False):
                             except Exception as e:
                                 print(f"   ⚠️ Could not re-resolve FShare {task.filename}: {e}")
             
-            # Separate by type for processing
-            parallel_tasks = [t for t in pending_tasks if t.link_type in ['gofile', 'pixeldrain', 'direct', 'rd', 'fshare']]
+            # Separate by type: everything without a sequential processor goes parallel
+            parallel_tasks = [t for t in pending_tasks if t.link_type not in SEQUENTIAL_LINK_TYPES]
             youtube_urls = [t.url for t in pending_tasks if t.link_type == 'youtube']
             mega_urls = [t.url for t in pending_tasks if t.link_type == 'mega']
-            rd_urls = [t.url for t in pending_tasks if t.link_type == 'magnet']  # Only magnets go sequential
+            debrid_urls = [t.url for t in pending_tasks if t.link_type == 'magnet']
+            magnet_file_tasks = [t for t in pending_tasks if t.link_type == 'magnet_file']
+            tb_magnet_file_tasks = [t for t in pending_tasks if t.link_type == 'tb_magnet_file']
         else:
             urls = [x.strip() for x in text_area.value.split('\n') if x.strip()]
             if not urls:
                 print("❌ No links provided!")
                 btn.disabled = False
-                btn_subs.disabled = False
                 return
-            
-            needs_ytdlp = any(h in u for u in urls for h in ['youtube.com', 'youtu.be', 'twitch.tv', 'tiktok.com', 'vimeo.com', 'dailymotion.com', 'soundcloud.com', 'ok.ru']) or any('archive.org/details/' in u for u in urls)
-            needs_mega = any("mega.nz" in u or "transfer.it" in u for u in urls)
-            needs_aria = not (needs_ytdlp and not needs_mega) or any(h in u for u in urls for h in ["gofile.io", "pixeldrain.com", "magnet:", "real-debrid", "mega.nz", "fshare.vn"])
 
-            
+            ytdlp_hosts = STREAMING_HOSTS + ('tiktok.com', 'dailymotion.com', 'soundcloud.com')
+            needs_ytdlp = any(url_matches_host(u, ytdlp_hosts) for u in urls) or \
+                          any(url_matches_host(u, ('archive.org',)) and '/details/' in u for u in urls)
+            needs_mega = any(url_matches_host(u, ('mega.nz', 'transfer.it')) for u in urls)
+            needs_aria = not (needs_ytdlp and not needs_mega) or any(
+                url_matches_host(u, ('gofile.io', 'pixeldrain.com', 'real-debrid.com', 'mega.nz', 'fshare.vn'))
+                or u.startswith('magnet:') for u in urls)
+
             setup_environment(needs_mega, needs_ytdlp, needs_aria)
             
             s, t = get_gofile_session(gofile_token)
             
             print(f"🔍 Resolving {len(urls)} links...")
-            parallel_tasks, youtube_urls, mega_urls, rd_urls = resolve_all_links(urls, s, t, rd_key)
+            parallel_tasks, youtube_urls, mega_urls, debrid_urls = resolve_all_links(urls, s, t, rd_key, tb_key, debrid_service)
             
             # Create session-compatible task list for saving
             all_tasks = parallel_tasks.copy()
@@ -3877,17 +4472,19 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False):
             
             for url in mega_urls:
                 all_tasks.append(DownloadTask(url=url, filename="", source="mega", link_type="mega"))
-            for url in rd_urls:
-                # Distinguish between magnet links and other RD-related links
-                if "magnet:?" in url:
-                    all_tasks.append(DownloadTask(url=url, filename="", source="rd", link_type="magnet"))
+            for url in debrid_urls:
+                # Distinguish between magnet links and other debrid-related links
+                if url.startswith("magnet:"):
+                    all_tasks.append(DownloadTask(url=url, filename="", source="debrid", link_type="magnet"))
                 else:
-                    all_tasks.append(DownloadTask(url=url, filename="", source="rd", link_type="rd"))
-            
+                    debrid_type = "tb" if debrid_service == 'tb' else "rd"
+                    all_tasks.append(DownloadTask(url=url, filename="", source="debrid", link_type=debrid_type))
+
             # Save initial session
-            save_session(all_tasks, gofile_token=gofile_token, rd_token=rd_key, 
-                        show_name=show_name_override.value.strip(), year=year_input.value.strip(), playlist_range=playlist_selection.value.strip())
-            
+            save_session(all_tasks,
+                        show_name=show_name_override.value.strip(), year=year_input.value.strip(),
+                        playlist_range=playlist_selection.value.strip())
+
             if quick_mode:
                 # Quick Download: Skip queue preview, start immediately
                 print(f"⚡ Quick Download: Starting {len(all_tasks)} items...")
@@ -3895,26 +4492,28 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False):
             else:
                 # Show queue preview instead of immediate download
                 show_queue_preview(all_tasks, mode)
+                queue_open = True  # Keep buttons disabled until the queue is acted on
             return  # Wait for user to click "Start Selected"
         
         # This code only runs for RESUME mode (preview was skipped)
         total_parallel = len(parallel_tasks)
-        total_sequential = len(youtube_urls) + len(mega_urls) + len(rd_urls)
+        total_sequential = len(youtube_urls) + len(mega_urls) + len(debrid_urls) + len(magnet_file_tasks) + len(tb_magnet_file_tasks)
         print(f"📊 Tasks: {total_parallel} parallel + {total_sequential} sequential\n")
-        
-        # Run shared download pipeline (no retry in resume mode - user can resume again if needed)
+
+        # Run shared download pipeline
         total_success, total_failed = _run_download_pipeline(
             all_tasks=all_tasks,
             parallel_tasks=parallel_tasks,
             youtube_urls=youtube_urls,
             mega_urls=mega_urls,
-            rd_urls=rd_urls,
+            debrid_urls=debrid_urls,
             mode=mode,
             gofile_token=gofile_token,
             rd_key=rd_key,
             max_workers=max_workers,
-            magnet_file_tasks=None,
-            enable_retry=False  # Resume mode: user can resume again if needed
+            magnet_file_tasks=magnet_file_tasks,
+            tb_magnet_file_tasks=tb_magnet_file_tasks,
+            tb_key=tb_key
         )
         
         # Handle results
@@ -3928,14 +4527,17 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False):
             yt_success_cumulative = 0
             yt_fail_cumulative = 0
         
-    except Exception as e: 
+    except Exception as e:
         print(f"\n❌ Critical Error: {e}")
-    finally: 
+    finally:
         stop_keep_alive()
-        btn.disabled = False
-        btn_quick.disabled = False
-        btn_resume.disabled = False
-        reset_progress()
+        if not queue_open:
+            # While the queue preview is open the buttons stay disabled;
+            # hide_queue()/start_from_queue() re-enable them later.
+            btn.disabled = False
+            btn_quick.disabled = False
+            btn_resume.disabled = False
+            reset_progress()
         check_resume_available()
 
 # --- QUICK DOWNLOAD ---
@@ -3986,7 +4588,7 @@ btn_confirm_cancel.on_click(cancel_confirmation)
 def early_mount_drive():
     """Mount Drive on script load to enable session resume detection."""
     drive_path = f"{COLAB_ROOT}drive"
-    if not os.path.exists(drive_path):
+    if drive is not None and not os.path.exists(drive_path):
         try:
             print("📂 Mounting Google Drive for session detection...")
             drive.mount(drive_path)

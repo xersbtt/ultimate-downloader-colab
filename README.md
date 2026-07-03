@@ -5,12 +5,13 @@ A powerful Google Colab-based tool for downloading media from multiple sources d
 ## ✨ Features
 
 - **Multi-Source Downloads**: Gofile, Pixeldrain, Mega.nz, FShare, YouTube, OK.ru, Twitch, Vimeo, and more
-- **35+ Premium Hosts via Real-Debrid**: MediaFire, 1fichier, Rapidgator, Nitroflare, etc.
-- **Parallel Downloads**: Download up to 5 files concurrently for Gofile, Pixeldrain, Real-Debrid, and direct HTTP links
+- **35+ Premium Hosts via Real-Debrid or TorBox**: MediaFire, 1fichier, Rapidgator, Nitroflare, etc.
+- **Choice of Debrid Service**: Select Real-Debrid, TorBox, or None from the Debrid toggle — both handle premium hosts and magnet links
+- **Parallel Downloads**: Download up to 5 files concurrently for Gofile, Pixeldrain, debrid, and direct HTTP links
 - **Session Resume**: Automatically resume interrupted downloads after runtime restart
 - **Queue Management**: Preview, reorder, sort (A-Z/Z-A), and select which files to download
 - **Download History**: Persistent log of completed downloads for debugging
-- **Real-Debrid Integration**: Unrestrict premium links and process magnet links
+- **Debrid Integration**: Unrestrict premium links and process magnet links via Real-Debrid or TorBox
 - **Magnet File Selection**: Preview individual torrent files and choose which to download
 - **Smart Media Sorting**: Automatically organises into Plex-compatible folder structures
   - TV Shows: `Show Name/Season XX/Show Name - S01E01.mkv`
@@ -43,14 +44,16 @@ Run the cell and the UI will appear automatically.
 ### 2. Configure API Keys (Optional)
 
 **Option A: Manual Entry**  
-Click ⚙️ Settings and enter your Gofile/Real-Debrid tokens in the API Key fields.
+Click ⚙️ Settings and enter your Gofile / Real-Debrid / TorBox tokens in the API Key fields, then pick your debrid service from the **Debrid** toggle.
 
 **Option B: Colab Secrets (Recommended)**  
 Store your keys securely in Colab Secrets:
 1. Click the 🔑 key icon in Colab's left sidebar
-2. Add secrets named `GOFILE_TOKEN` and `RD_TOKEN`
+2. Add secrets named `GOFILE_TOKEN`, `RD_TOKEN` (Real-Debrid), and/or `TB_TOKEN` (TorBox)
 3. For FShare: Add `FSHARE_EMAIL` and `FSHARE_PASSWORD`
 4. Keys will auto-populate on each run
+
+> Colab Secrets is the recommended place for credentials — tokens and passwords are **not** written to Google Drive, so they are re-read from Secrets (or the Settings fields) each run.
 
 ### 3. Paste Your Links
 
@@ -102,7 +105,7 @@ Files are automatically organised and saved to your Google Drive.
 - `My Drive/Downloads/` - All files when Auto-organise is disabled (original filenames)
 - `My Drive/Ultimate Downloader/` - Config files (session.json, history.json, settings.json)
 
-> **API Keys**: Gofile and Real-Debrid tokens are configured in ⚙️ Settings. For security, use Colab Secrets (see Quick Start).
+> **API Keys**: Gofile, Real-Debrid, and TorBox tokens are configured in ⚙️ Settings (select the active debrid service with the **Debrid** toggle). For security, use Colab Secrets (see Quick Start) — credentials are never written to Drive.
 
 > **Quick Download Subtitles**: Enable "Include subtitles in quick downloads" in ⚙️ Settings to automatically fetch subtitles when using the Quick Download button.
 
@@ -123,7 +126,8 @@ Files are automatically organised and saved to your Google Drive.
 |--------|----------|---------------|
 | **Gofile** | Public/private folders, cookie auth | Parallel |
 | **Pixeldrain** | Direct file downloads | Parallel |
-| **Real-Debrid** | Link unrestricting, file selection from magnets | Parallel (cached) / Sequential (uncached) |
+| **Real-Debrid** | Link unrestricting, file selection from magnets, 35+ premium hosts | Parallel (cached) / Sequential (uncached) |
+| **TorBox** | Web-download unrestricting, magnet file selection, 35+ premium hosts | Parallel (cached) / Sequential (uncached) |
 | **FShare** ⚠️ | VIP file/folder downloads (experimental) | Sequential |
 | **Direct HTTP** | Any direct download URL | Parallel |
 | **Mega.nz** | Full download support | Sequential |
@@ -145,6 +149,7 @@ Files are automatically organised and saved to your Google Drive.
 | v5.3 | NNxNN episode detection, anti-idle keep-alive |
 | v5.4 | Fixed Colab anti-idle, RD magnet rate limiting |
 | v5.5 | FShare VIP support, OK.ru video support |
+| v6.0 | TorBox debrid integration, security & reliability overhaul |
 
 ## 🎬 Episode Detection Patterns
 
@@ -308,7 +313,7 @@ Stremio is for streaming; this is for downloading. Use this when you want to:
 **Isn't this just a wrapper for yt-dlp/aria2?**
 
 Yes and no. It orchestrates multiple tools (yt-dlp, aria2, megatools, unrar) under one UI, but adds significant value:
-- Unified interface for 35+ sources including premium hosts via Real-Debrid
+- Unified interface for 35+ sources including premium hosts via Real-Debrid or TorBox
 - Automatic Plex-compatible organization (Show/Season/Episode structure)
 - Parallel downloads with session resume across Colab restarts
 - Queue management with preview, reordering, and selective downloads
@@ -330,14 +335,15 @@ Colab's temp disk is ~100GB, but downloads transfer directly to Google Drive, so
 
 Yes — Google Colab and Google Drive both require a Google account.
 
-**Is Real-Debrid required?**
+**Is a debrid service (Real-Debrid / TorBox) required?**
 
-No. Many sources work without it: YouTube, Mega.nz, Gofile, Pixeldrain, Vimeo, Twitch, and direct HTTP links. Real-Debrid unlocks 35+ premium file hosts.
+No. Many sources work without one: YouTube, Mega.nz, Gofile, Pixeldrain, Vimeo, Twitch, and direct HTTP links. A debrid service (Real-Debrid **or** TorBox) unlocks 35+ premium file hosts and magnet links — pick whichever you have with the **Debrid** toggle.
 
 **How do I get API tokens?**
 
 - **Gofile**: Log in at [gofile.io](https://gofile.io), go to My Profile → Account Token
 - **Real-Debrid**: Log in at [real-debrid.com](https://real-debrid.com), go to My Devices
+- **TorBox**: Log in at [torbox.app](https://torbox.app), go to Settings → API
 
 **Can I run this locally instead of Colab?**
 
@@ -354,7 +360,6 @@ Yes! Colab works in mobile browsers. The UI is functional on phones/tablets, tho
 ```
 Ultimate Downloader/
 ├── ultimate_downloader.py          # Latest version (always current)
-├── ultimate_downloader_v5.2.py     # Current versioned snapshot
 ├── Ultimate_Downloader.ipynb       # Jupyter notebook launcher
 ├── Ultimate Downloader.url         # Windows shortcut to Colab
 ├── CHANGELOG.md                    # Version history
@@ -362,7 +367,7 @@ Ultimate Downloader/
 ├── LICENSE                         # MIT Licence
 ├── banner_2x1.png                  # GitHub banner image
 ├── .gitignore                      # Git ignore rules
-└── archive/                        # Previous versions (v4.34 and earlier)
+└── archive/                        # Previous versions (v5.5 and earlier)
 ```
 
 ---

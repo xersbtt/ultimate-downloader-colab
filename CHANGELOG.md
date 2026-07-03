@@ -4,7 +4,59 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 
 ---
 
-## v5.5 (Latest)
+## v6.0 (Latest)
+**Theme: TorBox Debrid Integration & Reliability Overhaul**
+
+### ✨ New Features
+- **TorBox as Full Debrid Service**: TorBox is now fully integrated as an alternative to Real-Debrid
+  - Select between Real-Debrid, TorBox, or None via the Debrid Service toggle in the main UI
+  - **Magnet links**: Routed through TorBox torrents API (`resolve_tb_magnet_files`) with file selection in queue preview
+  - **Premium file hosts**: 35+ hosts (MediaFire, 1fichier, Rapidgator, etc.) routed through TorBox Web Downloads
+  - **MEGA links**: Tried via TorBox first, falls back to megadl if TorBox fails
+  - **Generic links**: Unknown HTTP links attempted through TorBox web download when TorBox is selected
+  - RD-specific direct links (`real-debrid.com/d/`) always use Real-Debrid regardless of toggle
+- **Debrid-Agnostic Download Pipeline**: `resolve_all_links()`, `_run_download_pipeline()`, `execute_selected_tasks()`, and `execute_batch()` now support both debrid services through a unified routing layer
+- **TorBox Session Resume**: TB links re-resolved with fresh tokens on session resume (same as RD/Gofile/Pixeldrain); the API key is read from the widget/Colab Secrets rather than stored on Drive (see Security below)
+
+### 🔧 Improvements
+- Added `get_active_debrid()` helper to centralise debrid service selection logic
+- `DEBRID_SUPPORTED_HOSTS` used for both RD and TB host routing (replaces `RD_SUPPORTED_HOSTS` references)
+- Queue preview displays 📦 icon for TorBox-resolved links (`tb`, `tb_host`, `tb_magnet_file`)
+
+### 🐛 Bug Fixes (code review pass)
+- **MediaFire/1fichier links silently dropped**: Without a debrid service selected, resolved MediaFire and 1fichier tasks were excluded from the download partition and never downloaded (while the summary reported success). Tasks are now partitioned by exclusion (`SEQUENTIAL_LINK_TYPES`) so new resolver types can never be silently dropped
+- **Resume skipped selected torrent files**: Resuming a session containing `magnet_file`/`tb_magnet_file` tasks dropped them; they are now passed through to the pipeline
+- **Parallel download file mix-up**: The aria2 "renamed file" fallback could grab another worker's in-progress file. It now prefers the path aria2 itself reports (`Download complete:`), skips files with `.aria2` control files, and only accepts files created after the download attempt started
+- **Duplicate handling unified**: An existing file in Drive is now consistently kept (previously non-archive downloads silently overwrote it while archive extraction kept it). Subtitles still refresh, since re-downloading them is an explicit action
+- **Batch episode detection now works for torrent files**: The episode cache is keyed on filenames stripped of the queue's " (123.4 MB)" size suffix, so download-time lookups match
+- **Year override survives resume**: Sequential (YouTube/Mega/debrid) session saves omitted the year field
+- **Queue preview button state**: Resolve/Quick Download stay disabled while the queue preview is open (previously re-enabled immediately, allowing the pending queue to be clobbered)
+- **History view**: Fixed literal `\n` printed in the download history listing
+- **Debrid downloads reported honest status**: Magnet links and selected torrent files (RD & TorBox) were marked `done` unconditionally regardless of outcome, hiding failures in the summary and preventing resume from retrying them. `process_rd_link`/`process_tb_link` now return success, and the magnet-file processors set per-file status. Files already present in Drive are marked `skipped` (via a `DUPLICATE_SKIP` sentinel) instead of `failed`, which also fixes parallel duplicates being mislabelled as failures
+
+### 🔒 Security
+- **Credentials no longer written to Drive in plaintext**: `settings.json` no longer stores the FShare password and `session.json` no longer stores Gofile/RD/TorBox tokens. On resume, tokens are re-read from the widgets/Colab Secrets (legacy session files still work as a fallback). Use Colab Secrets (`FSHARE_PASSWORD`, `RD_TOKEN`, `TB_TOKEN`, `GOFILE_TOKEN`) for persistence
+- **Hostname-based URL routing**: Link routing now compares `urlparse` hostnames instead of substring matching, so `evil.com/?x=mega.nz` can no longer masquerade as a supported host
+
+### ⚡ Performance
+- **Single-pass archive extraction**: Archives are extracted with one `unrar`/`7z` invocation instead of one process per file (per-file extraction re-decompressed solid RAR archives from the start each time — O(N²))
+- **Concurrent link resolution**: Independent resolvers (Gofile, Pixeldrain, and MediaFire/1fichier when no debrid service is active) run in a thread pool during Resolve Links; rate-limited services (debrid APIs, FShare) stay sequential
+- **Throttled session saves**: Per-task session writes to Drive FUSE are throttled to one per 5 seconds, with a guaranteed final save at batch end
+- **Numeric progress tracking**: Download progress/speed is stored as numbers (`download_stats`) instead of formatting strings and regex-parsing them back every 0.5s
+- **Keep-alive thread fixes**: `start_keep_alive()` is idempotent (no more duplicate threads per batch) and stops promptly instead of after up to 2 minutes
+
+### 🧹 Maintainability
+- Extracted `detect_episode_info()` — the episode/show-name parsing is now a pure function (no widget access), verified byte-identical against the previous behaviour across the test filename corpus
+- Deduplicated RD/TorBox torrent flows via shared helpers (`_update_torrent_progress`, `_make_torrent_file_task`, `_group_tasks_by_torrent`, `_tb_fetch_item`, `_tb_extract_download_url`, `_reset_progress_bar`)
+- `check_and_load_secrets()` collapsed from five copy-pasted blocks into one loop
+- Removed dead code: unused `btn_subs` widget, `enable_retry` parameter, `DownloadTask.retry_count`, `queue_mode` global; session loading now tolerates unknown fields from older versions
+- `google.colab` import guarded so the module can be imported outside Colab (enables unit-testing the pure logic)
+- Settings save/load failures now print a warning when Drive is mounted (previously always silent)
+- Moved `ultimate_downloader_v5.5.py` into `archive/` alongside the other historical versions
+
+---
+
+## v5.5
 **Theme: FShare VIP & OK.ru Support**
 
 ### ✨ New Features
@@ -751,4 +803,5 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 | v5.3 | NNxNN episode detection, anti-idle keep-alive |
 | v5.4 | Fixed Colab anti-idle, RD magnet rate limiting |
 | v5.5 | FShare VIP support, OK.ru video support |
+| v6.0 | TorBox debrid integration, security & reliability overhaul |
 
