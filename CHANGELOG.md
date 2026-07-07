@@ -4,7 +4,22 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 
 ---
 
-## v6.1 (Latest)
+## v6.2 (Latest)
+**Theme: TMDB Metadata Matching**
+
+### ✨ New Features
+- **TMDB Metadata Matching**: Filenames are matched against TMDB at queue time for canonical show/movie names, automatic year detection, and correct Plex folder naming
+  - **Absolute-episode → season mapping**: high-count anime episodes (e.g. `One Piece - 1085`) are converted to the correct `SxxEyy` using TMDB per-season episode counts — only when the filename has no explicit season marker
+  - Romaji anime titles matched via TMDB alternative titles (e.g. "Ore dake Level Up na Ken" → "Solo Leveling")
+  - Queue preview annotates matched files (`→ Show Name (Year)`); a summary line reports match count
+  - Persistent query cache on Drive (`tmdb_cache.json`, capped at 500 entries) avoids repeat API calls across sessions
+  - Configure via ⚙️ Settings or Colab Secret `TMDB_API_KEY`; toggle with the "TMDB matching" checkbox
+  - Fully optional: with no key (or no match) behaviour is identical to v6.1 filename parsing; Force Name always wins
+  - AniList integration deferred to a future release
+
+---
+
+## v6.1
 **Theme: Per-Download Progress Bars & UI Polish**
 
 ### ✨ New Features

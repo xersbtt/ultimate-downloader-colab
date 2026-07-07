@@ -16,6 +16,7 @@ A powerful Google Colab-based tool for downloading media from multiple sources d
 - **Smart Media Sorting**: Automatically organises into Plex-compatible folder structures
   - TV Shows: `Show Name/Season XX/Show Name - S01E01.mkv`
   - Movies: `Movie Name/Movie Name.mkv`
+- **TMDB Metadata Matching**: Canonical names, years, and anime absolute-episode → season mapping via the free TMDB API (optional)
 - **Archive Extraction**: Handles RAR, ZIP, 7Z with sequential extraction to save Colab disk space
 - **Subtitle Preservation**: Keeps `.srt`, `.ass`, `.sub`, `.vtt` files regardless of size
 - **Duplicate Prevention**: Skips already-downloaded files across sessions
@@ -49,7 +50,7 @@ Click ⚙️ Settings and enter your Gofile / Real-Debrid / TorBox tokens in the
 **Option B: Colab Secrets (Recommended)**  
 Store your keys securely in Colab Secrets:
 1. Click the 🔑 key icon in Colab's left sidebar
-2. Add secrets named `GOFILE_TOKEN`, `RD_TOKEN` (Real-Debrid), and/or `TB_TOKEN` (TorBox)
+2. Add secrets named `GOFILE_TOKEN`, `RD_TOKEN` (Real-Debrid), and/or `TB_TOKEN` (TorBox), and `TMDB_API_KEY` (TMDB metadata matching)
 3. For FShare: Add `FSHARE_EMAIL` and `FSHARE_PASSWORD`
 4. Keys will auto-populate on each run
 
@@ -151,6 +152,7 @@ Files are automatically organised and saved to your Google Drive.
 | v5.5 | FShare VIP support, OK.ru video support |
 | v6.0 | TorBox debrid integration, security & reliability overhaul |
 | v6.1 | Per-download progress bars, UI alignment polish |
+| v6.2 | TMDB metadata matching, anime season mapping |
 
 ## 🎬 Episode Detection Patterns
 
@@ -345,6 +347,9 @@ No. Many sources work without one: YouTube, Mega.nz, Gofile, Pixeldrain, Vimeo, 
 - **Gofile**: Log in at [gofile.io](https://gofile.io), go to My Profile → Account Token
 - **Real-Debrid**: Log in at [real-debrid.com](https://real-debrid.com), go to My Devices
 - **TorBox**: Log in at [torbox.app](https://torbox.app), go to Settings → API
+- **TMDB**: Free — create an account at [themoviedb.org](https://www.themoviedb.org/settings/api) and request an API key
+
+This product uses the TMDB API but is not endorsed or certified by TMDB.
 
 **Can I run this locally instead of Colab?**
 

@@ -5,6 +5,7 @@ import requests
 import subprocess
 import shutil
 import time
+import difflib
 from typing import Optional, Tuple, List, Dict, Any
 from dataclasses import dataclass, field, fields, asdict
 from datetime import datetime
@@ -42,6 +43,7 @@ def check_and_load_secrets():
         (token_rd, 'RD_TOKEN'),
         (token_tb, 'TB_TOKEN'),
         (token_gf, 'GOFILE_TOKEN'),
+        (token_tmdb, 'TMDB_API_KEY'),
         (token_fshare_email, 'FSHARE_EMAIL'),
         (token_fshare_password, 'FSHARE_PASSWORD'),
     ]
@@ -72,6 +74,7 @@ SESSION_FILE = f"{UD_CONFIG_PATH}session.json"
 HISTORY_FILE = f"{UD_CONFIG_PATH}history.json"
 SETTINGS_FILE = f"{UD_CONFIG_PATH}settings.json"
 FSHARE_COOKIE_FILE = f"{UD_CONFIG_PATH}fshare_cookies.json"
+TMDB_CACHE_FILE = f"{UD_CONFIG_PATH}tmdb_cache.json"
 COOKIE_PATH = f"{COLAB_ROOT}cookies.txt"
 MAX_CONCURRENT_DEFAULT = 3
 
@@ -79,6 +82,9 @@ MAX_CONCURRENT_DEFAULT = 3
 REQUEST_TIMEOUT = 30  # Default timeout for HTTP requests
 GOFILE_WEBSITE_TOKEN = "4fd6sg89d7s6"  # Website token for Gofile API - update if authentication fails
 TORBOX_API_BASE = "https://api.torbox.app/v1/api"  # TorBox API base URL
+TMDB_API_BASE = "https://api.themoviedb.org/3"  # TMDB v3 API (metadata matching)
+TMDB_MATCH_THRESHOLD = 0.60  # Minimum title similarity to accept a search result
+TMDB_QUERY_CACHE_MAX = 500   # Persistent query cache cap (oldest dropped first)
 
 # Known resolution values (for filename parsing)
 KNOWN_RESOLUTIONS = {360, 480, 540, 720, 1080, 1440, 2160, 4320}
@@ -177,6 +183,8 @@ def stop_keep_alive():
 
 # --- UI ELEMENTS ---
 token_gf = widgets.Text(description='Gofile:', placeholder='Optional', value=get_colab_secret('GOFILE_TOKEN'), style={'description_width': '80px'}, layout=widgets.Layout(width='270px'))
+token_tmdb = widgets.Text(description='TMDB:', placeholder='API Key (optional)', value=get_colab_secret('TMDB_API_KEY'), style={'description_width': '80px'}, layout=widgets.Layout(width='270px'))
+tmdb_enabled_checkbox = widgets.Checkbox(value=True, description='TMDB matching', tooltip='Match filenames against TMDB for canonical names, years, and season mapping', indent=False, layout=widgets.Layout(width='150px'))
 token_rd = widgets.Text(description='RD Token:', placeholder='Real-Debrid API Key', value=get_colab_secret('RD_TOKEN'), style={'description_width': '100px'}, layout=widgets.Layout(width='290px'))
 token_tb = widgets.Text(description='TB Token:', placeholder='TorBox API Key', value=get_colab_secret('TB_TOKEN'), style={'description_width': '100px'}, layout=widgets.Layout(width='290px'))
 # Debrid sits second in its row, after the 280px auto-organise checkbox — the same slot
@@ -443,6 +451,7 @@ dir_status = widgets.HTML("")
 settings_buttons = widgets.HBox([btn_clear_history, btn_clear_ytarchive, btn_clear_session, btn_settings_close])
 cookie_row = widgets.HBox([btn_upload_cookies, btn_clear_cookies, cookie_status])
 api_keys_row = widgets.HBox([token_gf, token_rd, token_tb])
+tmdb_row = widgets.HBox([token_tmdb, tmdb_enabled_checkbox])
 fshare_keys_row = widgets.HBox([token_fshare_email, token_fshare_password])
 # 30px indent = Gofile's 80px label width minus Debrid's 50px, so the dropdown box
 # lines up under the Gofile input. (The toggle itself keeps 50px to stay aligned with
@@ -453,6 +462,7 @@ settings_ui = widgets.VBox([
     widgets.HTML("<small><b>🔑 API Keys:</b></small>"),
     api_keys_row,
     debrid_row,
+    tmdb_row,
     widgets.HTML("<small><b>🇻🇳 FShare Account:</b></small>"),
     fshare_keys_row,
     secrets_status,
@@ -475,7 +485,7 @@ about_ui = widgets.VBox([
     widgets.HTML("""
         <div style='padding: 10px;'>
             <h3>ℹ️ About Ultimate Downloader</h3>
-            <p><strong>Version:</strong> 6.1</p>
+            <p><strong>Version:</strong> 6.2</p>
             <p><strong>Author:</strong> xersbtt</p>
             <p><strong>Repository:</strong> <a href='https://github.com/xersbtt/ultimate-downloader-colab' target='_blank'>github.com/xersbtt/ultimate-downloader-colab</a></p>
             <hr>
@@ -494,6 +504,7 @@ about_ui = widgets.VBox([
                 FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
             </small></p>
             <p><strong>Licence:</strong> MIT</p>
+            <p><small>Metadata provided by <a href='https://www.themoviedb.org' target='_blank'>TMDB</a>. This product uses the TMDB API but is not endorsed or certified by TMDB.</small></p>
         </div>
     """),
     btn_about_close
@@ -560,6 +571,7 @@ def save_dir_settings():
             'media_type': media_type_toggle.value,
             'category': category_override.value,
             'quick_dl_subs': quick_dl_subs_checkbox.value,
+            'tmdb_enabled': tmdb_enabled_checkbox.value,
             'quick_dl_langs': list(quick_dl_subtitle_langs.value),
             # FShare password is intentionally NOT saved — plaintext credentials
             # don't belong on Drive. Use Colab Secrets (FSHARE_PASSWORD) instead.
@@ -613,6 +625,8 @@ def load_dir_settings(skip_ui_state=False):
                     category_override.value = settings['category']
                 if 'quick_dl_subs' in settings:
                     quick_dl_subs_checkbox.value = settings['quick_dl_subs']
+                if 'tmdb_enabled' in settings:
+                    tmdb_enabled_checkbox.value = settings['tmdb_enabled']
                 if 'quick_dl_langs' in settings:
                     quick_dl_subtitle_langs.value = tuple(settings['quick_dl_langs'])
                 if settings.get('debrid_service'):
@@ -662,6 +676,7 @@ dir_anime_movies_input.observe(on_dir_change, names='value')
 media_type_toggle.observe(on_dir_change, names='value')
 category_override.observe(on_dir_change, names='value')
 quick_dl_subs_checkbox.observe(on_dir_change, names='value')
+tmdb_enabled_checkbox.observe(on_dir_change, names='value')
 quick_dl_subtitle_langs.observe(on_dir_change, names='value')
 token_fshare_email.observe(on_dir_change, names='value')
 token_fshare_password.observe(on_dir_change, names='value')
@@ -715,7 +730,7 @@ organize_options_row = widgets.HBox([show_name_override, year_input, media_type_
     layout=widgets.Layout(display='flex' if auto_organize_checkbox.value else 'none'))
 
 input_ui = widgets.VBox([
-    widgets.HTML("<h3>🚀 Ultimate Downloader v6.1</h3>"),
+    widgets.HTML("<h3>🚀 Ultimate Downloader v6.2</h3>"),
     widgets.HBox([auto_organize_checkbox, debrid_service_toggle]),
     organize_options_row,
     widgets.HBox([concurrent_slider]),
@@ -775,7 +790,7 @@ def save_session(
         return
     try:
         session = {
-            "version": "6.1",
+            "version": "6.2",
             "started_at": datetime.now().isoformat(),
             "show_name_override": show_name,
             "year": year,
@@ -858,10 +873,11 @@ def check_secrets_status():
     gf_status = "✅" if token_gf.value.strip() else "❌"
     rd_status = "✅" if token_rd.value.strip() else "❌"
     tb_status = "✅" if token_tb.value.strip() else "❌"
+    tmdb_status = "✅" if token_tmdb.value.strip() else "❌"
     fs_status = "✅" if token_fshare_email.value.strip() and token_fshare_password.value.strip() else "❌"
     debrid = debrid_service_toggle.value
     debrid_label = f"<b>[{debrid}]</b>"
-    secrets_status.value = f"<span style='font-size:12px'>{gf_status} Gofile &nbsp; {rd_status} Real-Debrid &nbsp; {tb_status} TorBox &nbsp; {fs_status} FShare &nbsp; | Debrid: {debrid_label}</span>"
+    secrets_status.value = f"<span style='font-size:12px'>{gf_status} Gofile &nbsp; {rd_status} Real-Debrid &nbsp; {tb_status} TorBox &nbsp; {tmdb_status} TMDB &nbsp; {fs_status} FShare &nbsp; | Debrid: {debrid_label}</span>"
 
 def check_cookie_status():
     """Check if cookies.txt exists and update status display."""
@@ -1021,7 +1037,12 @@ def update_queue_display():
                        "magnet": "🧲", "magnet_file": "🧲", "tb_magnet_file": "🧲", "archive": "📚",
                        "fshare": "🇻🇳", "okru": "🟠"}.get(task.link_type, "📄")
         name = task.filename[:50] if task.filename else task.url[:50]
-        options.append(f"{i+1}. {source_icon} {name}")
+        m = get_tmdb_match(task.filename) if task.filename else None
+        if m:
+            tag = f" → {m['name']}" + (f" ({m['year']})" if m['year'] else "")
+            options.append(f"{i+1}. {source_icon} {name}{tag}")
+        else:
+            options.append(f"{i+1}. {source_icon} {name}")
     queue_list.options = options
     queue_list.value = tuple(options)  # Select all by default
 
@@ -1037,7 +1058,13 @@ def show_queue_preview(tasks: List[DownloadTask], mode: str):
         batch_results = analyze_batch_episodes(filenames)
         if batch_results:
             print(f"   🎯 Batch analysis detected episode numbers in {len(batch_results)} files")
-    
+
+    # TMDB metadata matching (canonical names, years, season mapping)
+    if tmdb_is_enabled():
+        tmdb_matched = analyze_batch_metadata(filenames)
+        if tmdb_matched:
+            print(f"   🎬 TMDB matched {tmdb_matched} of {len(filenames)} file(s)")
+
     update_queue_display()
     
     # Hide subtitle and playlist options initially to prevent flash of old content
@@ -1467,6 +1494,195 @@ def get_batch_episode(filename: str) -> Optional[int]:
     """Get batch-detected episode number for a filename, if available."""
     return _batch_episode_cache.get(_strip_size_suffix(filename))
 
+# --- TMDB METADATA MATCHING ---
+# Batch-time lookups against TMDB refine the regex-based filename detection:
+# canonical show names, years, and absolute-episode → season mapping. Everything
+# here degrades silently to the regex behaviour when disabled or unreachable.
+_tmdb_match_cache: Dict[str, dict] = {}  # stripped filename -> match dict (per batch)
+_tmdb_query_cache: Dict[str, Optional[dict]] = {}  # "kind|query|year" -> match/None (persistent)
+_tmdb_query_cache_loaded = False
+
+def tmdb_is_enabled() -> bool:
+    """TMDB matching is active when the checkbox is on and a key is configured."""
+    return tmdb_enabled_checkbox.value and bool(token_tmdb.value.strip())
+
+def _tmdb_get(path: str, params: dict) -> Optional[dict]:
+    """GET a TMDB v3 endpoint. Returns parsed JSON or None on any failure."""
+    try:
+        full_params = dict(params, api_key=token_tmdb.value.strip())
+        r = requests.get(f"{TMDB_API_BASE}{path}", params=full_params, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+def _tmdb_similarity(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a.casefold().strip(), b.casefold().strip()).ratio()
+
+def _load_tmdb_query_cache():
+    global _tmdb_query_cache, _tmdb_query_cache_loaded
+    if _tmdb_query_cache_loaded:
+        return
+    _tmdb_query_cache_loaded = True
+    try:
+        if os.path.exists(TMDB_CACHE_FILE):
+            with open(TMDB_CACHE_FILE, 'r') as f:
+                _tmdb_query_cache = json.load(f)
+    except Exception:
+        _tmdb_query_cache = {}  # Corrupt/unreadable cache — start fresh
+
+def _save_tmdb_query_cache():
+    try:
+        if len(_tmdb_query_cache) > TMDB_QUERY_CACHE_MAX:
+            for k in list(_tmdb_query_cache)[:len(_tmdb_query_cache) - TMDB_QUERY_CACHE_MAX]:
+                del _tmdb_query_cache[k]
+        with open(TMDB_CACHE_FILE, 'w') as f:
+            json.dump(_tmdb_query_cache, f)
+    except Exception:
+        pass  # Drive not mounted — cache is best-effort
+
+def _tmdb_alt_titles(kind: str, tmdb_id: int) -> List[str]:
+    """Alternative titles for a result (romaji anime titles live here)."""
+    data = _tmdb_get(f"/{kind}/{tmdb_id}/alternative_titles", {})
+    if not data:
+        return []
+    entries = data.get('results') or data.get('titles') or []  # tv uses 'results', movie 'titles'
+    return [e.get('title', '') for e in entries if e.get('title')]
+
+def _tmdb_fetch_tv_seasons(tv_id: int) -> Dict[str, int]:
+    """{season_number(str): episode_count}, specials (season 0) excluded.
+    Keys are strings because the dict round-trips through the JSON cache."""
+    data = _tmdb_get(f"/tv/{tv_id}", {})
+    seasons = {}
+    for s in (data or {}).get('seasons', []):
+        num = s.get('season_number', 0)
+        count = s.get('episode_count', 0)
+        if num > 0 and count > 0:
+            seasons[str(num)] = count
+    return seasons
+
+def _tmdb_search(kind: str, query: str, year: Optional[str]) -> Optional[dict]:
+    """Search TMDB ('tv' or 'movie') with a similarity gate. Uses the persistent
+    query cache (misses cached as None so they aren't re-queried)."""
+    _load_tmdb_query_cache()
+    cache_key = f"{kind}|{query.casefold()}|{year or ''}"
+    if cache_key in _tmdb_query_cache:
+        return _tmdb_query_cache[cache_key]
+
+    params = {'query': query, 'include_adult': 'false'}
+    if year:
+        params['first_air_date_year' if kind == 'tv' else 'year'] = year
+    data = _tmdb_get(f"/search/{kind}", params)
+    results = (data or {}).get('results') or []
+    if not results and year:
+        # Filename years are often wrong (encode year, not release year) — retry without
+        data = _tmdb_get(f"/search/{kind}", {'query': query, 'include_adult': 'false'})
+        results = (data or {}).get('results') or []
+
+    match = None
+    for r in results[:5]:
+        name = r.get('name') or r.get('title') or ''
+        orig = r.get('original_name') or r.get('original_title') or ''
+        score = max(_tmdb_similarity(query, name), _tmdb_similarity(query, orig))
+        if score >= TMDB_MATCH_THRESHOLD:
+            match = r
+            break
+    if match is None and results:
+        # Romaji queries score poorly against localized/original names but live in
+        # alternative titles — check them for the top result only
+        top = results[0]
+        if any(_tmdb_similarity(query, alt) >= TMDB_MATCH_THRESHOLD
+               for alt in _tmdb_alt_titles(kind, top['id'])):
+            match = top
+
+    normalized = None
+    if match is not None:
+        name = match.get('name') or match.get('title') or ''
+        date = match.get('first_air_date') or match.get('release_date') or ''
+        normalized = {
+            'type': kind,
+            'id': match['id'],
+            'name': sanitize_filename(name) or 'Unknown',
+            'year': date[:4] if date else '',
+        }
+        if kind == 'tv':
+            normalized['seasons'] = _tmdb_fetch_tv_seasons(match['id'])
+
+    _tmdb_query_cache[cache_key] = normalized
+    return normalized
+
+def _map_absolute_episode(episode: int, seasons: Dict[str, int]) -> Tuple[int, int]:
+    """Convert an absolute episode number to (season, episode) using per-season
+    counts. Returns (1, episode) unchanged when mapping doesn't apply — including
+    episodes beyond TMDB's known total (a season TMDB hasn't listed yet)."""
+    if not seasons:
+        return (1, episode)
+    order = sorted(seasons, key=lambda k: int(k))
+    total = sum(seasons[k] for k in order)
+    if episode <= seasons.get('1', 0) or episode > total:
+        return (1, episode)
+    remaining = episode
+    for k in order:
+        if remaining <= seasons[k]:
+            return (int(k), remaining)
+        remaining -= seasons[k]
+    return (1, episode)
+
+def get_tmdb_match(filename: str) -> Optional[dict]:
+    """Batch-cached TMDB match for a filename (None when disabled or unmatched)."""
+    if not tmdb_is_enabled():
+        return None
+    return _tmdb_match_cache.get(_strip_size_suffix(sanitize_filename(filename)))
+
+def analyze_batch_metadata(filenames: List[str]) -> int:
+    """Match a batch of filenames against TMDB. Populates _tmdb_match_cache keyed
+    by the stripped+sanitized filename. One search per distinct (kind, query, year).
+    Returns the number of files matched."""
+    _tmdb_match_cache.clear()
+    if not tmdb_is_enabled() or not filenames:
+        return 0
+    if show_name_override.value.strip():
+        return 0  # Force Name wins — don't spend lookups that would be ignored
+
+    cat = category_override.value
+    queries: Dict[Tuple[str, str, Optional[str]], List[str]] = {}
+    for fname in filenames:
+        key = _strip_size_suffix(sanitize_filename(fname))
+        info = detect_episode_info(key)
+        if cat == 'Movie':
+            kind = 'movie'
+        elif cat == 'Series':
+            kind = 'tv'
+        else:
+            kind = 'tv' if info['episode_detected'] else 'movie'
+        year_m = re.search(r'\b(19|20)\d{2}\b', key)
+        year = year_m.group(0) if year_m else None
+        if kind == 'tv':
+            query = info['show_name']
+        else:
+            query = clean_show_name(key[:year_m.start()]) if year_m else clean_show_name(os.path.splitext(key)[0])
+        if not query or query == 'Unknown Show':
+            continue
+        queries.setdefault((kind, query, year), []).append(key)
+
+    matched = 0
+    had_error = False
+    for (kind, query, year), keys in queries.items():
+        try:
+            match = _tmdb_search(kind, query, year)
+        except Exception:
+            had_error = True
+            match = None
+        if match:
+            for key in keys:
+                _tmdb_match_cache[key] = match
+                matched += 1
+    _save_tmdb_query_cache()
+    if had_error:
+        print("   ⚠️ TMDB: some lookups failed — falling back to filename parsing")
+    return matched
+
 def check_duplicate_in_drive(filename: str, source: str = "generic", playlist_index: Optional[int] = None) -> bool:
     """Check if file already exists in Drive to avoid re-downloading"""
     dest_path, category = determine_destination_path(filename, source, dry_run=True, playlist_index=playlist_index)
@@ -1673,7 +1889,19 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
         is_tv = True
         if not episode_detected:
             episode_num = 1  # Default to E01 if no episode detected
-    
+
+    # TMDB metadata (populated by analyze_batch_metadata at queue/quick/resume time).
+    # Force Name always wins; a match refines names/years, never user input.
+    tmdb_match = None if manual_show_name else get_tmdb_match(filename)
+    tmdb_tv_year = ''
+    if tmdb_match and tmdb_match['type'] == 'tv' and (is_tv or episode_detected):
+        show_name = tmdb_match['name']
+        tmdb_tv_year = tmdb_match['year']
+        # Absolute-numbering conversion (e.g. "One Piece - 1085" → S19Exx) applies only
+        # when the filename carried no explicit SxxExx/NxN season marker
+        if episode_detected and not info['has_sxe'] and season_num == 1:
+            season_num, episode_num = _map_absolute_episode(episode_num, tmdb_match.get('seasons') or {})
+
     # Apply Force Name override - affects both TV shows and movies
     if manual_show_name:
         if is_tv or episode_detected:
@@ -1697,17 +1925,21 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
     elif is_tv:
         pass  # Continue to TV show path generation below
     else:
-        # No Force Name, not TV - detect movie
-        year_match = re.search(r'\b(19|20)\d{2}\b', filename)
-        if year_match:
-            movie_name = clean_show_name(filename[:year_match.start()])
-            year = year_match.group(0)
-            folder_name = f"{movie_name} ({year})"
-        elif source == "youtube":
-            return os.path.join(f"{DRIVE_BASE}{get_youtube_path()}", filename), "YouTube"
+        # No Force Name, not TV - detect movie (TMDB match wins over filename parsing)
+        if tmdb_match and tmdb_match['type'] == 'movie':
+            movie_name = tmdb_match['name']
+            folder_name = f"{movie_name} ({tmdb_match['year']})" if tmdb_match['year'] else movie_name
         else:
-            movie_name = clean_show_name(os.path.splitext(filename)[0])
-            folder_name = movie_name
+            year_match = re.search(r'\b(19|20)\d{2}\b', filename)
+            if year_match:
+                movie_name = clean_show_name(filename[:year_match.start()])
+                year = year_match.group(0)
+                folder_name = f"{movie_name} ({year})"
+            elif source == "youtube":
+                return os.path.join(f"{DRIVE_BASE}{get_youtube_path()}", filename), "YouTube"
+            else:
+                movie_name = clean_show_name(os.path.splitext(filename)[0])
+                folder_name = movie_name
         _, ext = os.path.splitext(filename)
         new_filename = f"{folder_name}{ext}"
         # Use anime folder if anime mode is enabled
@@ -1728,7 +1960,8 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
     new_filename = f"{show_name} - S{season_num:02d}E{episode_num:02d}{part_suffix}{ext}"
     season_folder = "Specials" if season_num == 0 else f"Season {season_num:02d}"
     # Append year to show folder name only (file name stays without year)
-    show_folder = f"{show_name} ({manual_year})" if manual_year else show_name
+    folder_year = manual_year or tmdb_tv_year
+    show_folder = f"{show_name} ({folder_year})" if folder_year else show_name
     
     # Use anime folder if anime mode is enabled
     if is_anime_mode_enabled():
@@ -4294,6 +4527,12 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str):
         debrid_service, rd_key, tb_key = get_active_debrid()
         max_workers = concurrent_slider.value
 
+        # Quick Download skips the queue preview — run TMDB matching here if it hasn't run.
+        # (Do NOT re-run analyze_batch_episodes here: it would re-analyze on the selected
+        # subset and could lose the batch detection computed at preview time.)
+        if tmdb_is_enabled() and not _tmdb_match_cache:
+            analyze_batch_metadata([t.filename for t in selected_tasks if t.filename])
+
         # Separate by type: everything without a sequential processor goes parallel
         parallel_tasks = [t for t in selected_tasks if t.link_type not in SEQUENTIAL_LINK_TYPES]
         youtube_urls = [t.url for t in selected_tasks if t.link_type == 'youtube']
@@ -4483,7 +4722,11 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False):
             # Filter to pending/failed/downloading tasks (downloading = was active when runtime crashed)
             pending_tasks = [t for t in all_tasks if t.status in ['pending', 'failed', 'downloading']]
             print(f"📂 Resuming {len(pending_tasks)} of {len(all_tasks)} tasks...")
-            
+
+            # Fresh runtime — re-run TMDB matching for the resumed batch
+            if tmdb_is_enabled():
+                analyze_batch_metadata([t.filename for t in pending_tasks if t.filename])
+
             # Install required tools first
             needs_pixeldrain_gofile_rd_tb = any(t.link_type in ['gofile', 'pixeldrain', 'rd', 'tb'] for t in pending_tasks)
             needs_fshare = any(t.link_type == 'fshare' for t in pending_tasks)
