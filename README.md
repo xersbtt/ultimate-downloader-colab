@@ -150,6 +150,7 @@ Files are automatically organised and saved to your Google Drive.
 | v5.4 | Fixed Colab anti-idle, RD magnet rate limiting |
 | v5.5 | FShare VIP support, OK.ru video support |
 | v6.0 | TorBox debrid integration, security & reliability overhaul |
+| v6.1 | Per-download progress bars, UI alignment polish |
 
 ## 🎬 Episode Detection Patterns
 

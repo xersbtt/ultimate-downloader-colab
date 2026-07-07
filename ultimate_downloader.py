@@ -179,18 +179,21 @@ def stop_keep_alive():
 token_gf = widgets.Text(description='Gofile:', placeholder='Optional', value=get_colab_secret('GOFILE_TOKEN'), style={'description_width': '80px'}, layout=widgets.Layout(width='270px'))
 token_rd = widgets.Text(description='RD Token:', placeholder='Real-Debrid API Key', value=get_colab_secret('RD_TOKEN'), style={'description_width': '100px'}, layout=widgets.Layout(width='290px'))
 token_tb = widgets.Text(description='TB Token:', placeholder='TorBox API Key', value=get_colab_secret('TB_TOKEN'), style={'description_width': '100px'}, layout=widgets.Layout(width='290px'))
+# Debrid sits second in its row, after the 280px auto-organise checkbox — the same slot
+# the 280px Name field occupies in the row below. Same 50px label width as Year:, so the
+# dropdown and the Year box line up without margin tweaks.
 debrid_service_toggle = widgets.Dropdown(
     options=['None', 'Real-Debrid', 'TorBox'],
     value='None',
     description='Debrid:',
     tooltip='Select debrid service for premium links & magnets',
     style={'description_width': '50px'},
-    layout=widgets.Layout(width='170px', margin='0 0 0 150px')
+    layout=widgets.Layout(width='170px')
 )
 token_fshare_email = widgets.Text(description='FShare:', placeholder='Email', value=get_colab_secret('FSHARE_EMAIL'), style={'description_width': '80px'}, layout=widgets.Layout(width='250px'))
 token_fshare_password = widgets.Password(description='Password:', placeholder='FShare Password', value=get_colab_secret('FSHARE_PASSWORD'), style={'description_width': '80px'}, layout=widgets.Layout(width='250px'))
 show_name_override = widgets.Text(description='Name:', placeholder='Optional (Forces folder/file name)', layout=widgets.Layout(width='280px'))
-year_input = widgets.Text(description='Year:', placeholder='e.g. 2025', style={'description_width': '35px'}, layout=widgets.Layout(width='120px'))
+year_input = widgets.Text(description='Year:', placeholder='e.g. 2025', style={'description_width': '50px'}, layout=widgets.Layout(width='135px'))
 media_type_toggle = widgets.ToggleButtons(
     options=['Movies/TV', 'Anime'],
     value='Movies/TV',
@@ -207,8 +210,9 @@ category_override = widgets.Dropdown(
 )
 playlist_selection = widgets.Text(description='Playlist:', placeholder='e.g. 1,3,5-10 (Empty=All)', style={'description_width': '60px'}, layout=widgets.Layout(width='220px'))
 concurrent_slider = widgets.IntSlider(value=MAX_CONCURRENT_DEFAULT, min=1, max=5, description='Parallel DLs:', style={'description_width': '80px'})
-# Auto-organisation checkbox for main UI
-auto_organize_checkbox = widgets.Checkbox(value=True, description='Auto-organise', tooltip='Auto-rename and organise files. Uncheck to save with original filenames to Downloads.', indent=False, layout=widgets.Layout(width='130px'))
+# Auto-organisation checkbox for main UI. Width matches the Name field below (280px)
+# so the Debrid dropdown next to it starts exactly where the Year field starts.
+auto_organize_checkbox = widgets.Checkbox(value=True, description='Auto-organise', tooltip='Auto-rename and organise files. Uncheck to save with original filenames to Downloads.', indent=False, layout=widgets.Layout(width='280px'))
 
 text_area = widgets.Textarea(description='Links:', placeholder='Paste Links Here (Transfer.it, Mega, YouTube, etc.)...', layout=widgets.Layout(width='98%', height='150px'))
 btn = widgets.Button(description="Resolve Links", button_style='success', icon='search')
@@ -220,6 +224,18 @@ btn_settings = widgets.Button(description="⚙️", button_style='', tooltip='Se
 btn_about = widgets.Button(description="ℹ️", button_style='', tooltip='About', layout=widgets.Layout(width='40px'))
 progress_bar = widgets.FloatProgress(value=0.0, min=0.0, max=100.0, description='Idle', bar_style='info', layout=widgets.Layout(width='98%'))
 status_label = widgets.HTML(value="")
+
+# --- PER-DOWNLOAD PROGRESS BARS ---
+# Individual bars for each parallel download, shown in a collapsible accordion.
+_per_task_bars: Dict[str, widgets.FloatProgress] = {}  # task_id -> bar widget
+_per_task_done_at: Dict[str, float] = {}  # task_id -> completion timestamp (for linger)
+_PER_TASK_LINGER = 2.0  # seconds a completed bar stays visible before removal
+
+_per_task_box = widgets.VBox([], layout=widgets.Layout(width='100%'))
+_per_task_accordion = widgets.Accordion(children=[_per_task_box])
+_per_task_accordion.set_title(0, '📥 Downloads')
+_per_task_accordion.selected_index = None  # collapsed by default
+_per_task_accordion.layout = widgets.Layout(width='98%', display='none')  # hidden until needed
 
 # --- SETTINGS/MANAGEMENT UI ---
 btn_clear_history = widgets.Button(description="Clear Download History", button_style='warning', tooltip='Delete history.json', layout=widgets.Layout(width='180px'))
@@ -428,7 +444,10 @@ settings_buttons = widgets.HBox([btn_clear_history, btn_clear_ytarchive, btn_cle
 cookie_row = widgets.HBox([btn_upload_cookies, btn_clear_cookies, cookie_status])
 api_keys_row = widgets.HBox([token_gf, token_rd, token_tb])
 fshare_keys_row = widgets.HBox([token_fshare_email, token_fshare_password])
-debrid_row = widgets.HBox([debrid_service_toggle])
+# 30px indent = Gofile's 80px label width minus Debrid's 50px, so the dropdown box
+# lines up under the Gofile input. (The toggle itself keeps 50px to stay aligned with
+# Year: in the main UI — it's the same widget instance rendered in both places.)
+debrid_row = widgets.HBox([debrid_service_toggle], layout=widgets.Layout(margin='0 0 0 30px'))
 settings_ui = widgets.VBox([
     widgets.HTML("<b>⚙️ Settings & File Management</b>"),
     widgets.HTML("<small><b>🔑 API Keys:</b></small>"),
@@ -456,7 +475,7 @@ about_ui = widgets.VBox([
     widgets.HTML("""
         <div style='padding: 10px;'>
             <h3>ℹ️ About Ultimate Downloader</h3>
-            <p><strong>Version:</strong> 6.0</p>
+            <p><strong>Version:</strong> 6.1</p>
             <p><strong>Author:</strong> xersbtt</p>
             <p><strong>Repository:</strong> <a href='https://github.com/xersbtt/ultimate-downloader-colab' target='_blank'>github.com/xersbtt/ultimate-downloader-colab</a></p>
             <hr>
@@ -696,7 +715,7 @@ organize_options_row = widgets.HBox([show_name_override, year_input, media_type_
     layout=widgets.Layout(display='flex' if auto_organize_checkbox.value else 'none'))
 
 input_ui = widgets.VBox([
-    widgets.HTML("<h3>🚀 Ultimate Downloader v6.0</h3>"),
+    widgets.HTML("<h3>🚀 Ultimate Downloader v6.1</h3>"),
     widgets.HBox([auto_organize_checkbox, debrid_service_toggle]),
     organize_options_row,
     widgets.HBox([concurrent_slider]),
@@ -706,6 +725,7 @@ input_ui = widgets.VBox([
     about_ui,
     queue_ui,
     progress_bar,
+    _per_task_accordion,
     status_label,
     widgets.HTML("<hr>")
 ])
@@ -755,7 +775,7 @@ def save_session(
         return
     try:
         session = {
-            "version": "6.0",
+            "version": "6.1",
             "started_at": datetime.now().isoformat(),
             "show_name_override": show_name,
             "year": year,
@@ -1211,12 +1231,22 @@ def start_from_queue(b=None, mode="video"):
     execute_selected_tasks(selected_tasks, mode)
 
 # --- HELPER FUNCTIONS ---
+def _clear_per_task_bars():
+    """Close and remove all per-download progress bars."""
+    for bar in _per_task_bars.values():
+        bar.close()
+    _per_task_bars.clear()
+    _per_task_done_at.clear()
+    _per_task_box.children = []
+    _per_task_accordion.layout.display = 'none'
+
 def reset_progress():
     """Resets UI to idle state"""
     progress_bar.value = 0
     progress_bar.description = "Idle"
     progress_bar.bar_style = 'info'
     status_label.value = ""
+    _clear_per_task_bars()
 
 def update_status(message: str):
     """Thread-safe status update."""
@@ -3938,36 +3968,33 @@ def resolve_all_links(urls: List[str], session: requests.Session, tokens: dict, 
 
 
 def update_progress_display(tasks: List[DownloadTask]):
-    """Update progress bar with parallel download status, speed, and ETA."""
+    """Update overall progress bar and per-download progress bars."""
     global last_display_speed
     
     active = [t for t in tasks if t.status == "downloading"]
     done = sum(1 for t in tasks if t.status in ["done", "skipped"])
     failed = sum(1 for t in tasks if t.status == "failed")
     total = len(tasks)
+    now = time.time()
     
-    # Collect speeds and individual progress from active downloads (numeric stats
-    # written by download_with_aria2 — no string parsing needed)
+    # Collect aggregate speed and per-task progress from active downloads
     total_speed_mbs = 0.0
-    individual_progress = 0.0
+    active_pct_sum = 0.0
     for t in active:
         stats = download_stats.get(t.id)
         if stats:
-            individual_progress = stats['pct']  # Last active's progress (used for single downloads)
             total_speed_mbs += stats['speed_mbs']
+            active_pct_sum += stats['pct'] / 100.0  # 0.0 – 1.0 contribution
     
     # Use current speed if available, otherwise keep last known speed
     if total_speed_mbs > 0:
         last_display_speed = total_speed_mbs
     display_speed = last_display_speed if last_display_speed > 0 else total_speed_mbs
     
-    # Special case: single download shows real-time individual progress
-    if total == 1 and active:
-        display_progress = individual_progress
-    else:
-        # Batch progress: completed tasks / total tasks
-        display_progress = (done / total) * 100 if total else 0
-    
+    # --- OVERALL PROGRESS BAR ---
+    # Fractional progress: completed tasks + fractional progress of active tasks.
+    # Gives smooth continuous movement instead of staircase jumps.
+    display_progress = ((done + active_pct_sum) / total) * 100 if total else 0
     progress_bar.value = display_progress
     progress_bar.bar_style = 'warning' if active else 'success' if done == total else 'info'
     
@@ -3975,7 +4002,7 @@ def update_progress_display(tasks: List[DownloadTask]):
     remaining = total - done - failed
     eta_str = ""
     if active and batch_start_time:
-        elapsed = time.time() - batch_start_time
+        elapsed = now - batch_start_time
         if done > 0:
             avg_time_per_task = elapsed / done
             eta_seconds = avg_time_per_task * remaining
@@ -4000,6 +4027,80 @@ def update_progress_display(tasks: List[DownloadTask]):
         status_label.value = f"<small style='color:orange'>❌ {failed} failed</small>"
     else:
         progress_bar.description = f"DL {done}/{total}"
+    
+    # --- PER-DOWNLOAD PROGRESS BARS ---
+    finished_ids = {t.id for t in tasks if t.status in ('done', 'skipped', 'failed')}
+    
+    # Create bars for newly-active tasks
+    for t in active:
+        if t.id not in _per_task_bars:
+            name = t.filename[:40] if t.filename else t.url[:40]
+            bar = widgets.FloatProgress(
+                value=0.0, min=0.0, max=100.0,
+                description=name,
+                bar_style='info',
+                style={'description_width': '220px'},
+                layout=widgets.Layout(width='100%', height='22px')
+            )
+            _per_task_bars[t.id] = bar
+    
+    # Update active bars with live stats
+    for t in active:
+        bar = _per_task_bars.get(t.id)
+        if not bar:
+            continue
+        stats = download_stats.get(t.id)
+        if stats:
+            pct = stats['pct']
+            speed = stats['speed_mbs']
+            bar.value = pct
+            bar.bar_style = 'warning'
+            name = t.filename[:30] if t.filename else 'download'
+            task_speed = f"{speed:.1f} MB/s" if speed > 0 else "starting..."
+            bar.description = f"{name}  {int(pct)}% ({task_speed})"
+    
+    # Mark completed/failed/skipped bars for linger
+    for task_id in list(_per_task_bars.keys()):
+        if task_id in finished_ids and task_id not in _per_task_done_at:
+            _per_task_done_at[task_id] = now
+            bar = _per_task_bars[task_id]
+            task = next((t for t in tasks if t.id == task_id), None)
+            if not task:
+                continue
+            bar.value = 100
+            name = task.filename[:35] if task.filename else 'download'
+            if task.status == 'failed':
+                bar.bar_style = 'danger'
+                bar.description = f"❌ {name}"
+            elif task.status == 'skipped':
+                bar.bar_style = 'success'
+                bar.description = f"⏭️ {name}"
+            else:
+                bar.bar_style = 'success'
+                bar.description = f"✅ {name}"
+    
+    # Remove bars that have lingered long enough (race-safe: .pop instead of del)
+    for task_id in list(_per_task_done_at.keys()):
+        if now - _per_task_done_at.get(task_id, now) >= _PER_TASK_LINGER:
+            bar = _per_task_bars.pop(task_id, None)
+            if bar:
+                bar.close()
+            _per_task_done_at.pop(task_id, None)
+    
+    # Sync container children and accordion visibility
+    visible_bars = list(_per_task_bars.values())
+    if visible_bars:
+        _per_task_box.children = visible_bars
+        active_count = len(active)
+        if active_count > 0:
+            agg_speed = f"{display_speed:.1f} MB/s" if display_speed > 0 else "starting..."
+            _per_task_accordion.set_title(0, f"📥 {active_count} active download{'s' if active_count != 1 else ''} ({agg_speed})")
+        else:
+            _per_task_accordion.set_title(0, "📥 Finishing...")
+        _per_task_accordion.layout.display = 'block'
+    else:
+        _per_task_box.children = []
+        _per_task_accordion.layout.display = 'none'
 
 def progress_monitor(tasks: List[DownloadTask], interval: float = 0.5):
     """Background thread to update progress display periodically."""
@@ -4036,6 +4137,7 @@ def _run_download_pipeline(
 
     start_keep_alive()
     download_stats.clear()  # Drop progress entries from any previous batch
+    _clear_per_task_bars()
 
     def save_progress(throttle: bool = True):
         """Persist batch state; throttled by default so per-task completions
@@ -4082,8 +4184,10 @@ def _run_download_pipeline(
                         task.error = str(e)[:100]
         finally:
             stop_monitor = True
+            monitor_thread.join(timeout=2)  # Wait for monitor's final tick before touching shared state
         
         update_progress_display(parallel_tasks)
+        _clear_per_task_bars()  # Clean up before sequential phase
         print(f"✅ Parallel downloads complete!")
     
     # --- SEQUENTIAL DOWNLOADS ---

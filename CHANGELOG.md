@@ -4,7 +4,26 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 
 ---
 
-## v6.0 (Latest)
+## v6.1 (Latest)
+**Theme: Per-Download Progress Bars & UI Polish**
+
+### ✨ New Features
+- **Per-Download Progress Bars**: Each parallel download now gets its own progress bar (filename, live %, speed) inside a collapsible "📥 N active downloads" accordion, in addition to the overall batch bar
+  - Bars turn ✅/⏭️/❌ on completion/skip/failure and linger for 2 seconds before being removed
+  - Overall progress bar is now fractional (`completed + Σ active%`) for every batch size, so single downloads and small batches show smooth continuous movement instead of staircase jumps
+
+### 🐛 Bug Fixes
+- **Race conditions in progress tracking**: The per-task bar cleanup could raise `KeyError`/`RuntimeError` from a monitor-thread/main-thread race, aborting the sequential download phase. Fixed with `.pop()`/`.get()` instead of `del`/direct indexing, and the monitor thread is now joined before the main thread touches shared bar state
+- **Stale "Finishing..." bars**: Per-download bars used to freeze in a completed state for the entire sequential (YouTube/Mega/magnet) phase instead of clearing once the parallel phase ended
+- **Progress bar colors not rendering**: An inline `bar_color` style was overriding the `bar_style` (info/warning/success/danger) classes, so status colors never showed
+- **Widget leak**: Removed per-download bars are now `.close()`d instead of just dropped from the tracking dict, so long sessions don't accumulate orphaned widget models
+
+### 🎨 UI
+- Aligned the Debrid dropdown with the Year field in the main input row, and the Debrid dropdown with the Gofile field in ⚙️ Settings
+
+---
+
+## v6.0
 **Theme: TorBox Debrid Integration & Reliability Overhaul**
 
 ### ✨ New Features
