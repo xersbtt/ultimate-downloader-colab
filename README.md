@@ -9,6 +9,7 @@ A powerful Google Colab-based tool for downloading media from multiple sources d
 - **Choice of Debrid Service**: Select Real-Debrid, TorBox, or None from the Debrid toggle — both handle premium hosts and magnet links
 - **Parallel Downloads**: Download up to 5 files concurrently for Gofile, Pixeldrain, debrid, and direct HTTP links
 - **Session Resume**: Automatically resume interrupted downloads after runtime restart
+- **Interrupt & Retry**: Stop a running batch cleanly with Runtime → Interrupt (progress saved); retry failures with one click via the Retry Failed button
 - **Queue Management**: Preview, reorder, sort (A-Z/Z-A), and select which files to download
 - **Download History**: Persistent log of completed downloads for debugging
 - **Debrid Integration**: Unrestrict premium links and process magnet links via Real-Debrid or TorBox
@@ -16,7 +17,7 @@ A powerful Google Colab-based tool for downloading media from multiple sources d
 - **Smart Media Sorting**: Automatically organises into Plex-compatible folder structures
   - TV Shows: `Show Name/Season XX/Show Name - S01E01.mkv`
   - Movies: `Movie Name/Movie Name.mkv`
-- **TMDB Metadata Matching**: Canonical names, years, and anime absolute-episode → season mapping via the free TMDB API (optional)
+- **TMDB Metadata Matching**: Canonical names, years, and anime absolute-episode → season mapping via the free TMDB API (optional); correct or clear any auto-match per item in the queue, and corrections persist across resume
 - **Archive Extraction**: Handles RAR, ZIP, 7Z with sequential extraction to save Colab disk space
 - **Subtitle Preservation**: Keeps `.srt`, `.ass`, `.sub`, `.vtt` files regardless of size
 - **Duplicate Prevention**: Skips already-downloaded files across sessions
@@ -152,7 +153,7 @@ Files are automatically organised and saved to your Google Drive.
 | v5.5 | FShare VIP support, OK.ru video support |
 | v6.0 | TorBox debrid integration, security & reliability overhaul |
 | v6.1 | Per-download progress bars, UI alignment polish |
-| v6.2 | TMDB metadata matching, anime season mapping |
+| v6.2 | TMDB metadata matching, anime season mapping, stop & retry controls |
 
 ## 🎬 Episode Detection Patterns
 

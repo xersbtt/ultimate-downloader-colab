@@ -5,9 +5,11 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 ---
 
 ## v6.2 (Latest)
-**Theme: TMDB Metadata Matching**
+**Theme: TMDB Metadata Matching & Batch Controls**
 
 ### ✨ New Features
+- **Stop a running batch**: Use **Runtime → Interrupt execution** (shortcut Ctrl+M I / ⌘+M I) to stop cleanly — active aria2/megadl downloads are terminated, not-yet-started items stay pending, and the session is saved so Resume/Retry picks up where you left off. A hint is shown during downloads. (A widget "Stop" button can't be used here: the download runs inside a widget callback that blocks the kernel's shell thread, so a click wouldn't be delivered until the batch already finished — and there's no per-cell ■ button because it's not a cell execution.)
+- **🔁 Retry Failed Button**: Appears after a batch completes with failures (or is interrupted) — one click re-runs the resume machinery (fresh link re-resolution included) without restarting the runtime
 - **TMDB Metadata Matching**: Filenames are matched against TMDB at queue time for canonical show/movie names, automatic year detection, and correct Plex folder naming
   - **Absolute-episode → season mapping**: high-count anime episodes (e.g. `One Piece - 1085`) are converted to the correct `SxxEyy` using TMDB per-season episode counts — only when the filename has no explicit season marker
   - Romaji anime titles matched via TMDB alternative titles (e.g. "Ore dake Level Up na Ken" → "Solo Leveling")
@@ -15,6 +17,7 @@ All notable changes to the Ultimate Downloader will be documented in this file.
   - Persistent query cache on Drive (`tmdb_cache.json`, capped at 500 entries) avoids repeat API calls across sessions
   - Configure via ⚙️ Settings or Colab Secret `TMDB_API_KEY`; toggle with the "TMDB matching" checkbox
   - Fully optional: with no key (or no match) behaviour is identical to v6.1 filename parsing; Force Name always wins
+  - **Manual match correction**: a "🎬 Fix Match" row in the queue preview lets you correct or clear the auto-match per item — select rows, then paste a TMDB URL / `tv:12345` / `movie:12345`, or type a title to search (via TMDB multi-search). "Clear Match" forces filename parsing for that item. Corrections are marked (`✎` / `✖ no TMDB`) in the queue and **persist across Stop/Resume** (saved with the session)
   - AniList integration deferred to a future release
 
 ---

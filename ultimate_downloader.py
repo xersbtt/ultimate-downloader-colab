@@ -85,6 +85,7 @@ TORBOX_API_BASE = "https://api.torbox.app/v1/api"  # TorBox API base URL
 TMDB_API_BASE = "https://api.themoviedb.org/3"  # TMDB v3 API (metadata matching)
 TMDB_MATCH_THRESHOLD = 0.60  # Minimum title similarity to accept a search result
 TMDB_QUERY_CACHE_MAX = 500   # Persistent query cache cap (oldest dropped first)
+TMDB_CLEARED = {'cleared': True}  # DownloadTask.tmdb_override value meaning "force regex, no TMDB"
 
 # Known resolution values (for filename parsing)
 KNOWN_RESOLUTIONS = {360, 480, 540, 720, 1080, 1440, 2160, 4320}
@@ -114,6 +115,7 @@ class DownloadTask:
     error: Optional[str] = None
     cookie: Optional[str] = None
     original_url: Optional[str] = None  # Original user-provided URL (for re-resolving on resume)
+    tmdb_override: Optional[dict] = None  # Manual TMDB correction (persisted); {'cleared': True} forces regex
 
 _TASK_FIELDS = {f.name for f in fields(DownloadTask)}
 
@@ -138,6 +140,49 @@ DUPLICATE_SKIP = "__duplicate_skip__"
 stop_monitor = False  # Flag to stop progress monitor thread
 batch_start_time: Optional[float] = None  # Track when batch started for overall ETA
 last_display_speed: float = 0.0  # Persist last known speed to prevent flickering
+
+# --- BATCH CANCELLATION ---
+# Stop works via the kernel interrupt (the ■ button next to the running cell / Runtime
+# → Interrupt), which raises KeyboardInterrupt on the main thread. The pipeline catches
+# it, terminates the active aria2/megadl subprocesses, and saves the session so
+# Resume/Retry can continue. Workers also poll _cancel_requested so anything not yet
+# started stays "pending" and in-flight items become "failed (Cancelled by user)".
+# (A widget Stop *button* can't work while a synchronous download blocks the kernel's
+# shell thread — the click would never be delivered until the batch already finished.)
+_cancel_requested = False
+_active_procs: Dict[str, Any] = {}  # key -> running subprocess.Popen
+_active_procs_lock = Lock()
+
+def cancel_requested() -> bool:
+    return _cancel_requested
+
+def stop_active_downloads():
+    """Signal cancellation and terminate every registered subprocess. Called from the
+    pipeline's KeyboardInterrupt handlers when the user interrupts the kernel."""
+    global _cancel_requested
+    _cancel_requested = True
+    with _active_procs_lock:
+        procs = list(_active_procs.values())
+    for p in procs:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+def _register_proc(key: str, process):
+    with _active_procs_lock:
+        _active_procs[key] = process
+
+def _unregister_proc(key: str):
+    with _active_procs_lock:
+        _active_procs.pop(key, None)
+
+def _reset_cancel_state():
+    """Clear the cancel flag and process registry between batches."""
+    global _cancel_requested
+    _cancel_requested = False
+    with _active_procs_lock:
+        _active_procs.clear()
 
 # --- COLAB KEEP-ALIVE ---
 _keep_alive_stop = False
@@ -227,6 +272,11 @@ btn = widgets.Button(description="Resolve Links", button_style='success', icon='
 btn_quick = widgets.Button(description="Quick Download", button_style='primary', icon='bolt', tooltip='Download immediately without queue preview', layout=widgets.Layout(width='140px'))
 btn_resume = widgets.Button(description="Resume Previous Session", button_style='warning', icon='play', layout=widgets.Layout(display='none', width='180px'))
 btn_restart = widgets.Button(description="🔄 Restart Runtime", button_style='danger', tooltip='Restart runtime then Resume Previous Session', layout=widgets.Layout(display='none'))
+# Stop is done via the kernel interrupt (see BATCH CANCELLATION), so this is a hint,
+# not a button — a widget button can't be clicked while a synchronous download blocks
+# the kernel. Shown only during an active batch.
+stop_hint = widgets.HTML(value="", layout=widgets.Layout(display='none'))
+btn_retry = widgets.Button(description="🔁 Retry Failed", button_style='warning', tooltip='Retry failed downloads from the saved session', layout=widgets.Layout(display='none', width='130px'))
 btn_history = widgets.Button(description="📜", button_style='', tooltip='View Download History', layout=widgets.Layout(width='40px'))
 btn_settings = widgets.Button(description="⚙️", button_style='', tooltip='Settings & Manage Files', layout=widgets.Layout(width='40px'))
 btn_about = widgets.Button(description="ℹ️", button_style='', tooltip='About', layout=widgets.Layout(width='40px'))
@@ -711,6 +761,16 @@ subtitle_langs = widgets.SelectMultiple(
 
 queue_controls = widgets.HBox([btn_queue_up, btn_queue_down, btn_queue_sort, btn_queue_select_all, btn_queue_select_none, btn_queue_remove, btn_queue_start, btn_queue_start_subs, btn_queue_cancel])
 queue_options = widgets.HBox([subtitle_langs])  # Uses description for alignment like queue_list
+
+# Manual TMDB correction (shown in queue only when TMDB matching is enabled)
+tmdb_override_input = widgets.Text(placeholder='TMDB URL, tv:12345 / movie:12345, or a title to search', layout=widgets.Layout(width='360px'))
+btn_tmdb_match = widgets.Button(description='🔍 Match Selected', button_style='info', tooltip='Apply a TMDB match to the selected queue item(s)', layout=widgets.Layout(width='150px'))
+btn_tmdb_clear = widgets.Button(description='✖ Clear Match', button_style='', tooltip='Remove the TMDB match — use filename parsing instead', layout=widgets.Layout(width='120px'))
+tmdb_match_row = widgets.HBox([
+    widgets.HTML("<small><b>🎬 Fix Match:</b></small>"),
+    tmdb_override_input, btn_tmdb_match, btn_tmdb_clear
+], layout=widgets.Layout(display='none'))
+
 # Playlist range selector (shown only for YouTube playlists)
 playlist_options = widgets.HBox([
     widgets.HTML("<small><b>🎯 Playlist Range:</b></small>"),
@@ -719,6 +779,7 @@ playlist_options = widgets.HBox([
 queue_ui = widgets.VBox([
     widgets.HTML("<b>📋 Queue Preview</b> <small>(Select items to manage)</small>"),
     queue_list,
+    tmdb_match_row,
     playlist_options,
     queue_options,
     queue_controls
@@ -735,7 +796,8 @@ input_ui = widgets.VBox([
     organize_options_row,
     widgets.HBox([concurrent_slider]),
     text_area,
-    widgets.HBox([btn, btn_quick, btn_resume, btn_restart, btn_history, btn_settings, btn_about]),
+    widgets.HBox([btn, btn_quick, btn_retry, btn_resume, btn_restart, btn_history, btn_settings, btn_about]),
+    stop_hint,
     settings_ui,
     about_ui,
     queue_ui,
@@ -1017,6 +1079,7 @@ def _do_clear_session():
         if os.path.exists(SESSION_FILE):
             os.remove(SESSION_FILE)
             btn_resume.layout.display = 'none'
+            btn_retry.layout.display = 'none'
             settings_status.value = "<span style='color:green'>✅ Session cleared!</span>"
         else:
             settings_status.value = "<span style='color:gray'>ℹ️ No session file to clear.</span>"
@@ -1037,9 +1100,13 @@ def update_queue_display():
                        "magnet": "🧲", "magnet_file": "🧲", "tb_magnet_file": "🧲", "archive": "📚",
                        "fshare": "🇻🇳", "okru": "🟠"}.get(task.link_type, "📄")
         name = task.filename[:50] if task.filename else task.url[:50]
+        ov = getattr(task, 'tmdb_override', None)
         m = get_tmdb_match(task.filename) if task.filename else None
-        if m:
-            tag = f" → {m['name']}" + (f" ({m['year']})" if m['year'] else "")
+        if ov == TMDB_CLEARED:
+            options.append(f"{i+1}. {source_icon} {name}  ✖ no TMDB")
+        elif m:
+            edited = " ✎" if ov else ""  # pencil marks a manual correction
+            tag = f" → {m['name']}" + (f" ({m['year']})" if m['year'] else "") + edited
             options.append(f"{i+1}. {source_icon} {name}{tag}")
         else:
             options.append(f"{i+1}. {source_icon} {name}")
@@ -1062,14 +1129,17 @@ def show_queue_preview(tasks: List[DownloadTask], mode: str):
     # TMDB metadata matching (canonical names, years, season mapping)
     if tmdb_is_enabled():
         tmdb_matched = analyze_batch_metadata(filenames)
+        _apply_tmdb_overrides(pending_queue)  # reapply any prior manual corrections
         if tmdb_matched:
             print(f"   🎬 TMDB matched {tmdb_matched} of {len(filenames)} file(s)")
 
     update_queue_display()
-    
+
     # Hide subtitle and playlist options initially to prevent flash of old content
     queue_options.layout.display = 'none'
     playlist_options.layout.display = 'none'
+    # Manual TMDB correction row: only meaningful when TMDB matching is active
+    tmdb_match_row.layout.display = 'flex' if tmdb_is_enabled() else 'none'
     queue_ui.layout.display = 'block'
     
     # Check for YouTube/streaming links
@@ -1143,6 +1213,8 @@ def hide_queue():
     queue_ui.layout.display = 'none'
     queue_list.options = []
     playlist_options.layout.display = 'none'
+    tmdb_match_row.layout.display = 'none'
+    tmdb_override_input.value = ''
     btn_queue_start_subs.layout.display = 'none'
     btn.disabled = False
     btn_quick.disabled = False
@@ -1596,21 +1668,119 @@ def _tmdb_search(kind: str, query: str, year: Optional[str]) -> Optional[dict]:
                for alt in _tmdb_alt_titles(kind, top['id'])):
             match = top
 
-    normalized = None
-    if match is not None:
-        name = match.get('name') or match.get('title') or ''
-        date = match.get('first_air_date') or match.get('release_date') or ''
-        normalized = {
-            'type': kind,
-            'id': match['id'],
-            'name': sanitize_filename(name) or 'Unknown',
-            'year': date[:4] if date else '',
-        }
-        if kind == 'tv':
-            normalized['seasons'] = _tmdb_fetch_tv_seasons(match['id'])
-
+    normalized = _tmdb_normalize(kind, match) if match is not None else None
     _tmdb_query_cache[cache_key] = normalized
     return normalized
+
+def _tmdb_normalize(kind: str, result: dict) -> dict:
+    """Normalize a TMDB tv/movie result (from search or a /{kind}/{id} fetch) to the
+    match dict used everywhere: {type, id, name, year[, seasons]}. A full /tv/{id}
+    response already carries 'seasons'; search results don't, so those are fetched."""
+    name = result.get('name') or result.get('title') or ''
+    date = result.get('first_air_date') or result.get('release_date') or ''
+    normalized = {
+        'type': kind,
+        'id': result['id'],
+        'name': sanitize_filename(name) or 'Unknown',
+        'year': date[:4] if date else '',
+    }
+    if kind == 'tv':
+        if 'seasons' in result:
+            seasons = {}
+            for s in result.get('seasons', []):
+                num, count = s.get('season_number', 0), s.get('episode_count', 0)
+                if num > 0 and count > 0:
+                    seasons[str(num)] = count
+            normalized['seasons'] = seasons
+        else:
+            normalized['seasons'] = _tmdb_fetch_tv_seasons(result['id'])
+    return normalized
+
+def _tmdb_fetch_by_id(kind: str, tmdb_id) -> Optional[dict]:
+    """Fetch a specific tv/movie by TMDB id and normalize it (None if not found)."""
+    data = _tmdb_get(f"/{kind}/{tmdb_id}", {})
+    if not data or 'id' not in data:
+        return None
+    return _tmdb_normalize(kind, data)
+
+def _resolve_tmdb_override(text: str) -> Optional[dict]:
+    """Resolve a manual correction string to a match dict. Accepts a themoviedb.org
+    URL, a 'tv:12345' / 'movie:12345' id, or free text (searched via /search/multi).
+    Does NOT touch the auto-search query cache."""
+    text = text.strip()
+    if not text:
+        return None
+    url_m = re.search(r'themoviedb\.org/(tv|movie)/(\d+)', text)
+    if url_m:
+        return _tmdb_fetch_by_id(url_m.group(1), url_m.group(2))
+    id_m = re.match(r'(?i)(tv|movie)\s*[:=]\s*(\d+)$', text)
+    if id_m:
+        return _tmdb_fetch_by_id(id_m.group(1).lower(), id_m.group(2))
+    # Free text — multi search returns tv/movie/person with a media_type tag
+    data = _tmdb_get("/search/multi", {'query': text, 'include_adult': 'false'})
+    for r in (data or {}).get('results', []):
+        if r.get('media_type') in ('tv', 'movie'):
+            return _tmdb_normalize(r['media_type'], r)
+    return None
+
+def _apply_tmdb_overrides(tasks: List[DownloadTask]):
+    """Write each task's manual TMDB override into the match cache, overriding any
+    auto-match. Called after analyze_batch_metadata at every entry point so manual
+    corrections survive Quick Download and resume."""
+    for t in tasks:
+        ov = getattr(t, 'tmdb_override', None)
+        if ov is None or not t.filename:
+            continue
+        key = _strip_size_suffix(sanitize_filename(t.filename))
+        if ov == TMDB_CLEARED:
+            _tmdb_match_cache.pop(key, None)  # force regex fallback
+        else:
+            _tmdb_match_cache[key] = ov
+
+def _selected_queue_indices() -> List[int]:
+    """0-based indices of the queue rows the user has selected."""
+    return [int(s.split('.')[0]) - 1 for s in queue_list.value]
+
+def apply_tmdb_override(b=None):
+    """Match Selected: resolve the Fix-Match input and apply it to selected rows."""
+    if not tmdb_is_enabled():
+        print("⚠️ Enable TMDB matching (Settings) and set an API key first")
+        return
+    text = tmdb_override_input.value.strip()
+    if not text:
+        print("⚠️ Enter a TMDB URL, tv:12345 / movie:12345, or a title to search")
+        return
+    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
+    if not indices:
+        print("⚠️ Select the queue item(s) to correct first")
+        return
+    match = _resolve_tmdb_override(text)
+    if not match:
+        print(f"❌ No TMDB result for '{text}'")
+        return
+    for i in indices:
+        task = pending_queue[i]
+        task.tmdb_override = match
+        if task.filename:
+            _tmdb_match_cache[_strip_size_suffix(sanitize_filename(task.filename))] = match
+    tmdb_override_input.value = ""
+    update_queue_display()
+    label = match['name'] + (f" ({match['year']})" if match['year'] else "")
+    print(f"✅ Matched {len(indices)} item(s) → {label}")
+
+def clear_tmdb_override(b=None):
+    """Clear Match: drop the TMDB match for selected rows (use filename parsing)."""
+    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
+    if not indices:
+        print("⚠️ Select the queue item(s) to clear first")
+        return
+    for i in indices:
+        task = pending_queue[i]
+        task.tmdb_override = TMDB_CLEARED
+        if task.filename:
+            _tmdb_match_cache.pop(_strip_size_suffix(sanitize_filename(task.filename)), None)
+    update_queue_display()
+    print(f"✖ Cleared TMDB match for {len(indices)} item(s) — will use filename parsing")
 
 def _map_absolute_episode(episode: int, seasons: Dict[str, int]) -> Tuple[int, int]:
     """Convert an absolute episode number to (season, episode) using per-season
@@ -2237,6 +2407,9 @@ def process_youtube_link(url, mode="video", apply_playlist_range=True) -> Tuple[
             print(f"   📜 Processing {total_items} item(s)...")
             
             for i, entry in enumerate(entries, 1):
+                if _cancel_requested:
+                    print(f"      🛑 Stopped — skipping remaining {total_items - i + 1} item(s)")
+                    break
                 if not entry:
                     fail_count += 1
                     continue
@@ -2314,6 +2487,8 @@ def process_mega_link(url) -> bool:
         files_before = set()
     try:
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
+        mega_proc_key = f"mega_{str(uuid4())[:8]}"
+        _register_proc(mega_proc_key, process)
         last_speed = ""
         for line in process.stdout:
             match = re.search(r'(\d+\.\d+)%', line)
@@ -2328,6 +2503,9 @@ def process_mega_link(url) -> bool:
                         progress_bar.description = f"Mega: {int(val)}% ({speed_str})"
                 except Exception: pass
         process.wait()
+        _unregister_proc(mega_proc_key)
+        if _cancel_requested:
+            return False  # Terminated by Stop
         if process.returncode == 0:
             # Verify files were actually downloaded (megadl can exit 0 for unsupported folder/file URLs)
             try:
@@ -2397,11 +2575,15 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
            '--summary-interval=1', '--show-console-readout=true']
     if cookie: cmd.extend(['--header', f'Cookie: accountToken={cookie}'])
 
+    proc_key = task_id or str(uuid4())
     for attempt in range(1, 4):
+        if _cancel_requested:
+            return None
         try:
             dl_start = time.time()
             completed_path = None  # Path reported by aria2's "Download complete:" line
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
+            _register_proc(proc_key, process)
             last_speed = ""
             last_speed_mbs = 0.0
             for line in process.stdout:
@@ -2425,6 +2607,9 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
                                 progress_bar.description = f"DL: {int(val)}% ({last_speed})" if last_speed else f"DL: {int(val)}%"
                     except Exception: pass
             process.wait()
+            _unregister_proc(proc_key)
+            if _cancel_requested:
+                return None  # Terminated by Stop — no fallback scan, no retries
             if process.returncode == 0 and os.path.exists(final_path):
                 return final_path
             if process.returncode == 0:
@@ -2456,10 +2641,13 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
                     print(f"      ⚠️ Retry {attempt}/3 - aria2 returned code {process.returncode}")
             time.sleep(2**attempt)
         except Exception as e:
+            _unregister_proc(proc_key)
             with print_lock:
                 print(f"      ❌ Download error (attempt {attempt}/3): {str(e)[:80]}")
             break
 
+    if _cancel_requested:
+        return None
     with print_lock:
         print(f"   ❌ Download failed after 3 attempts - Check URL validity or network connection")
     return None
@@ -2935,6 +3123,8 @@ def process_magnet_file_tasks(tasks: List[DownloadTask], rd_key: str) -> int:
                 progress_bar.description = "RD: Caching..."
             
             for poll_count in range(120):  # 4 minutes max
+                if _cancel_requested:
+                    break
                 info = requests.get(
                     f"https://api.real-debrid.com/rest/1.0/torrents/info/{torrent_id}",
                     headers=h, timeout=30
@@ -2956,6 +3146,8 @@ def process_magnet_file_tasks(tasks: List[DownloadTask], rd_key: str) -> int:
                     # Download each link. RD returns links in selected-file order,
                     # so links[k] maps to file_list[k].
                     for idx, link in enumerate(links, 1):
+                        if _cancel_requested:
+                            break
                         # Rate limit: delay between unrestrict calls to avoid RD fair-use blocks
                         if idx > 1:
                             time.sleep(2)
@@ -3290,6 +3482,8 @@ def process_tb_magnet_file_tasks(tasks: List[DownloadTask], tb_key: str) -> int:
                 progress_bar.description = "TB: Caching..."
             
             for poll_count in range(120):  # 4 minutes max
+                if _cancel_requested:
+                    break
                 item = _tb_fetch_item('torrents', int(torrent_id), tb_key)
                 if not item:
                     time.sleep(2)
@@ -3310,6 +3504,8 @@ def process_tb_magnet_file_tasks(tasks: List[DownloadTask], tb_key: str) -> int:
                     
                     # Download each selected file
                     for idx, (file_id, task) in enumerate(file_list, 1):
+                        if _cancel_requested:
+                            break
                         if idx > 1:
                             time.sleep(1)  # Rate limiting
                         try:
@@ -3977,6 +4173,8 @@ def resolve_fshare(url: str, email: str, password: str) -> List[Tuple[str, str]]
 # --- PARALLEL DOWNLOAD WORKER ---
 def download_worker(task: DownloadTask, gofile_token: str) -> DownloadTask:
     """Worker function for parallel downloads. Returns updated task."""
+    if _cancel_requested:
+        return task  # Never started — stays "pending" so resume picks it up untouched
     task.status = "downloading"
     try:
         # update_bar=False: the batch monitor thread owns the shared progress bar
@@ -3986,6 +4184,9 @@ def download_worker(task: DownloadTask, gofile_token: str) -> DownloadTask:
         elif f:
             handle_file_processing(f, source=task.source)
             task.status = "done"
+        elif _cancel_requested:
+            task.status = "failed"
+            task.error = "Cancelled by user"
         else:
             task.status = "failed"
             task.error = "Download returned None"
@@ -4371,6 +4572,14 @@ def _run_download_pipeline(
     start_keep_alive()
     download_stats.clear()  # Drop progress entries from any previous batch
     _clear_per_task_bars()
+    _reset_cancel_state()
+    # Point the user at the kernel interrupt for stopping (hidden in the finally).
+    # There is no per-cell ■ button during a download because it runs inside a widget
+    # callback, not a cell execution — the menu/shortcut interrupt is the way.
+    stop_hint.value = ("<div style='padding:4px 8px;background:#5a1e1e;border-radius:4px;"
+                       "display:inline-block'>⏹ <b>To stop:</b> menu <b>Runtime → Interrupt execution</b> "
+                       "&nbsp;(shortcut <b>Ctrl+M&nbsp;I</b>, Mac <b>⌘+M&nbsp;I</b>) — progress is saved for Resume/Retry.</div>")
+    stop_hint.layout.display = 'block'
 
     def save_progress(throttle: bool = True):
         """Persist batch state; throttled by default so per-task completions
@@ -4398,23 +4607,29 @@ def _run_download_pipeline(
         try:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_task = {
-                    executor.submit(download_worker, task, gofile_token): task 
+                    executor.submit(download_worker, task, gofile_token): task
                     for task in parallel_tasks
                 }
-                
-                for future in as_completed(future_to_task):
-                    task = future_to_task[future]
-                    try:
-                        result = future.result()
-                        for i, t in enumerate(all_tasks):
-                            if t.id == result.id:
-                                all_tasks[i] = result
-                                break
-                        save_progress()
-                    except Exception as e:
-                        print(f"   ❌ Task failed: {str(e)[:80]}")
-                        task.status = "failed"
-                        task.error = str(e)[:100]
+                try:
+                    for future in as_completed(future_to_task):
+                        task = future_to_task[future]
+                        try:
+                            result = future.result()
+                            for i, t in enumerate(all_tasks):
+                                if t.id == result.id:
+                                    all_tasks[i] = result
+                                    break
+                            save_progress()
+                        except Exception as e:
+                            print(f"   ❌ Task failed: {str(e)[:80]}")
+                            task.status = "failed"
+                            task.error = str(e)[:100]
+                except KeyboardInterrupt:
+                    # Terminate the aria2 subprocesses HERE, before the executor's
+                    # shutdown(wait=True) on with-exit would otherwise block on them.
+                    # Workers see the dead process + cancel flag and return promptly.
+                    print("\n🛑 Interrupt received — stopping active downloads (progress is saved)...")
+                    stop_active_downloads()
         finally:
             stop_monitor = True
             monitor_thread.join(timeout=2)  # Wait for monitor's final tick before touching shared state
@@ -4435,6 +4650,9 @@ def _run_download_pipeline(
             print("   ℹ️ Multiple playlist URLs detected - playlist range ignored (downloading all videos)")
         
         for i, url in enumerate(youtube_urls, 1):
+            if _cancel_requested:
+                print("   🛑 Stopped — remaining YouTube links left pending for resume")
+                break
             print(f"   [{i}/{len(youtube_urls)}] {url[:60]}...")
             s, f, total = process_youtube_link(url, mode, apply_playlist_range=use_playlist_range)
             yt_success += s
@@ -4456,6 +4674,9 @@ def _run_download_pipeline(
     if mega_urls:
         print(f"\n☁️ Processing {len(mega_urls)} Mega links...")
         for i, url in enumerate(mega_urls, 1):
+            if _cancel_requested:
+                print("   🛑 Stopped — remaining Mega links left pending for resume")
+                break
             print(f"   [{i}/{len(mega_urls)}] {url[:60]}...")
             mega_success = process_mega_link(url)
             for t in all_tasks:
@@ -4468,6 +4689,9 @@ def _run_download_pipeline(
         if rd_key:
             print(f"\n🔓 Processing {len(debrid_urls)} RD links...")
             for i, url in enumerate(debrid_urls, 1):
+                if _cancel_requested:
+                    print("   🛑 Stopped — remaining links left pending for resume")
+                    break
                 print(f"   [{i}/{len(debrid_urls)}] {url[:60]}...")
                 ok = process_rd_link(url, rd_key)
                 for t in all_tasks:
@@ -4478,6 +4702,9 @@ def _run_download_pipeline(
         elif tb_key:
             print(f"\n🔓 Processing {len(debrid_urls)} TorBox links...")
             for i, url in enumerate(debrid_urls, 1):
+                if _cancel_requested:
+                    print("   🛑 Stopped — remaining links left pending for resume")
+                    break
                 print(f"   [{i}/{len(debrid_urls)}] {url[:60]}...")
                 ok = process_tb_link(url, tb_key)
                 for t in all_tasks:
@@ -4487,12 +4714,12 @@ def _run_download_pipeline(
                 save_progress()
 
     # --- MAGNET FILE TASKS (RD) --- (process_* sets each task's status per file)
-    if magnet_file_tasks and rd_key:
+    if magnet_file_tasks and rd_key and not _cancel_requested:
         print(f"\n🧲 Processing {len(magnet_file_tasks)} selected magnet files (RD)...")
         process_magnet_file_tasks(magnet_file_tasks, rd_key)
 
     # --- MAGNET FILE TASKS (TorBox) ---
-    if tb_magnet_file_tasks and tb_key:
+    if tb_magnet_file_tasks and tb_key and not _cancel_requested:
         print(f"\n🧲 Processing {len(tb_magnet_file_tasks)} selected magnet files (TorBox)...")
         process_tb_magnet_file_tasks(tb_magnet_file_tasks, tb_key)
     
@@ -4513,13 +4740,14 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str):
     global yt_success_cumulative, yt_fail_cumulative
     yt_success_cumulative = 0
     yt_fail_cumulative = 0
-    
+
     clear_output(wait=True)
     display(input_ui)
     settings_ui.layout.display = 'none'
     btn.disabled = True
     btn_quick.disabled = True
     btn_resume.disabled = True
+    btn_retry.layout.display = 'none'
 
     start_keep_alive()
     try:
@@ -4530,8 +4758,10 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str):
         # Quick Download skips the queue preview — run TMDB matching here if it hasn't run.
         # (Do NOT re-run analyze_batch_episodes here: it would re-analyze on the selected
         # subset and could lose the batch detection computed at preview time.)
-        if tmdb_is_enabled() and not _tmdb_match_cache:
-            analyze_batch_metadata([t.filename for t in selected_tasks if t.filename])
+        if tmdb_is_enabled():
+            if not _tmdb_match_cache:  # Quick Download path — no queue preview ran
+                analyze_batch_metadata([t.filename for t in selected_tasks if t.filename])
+            _apply_tmdb_overrides(selected_tasks)  # honor any manual corrections
 
         # Separate by type: everything without a sequential processor goes parallel
         parallel_tasks = [t for t in selected_tasks if t.link_type not in SEQUENTIAL_LINK_TYPES]
@@ -4624,29 +4854,48 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str):
         # Handle results
         if total_failed > 0:
             failed_files = [t.filename for t in all_tasks if t.status == 'failed']
-            print(f"\n⚠️ Completed with {total_success} success, {total_failed} failed after 3 attempts:")
-            for f in failed_files[:5]:
-                print(f"   ❌ {f[:60]}")
-            if len(failed_files) > 5:
-                print(f"   ... and {len(failed_files) - 5} more")
-            
+            if cancel_requested():
+                print(f"\n🛑 Batch stopped by user — {total_success} completed, {total_failed} cancelled/failed.")
+            else:
+                print(f"\n⚠️ Completed with {total_success} success, {total_failed} failed after 3 attempts:")
+                for f in failed_files[:5]:
+                    print(f"   ❌ {f[:60]}")
+                if len(failed_files) > 5:
+                    print(f"   ... and {len(failed_files) - 5} more")
+
             save_session(all_tasks,
                         show_name=show_name_override.value.strip(), year=year_input.value.strip(),
                         playlist_range=playlist_selection.value.strip(),
                         yt_success=yt_success_cumulative, yt_fail=yt_fail_cumulative)
-            print(f"\n💾 Session saved. Use 'Resume Previous' to retry later, or 'Clear Session' in Settings to mark complete.")
+            print(f"\n💾 Session saved. Click '🔁 Retry Failed' to try again, or 'Clear Session' in Settings to mark complete.")
             btn_restart.layout.display = 'inline-block'
+            btn_retry.layout.display = 'inline-block'
         else:
             print(f"\n✅ All {total_success} downloads completed successfully!")
             clear_session()
             btn_restart.layout.display = 'none'
+            btn_retry.layout.display = 'none'
             yt_success_cumulative = 0
             yt_fail_cumulative = 0
-    
+
+    except KeyboardInterrupt:
+        # User hit the kernel interrupt — stop cleanly and keep the session for retry.
+        # selected_tasks holds the same task objects the pipeline mutated (shallow copy).
+        stop_active_downloads()
+        print(f"\n🛑 Stopped by user (kernel interrupt). Progress saved.")
+        save_session(selected_tasks,
+                    show_name=show_name_override.value.strip(), year=year_input.value.strip(),
+                    playlist_range=playlist_selection.value.strip(),
+                    yt_success=yt_success_cumulative, yt_fail=yt_fail_cumulative)
+        print(f"💾 Session saved. Click '🔁 Retry Failed' to continue.")
+        btn_restart.layout.display = 'inline-block'
+        btn_retry.layout.display = 'inline-block'
     except Exception as e:
         print(f"\n❌ Critical Error: {e}")
     finally:
         stop_keep_alive()
+        stop_hint.layout.display = 'none'
+        _reset_cancel_state()
         btn.disabled = False
         btn_quick.disabled = False
         btn_resume.disabled = False
@@ -4657,12 +4906,14 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str):
 def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False):
     global yt_success_cumulative, yt_fail_cumulative  # Must be at function start
     queue_open = False  # True while the queue preview is waiting for user input
+    all_tasks = []  # Ensure defined for the KeyboardInterrupt handler even if we stop early
     clear_output(wait=True)
     display(input_ui)
     settings_ui.layout.display = 'none'  # Close settings panel if open
     btn.disabled = True
     btn_quick.disabled = True
     btn_resume.disabled = True
+    btn_retry.layout.display = 'none'
     print(f"\n🚀 Initializing... (Mode: {mode}, Resume: {resume})")
     
     start_keep_alive()
@@ -4723,9 +4974,10 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False):
             pending_tasks = [t for t in all_tasks if t.status in ['pending', 'failed', 'downloading']]
             print(f"📂 Resuming {len(pending_tasks)} of {len(all_tasks)} tasks...")
 
-            # Fresh runtime — re-run TMDB matching for the resumed batch
+            # Fresh runtime — re-run TMDB matching, then reapply saved manual corrections
             if tmdb_is_enabled():
                 analyze_batch_metadata([t.filename for t in pending_tasks if t.filename])
+                _apply_tmdb_overrides(pending_tasks)
 
             # Install required tools first
             needs_pixeldrain_gofile_rd_tb = any(t.link_type in ['gofile', 'pixeldrain', 'rd', 'tb'] for t in pending_tasks)
@@ -4865,19 +5117,38 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False):
         
         # Handle results
         if total_failed > 0:
-            print(f"\n⚠️ Completed with {total_success} success, {total_failed} failed (session saved for retry)")
+            if cancel_requested():
+                print(f"\n🛑 Batch stopped by user — {total_success} completed, {total_failed} cancelled/failed (session saved)")
+            else:
+                print(f"\n⚠️ Completed with {total_success} success, {total_failed} failed (session saved for retry)")
             btn_restart.layout.display = 'inline-block'
+            btn_retry.layout.display = 'inline-block'
         else:
             print(f"\n✅ All {total_success} downloads completed successfully!")
             clear_session()
             btn_restart.layout.display = 'none'
+            btn_retry.layout.display = 'none'
             yt_success_cumulative = 0
             yt_fail_cumulative = 0
-        
+
+    except KeyboardInterrupt:
+        # User hit the kernel interrupt (resume path) — stop cleanly, keep session
+        stop_active_downloads()
+        print(f"\n🛑 Stopped by user (kernel interrupt). Progress saved.")
+        if all_tasks:
+            save_session(all_tasks,
+                        show_name=show_name_override.value.strip(), year=year_input.value.strip(),
+                        playlist_range=playlist_selection.value.strip(),
+                        yt_success=yt_success_cumulative, yt_fail=yt_fail_cumulative)
+        print(f"💾 Session saved. Click '🔁 Retry Failed' to continue.")
+        btn_restart.layout.display = 'inline-block'
+        btn_retry.layout.display = 'inline-block'
     except Exception as e:
         print(f"\n❌ Critical Error: {e}")
     finally:
         stop_keep_alive()
+        stop_hint.layout.display = 'none'
+        _reset_cancel_state()
         if not queue_open:
             # While the queue preview is open the buttons stay disabled;
             # hide_queue()/start_from_queue() re-enable them later.
@@ -4886,6 +5157,8 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False):
             btn_resume.disabled = False
             reset_progress()
         check_resume_available()
+
+
 
 # --- QUICK DOWNLOAD ---
 def on_quick_download(b=None):
@@ -4898,7 +5171,7 @@ def on_quick_download(b=None):
     # Setup subtitle languages for Quick Download if enabled
     if quick_dl_subs_checkbox.value:
         subtitle_langs.value = quick_dl_subtitle_langs.value
-    
+
     # Call execute_batch with quick_mode to skip queue preview
     execute_batch("video", quick_mode=True)
 
@@ -4906,6 +5179,7 @@ def on_quick_download(b=None):
 btn.on_click(lambda b: execute_batch("video"))
 btn_quick.on_click(on_quick_download)
 btn_resume.on_click(lambda b: execute_batch("video", resume=True))
+btn_retry.on_click(lambda b: execute_batch("video", resume=True))  # Retry = resume machinery, no restart needed
 btn_restart.on_click(restart_runtime)
 btn_history.on_click(view_history)
 
@@ -4917,6 +5191,8 @@ btn_queue_select_none.on_click(queue_select_none)
 btn_queue_remove.on_click(queue_remove_selected)
 btn_queue_cancel.on_click(queue_cancel)
 btn_queue_sort.on_click(queue_sort_alpha)
+btn_tmdb_match.on_click(apply_tmdb_override)
+btn_tmdb_clear.on_click(clear_tmdb_override)
 btn_queue_start.on_click(lambda b: start_from_queue(mode="video"))
 btn_queue_start_subs.on_click(lambda b: start_from_queue(mode="subs_only"))
 
