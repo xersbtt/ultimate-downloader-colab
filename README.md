@@ -95,6 +95,7 @@ Files are automatically organised and saved to your Google Drive.
 | **Movies/TV \| Anime** | Toggle between regular folders (Movies, TV Shows) and anime folders (Anime Movies, Anime Series) |
 | **Category** | Force Movie or Series classification (Auto: detect from filename) |
 | **Parallel DLs** | Number of concurrent downloads (1-5, applies to Gofile/Pixeldrain/RD/HTTP) |
+| **Auto Retry** | Optional: when a batch ends with failures, automatically re-run 🔁 Retry Failed up to this many times (stops early once everything succeeds). Empty = off. A kernel interrupt cancels the chain |
 
 ### Drive Folders
 
@@ -110,6 +111,8 @@ Files are automatically organised and saved to your Google Drive.
 > **API Keys**: Gofile, Real-Debrid, and TorBox tokens are configured in ⚙️ Settings (select the active debrid service with the **Debrid** toggle). For security, use Colab Secrets (see Quick Start) — credentials are never written to Drive.
 
 > **Quick Download Subtitles**: Enable "Include subtitles in quick downloads" in ⚙️ Settings to automatically fetch subtitles when using the Quick Download button.
+
+> **Overlap Drive moves** (⚙️ Settings → Performance): finished files move to Drive on a background thread while the next download starts immediately, instead of each worker pausing to move its own file. Opt-in — it queues up to 3 finished files on Colab's local disk and keeps more debrid connections busy, so leave it off if disk space or your provider's concurrent-download slots are tight.
 
 **Customizing Download Directories:**
 1. Click ⚙️ Settings in the main UI
@@ -129,7 +132,7 @@ Files are automatically organised and saved to your Google Drive.
 | **Gofile** | Public/private folders, cookie auth | Parallel |
 | **Pixeldrain** | Direct file downloads | Parallel |
 | **Real-Debrid** | Link unrestricting, file selection from magnets, 35+ premium hosts | Parallel (cached) / Sequential (uncached) |
-| **TorBox** | Web-download unrestricting, magnet file selection, 35+ premium hosts | Parallel (cached) / Sequential (uncached) |
+| **TorBox** | Web-download unrestricting, magnet file selection, torbox.app share links (Copy JDownloader Folder Links), 35+ premium hosts | Parallel (cached) / Sequential (uncached) |
 | **FShare** ⚠️ | VIP file/folder downloads (experimental) | Sequential |
 | **Direct HTTP** | Any direct download URL | Parallel |
 | **Mega.nz** | Full download support | Sequential |
@@ -154,6 +157,7 @@ Files are automatically organised and saved to your Google Drive.
 | v6.0 | TorBox debrid integration, security & reliability overhaul |
 | v6.1 | Per-download progress bars, UI alignment polish |
 | v6.2 | TMDB metadata matching, anime season mapping, stop & retry controls |
+| v6.3 | TorBox share-link support, parallel cached-torrent downloads, auto retry, EP-range pack fix |
 
 ## 🎬 Episode Detection Patterns
 

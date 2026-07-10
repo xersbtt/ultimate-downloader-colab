@@ -4,7 +4,22 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 
 ---
 
-## v6.2 (Latest)
+## v6.3 (Latest)
+**Theme: TorBox Share-Link Support**
+
+### ✨ New Features
+- **TorBox folder links resolve natively**: Paste a `torbox.app/download?id=...&type=...` link (the TorBox site's "Copy JDownloader Folder Links" button) and the queue expands it into every file in the torrent — with real filenames, so episode detection and TMDB matching work. Works for torrents, usenet, and web downloads, and resolves via the TorBox API regardless of which debrid service is toggled (uses the saved TB key)
+- **TorBox CDN links get real names**: Bare `store-*.tb-cdn.io/dld/<uuid>` links are now downloaded directly (no pointless re-unrestricting through the debrid path) and named from the server's `Content-Disposition` header instead of the opaque UUID, so they too can match episodes
+- **Cached TorBox files download in parallel**: When a TorBox torrent/usenet/web item is already cached, its per-file direct links are pre-fetched and the files join the parallel aria2 pool (respecting the Parallel DLs slider) instead of downloading one-by-one. Uncached items still go through the sequential flow that polls TorBox's caching progress
+- **Auto Retry failed batches**: New optional "Auto Retry" field next to the Parallel DLs slider. Set it to N and a batch that ends with failures automatically re-runs the 🔁 Retry Failed path — until nothing is left failed or N extra passes have run, whichever comes first. Empty = off (unchanged behaviour). Each pass starts with a 5-second countdown (`Auto Retry 2/3 starting in 5s...`) during which a kernel interrupt (Ctrl+M I) cancels the chain; interrupting mid-download also stops it. The retry budget refreshes each time a batch is started or 🔁 Retry Failed is clicked manually
+- **Overlap Drive moves with downloads (opt-in)**: New ⚙️ Settings → Performance toggle. Finished files are handed to a dedicated mover thread so the download pool starts the next file immediately, instead of each worker idling through its own Drive move. The mover queue is capped at 3 finished files so Colab's local disk can't silently fill (workers block until the mover catches up), and moves stay single-threaded so Drive FUSE writes never compete. On interrupt, queued moves are marked failed with the local file kept — 🔁 Retry re-moves them without re-downloading. Off by default: the classic move-then-next behaviour doubles as backpressure when Colab disk or debrid concurrent slots are tight. Status shows `📤 N moving` alongside download progress
+
+### 🐛 Bug Fixes
+- **Episode-range pack names mapped every file to episode 1**: Filenames like `Show.EP01-70.2160p...` (episode-range in the torrent/folder name, files named `01.mp4`…`70.mp4`) matched the range's `EP01` as the episode for *every* file — so file 1 organised to `S01E01` and the remaining files were skipped as duplicates of it. Ranges (`EP01-70`, `E01-E24`) are now recognised as pack markers: per-file numbers drive episode detection, and the range still anchors the show-name split (verified over the detection corpora with zero behaviour changes elsewhere)
+
+---
+
+## v6.2
 **Theme: TMDB Metadata Matching & Batch Controls**
 
 ### ✨ New Features
