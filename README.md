@@ -158,6 +158,7 @@ Files are automatically organised and saved to your Google Drive.
 | v6.1 | Per-download progress bars, UI alignment polish |
 | v6.2 | TMDB metadata matching, anime season mapping, stop & retry controls |
 | v6.3 | TorBox share-link support, parallel cached-torrent downloads, auto retry, EP-range pack fix |
+| v6.4 | Season match/Absolute numbering toggle, Force Season queue override, sticky Auto Retry & Overlap-moves settings |
 
 ## 🎬 Episode Detection Patterns
 

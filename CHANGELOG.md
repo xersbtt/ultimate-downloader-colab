@@ -4,7 +4,25 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 
 ---
 
-## v6.3 (Latest)
+## v6.4 (Latest)
+**Theme: Season Control & Sticky Settings**
+
+### ✨ New Features
+- **Numbering toggle (Season match / Absolute)**: New "Episode numbering" dropdown in ⚙️ Settings, directly under the TMDB controls (it only affects TMDB-matched shows, so it lives with them rather than in the per-batch input row). *Season match* (default, unchanged behaviour) converts bare absolute episode numbers on TMDB-matched shows to `SxxEyy` via per-season counts (e.g. `One Piece - 1085` → S19Exx). *Absolute* keeps the number as-is (`S01E1085`) — for libraries scanned with absolute ordering. Only affects TMDB-matched shows whose filenames carry no explicit `SxxExx`/`NxN` marker; persisted in settings.json
+- **🗂️ Force Season (manual season override)**: New row in the queue preview. Select queue items, type a season number, click **Set Season** — those files organise into that season regardless of filename parsing or TMDB mapping (episode number is kept; `0` = Specials). Solves multi-season batches whose filenames have no season marker: previously every file parsed as season 1, so season 2+ files were skipped as duplicates of season 1 — now select the season-2 files and force S2 in one batch, no more splitting the download or disabling auto-organise. Forced items show `[S02]` in the queue, the override is saved with the session (survives Stop/Resume/Retry), and **✖ Clear Season** reverts to detection. Works with or without TMDB; a forced season also suppresses absolute-episode mapping for that file
+- **Auto Retry and Overlap Drive moves persist across sessions**: both are now saved to settings.json on change and restored on startup, like the other toggles
+
+### 🐛 Bug Fixes
+- **`SxxEPyy` episode markers went undetected — whole seasons collapsed to E01**: Filenames like `Galileo.S02EP05.1080p...` (season + `EP` + episode, a common Japanese/FOD WEB-DL style) matched no episode pattern — the glued `EP` broke both the strict `SxxExx` regex and the loose `\bEP` regex — so every file in the pack parsed as episode 1 and organised to the same `SxxE01` path, leaving the second file onward skipped as duplicates. The strict pattern now accepts an optional `P` after the `E` (`S02EP05` → S02E05), so season and episode are read straight from the filename with no manual override needed (verified over the detection corpora with zero behaviour changes elsewhere)
+- **Subtitles kept the raw release name while their video was renamed**: `.srt` files organised with the messy folder-prefix name (e.g. `Nodame Cantabile Netflix ENG CHT SUB Nodame Cantabile - S01E01.Eng.srt`) even though the matching `.mkv` got the clean TMDB name. The language tag is stripped from a subtitle before routing (so `Show.EP01.Eng.srt` reads as `Show.EP01.srt`), but the TMDB/season match was cached under the *un*stripped name — a guaranteed cache miss that dropped the subtitle to filename parsing. TMDB-match and Force-Season cache keys now normalise the subtitle language tag the same way, so a subtitle resolves to the same show metadata (name, year, forced season, absolute-episode mapping) as its video and is renamed to match
+- **TorBox folder links prepended the folder name to every file**: resolving a `torbox.app/download` (JDownloader Folder Links) item named each file with its full in-torrent path, so the folder — often a release/quality string like `[MagicStar] … [Netflix] [ENG_CHT_SUB]` — was carried into the filename and leaked into show-name detection (and into fallback names when TMDB was off). The leading folder is now stripped to the basename, matching what the Real-Debrid resolver already did; both TorBox resolve paths (folder link and magnet) are fixed
+
+### 🎨 Organisation
+- **Subtitle language codes normalised for Plex**: the saved subtitle's language suffix is now mapped from the release tag to a Plex-recognised ISO 639-1 code (`Show - S01E01.en.srt` instead of `.Eng.srt`; `Vie`→`vi`, `Jpn`→`ja`, `Kor`→`ko`, etc.), with Traditional/Simplified Chinese kept distinct as `zh-Hant`/`zh-Hans`. Unrecognised tags pass through unchanged. This now applies to **all** subtitle formats (`.srt`, `.ass`, `.sub`, `.vtt`) — previously only `.srt` got a language suffix — and to subtitles unpacked from `.rar`/`.zip`/`.7z` archives, not just directly-downloaded ones
+
+---
+
+## v6.3
 **Theme: TorBox Share-Link Support**
 
 ### ✨ New Features

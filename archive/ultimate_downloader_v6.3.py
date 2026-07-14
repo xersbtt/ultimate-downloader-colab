@@ -117,7 +117,6 @@ class DownloadTask:
     cookie: Optional[str] = None
     original_url: Optional[str] = None  # Original user-provided URL (for re-resolving on resume)
     tmdb_override: Optional[dict] = None  # Manual TMDB correction (persisted); {'cleared': True} forces regex
-    season_override: Optional[int] = None  # Manual season number (persisted); None = detect from filename/TMDB
 
 _TASK_FIELDS = {f.name for f in fields(DownloadTask)}
 
@@ -263,19 +262,6 @@ category_override = widgets.Dropdown(
     tooltip='Auto: detect from filename. Movie/Series: force category regardless of filename pattern.',
     style={'description_width': '60px'},
     layout=widgets.Layout(width='140px')
-)
-# Season match (default): bare episode numbers on TMDB-matched shows are converted to
-# SxxEyy via per-season counts (e.g. "One Piece - 1085" → S19E..). Absolute: keep the
-# number as-is (S01E1085) for libraries scanned with absolute ordering. Only affects
-# TMDB-matched shows whose filenames carry no explicit SxxExx/NxN season marker, so it
-# lives in ⚙️ Settings beside the TMDB controls rather than in the per-batch input row.
-episode_numbering_toggle = widgets.Dropdown(
-    options=['Season match', 'Absolute'],
-    value='Season match',
-    description='Episode numbering:',
-    tooltip='Season match: convert absolute episode numbers to SxxEyy using TMDB season data. Absolute: keep the absolute number as-is (e.g. S01E1085). Applies only to TMDB-matched shows with no season marker in the filename.',
-    style={'description_width': '120px'},
-    layout=widgets.Layout(width='260px')
 )
 playlist_selection = widgets.Text(description='Playlist:', placeholder='e.g. 1,3,5-10 (Empty=All)', style={'description_width': '60px'}, layout=widgets.Layout(width='220px'))
 concurrent_slider = widgets.IntSlider(value=MAX_CONCURRENT_DEFAULT, min=1, max=5, description='Parallel DLs:', style={'description_width': '80px'})
@@ -523,9 +509,6 @@ settings_buttons = widgets.HBox([btn_clear_history, btn_clear_ytarchive, btn_cle
 cookie_row = widgets.HBox([btn_upload_cookies, btn_clear_cookies, cookie_status])
 api_keys_row = widgets.HBox([token_gf, token_rd, token_tb])
 tmdb_row = widgets.HBox([token_tmdb, tmdb_enabled_checkbox])
-# Numbering toggle sits under the TMDB controls because it only affects TMDB-matched
-# shows (absolute-episode → SxxEyy conversion); indented to line up under the key field.
-tmdb_numbering_row = widgets.HBox([episode_numbering_toggle], layout=widgets.Layout(margin='0 0 0 30px'))
 fshare_keys_row = widgets.HBox([token_fshare_email, token_fshare_password])
 # 30px indent = Gofile's 80px label width minus Debrid's 50px, so the dropdown box
 # lines up under the Gofile input. (The toggle itself keeps 50px to stay aligned with
@@ -537,7 +520,6 @@ settings_ui = widgets.VBox([
     api_keys_row,
     debrid_row,
     tmdb_row,
-    tmdb_numbering_row,
     widgets.HTML("<small><b>🇻🇳 FShare Account:</b></small>"),
     fshare_keys_row,
     secrets_status,
@@ -562,7 +544,7 @@ about_ui = widgets.VBox([
     widgets.HTML("""
         <div style='padding: 10px;'>
             <h3>ℹ️ About Ultimate Downloader</h3>
-            <p><strong>Version:</strong> 6.4</p>
+            <p><strong>Version:</strong> 6.3</p>
             <p><strong>Author:</strong> xersbtt</p>
             <p><strong>Repository:</strong> <a href='https://github.com/xersbtt/ultimate-downloader-colab' target='_blank'>github.com/xersbtt/ultimate-downloader-colab</a></p>
             <hr>
@@ -650,9 +632,6 @@ def save_dir_settings():
             'quick_dl_subs': quick_dl_subs_checkbox.value,
             'tmdb_enabled': tmdb_enabled_checkbox.value,
             'quick_dl_langs': list(quick_dl_subtitle_langs.value),
-            'auto_retry': auto_retry_input.value.strip(),
-            'async_moves': async_moves_checkbox.value,
-            'episode_numbering': episode_numbering_toggle.value,
             # FShare password is intentionally NOT saved — plaintext credentials
             # don't belong on Drive. Use Colab Secrets (FSHARE_PASSWORD) instead.
             'fshare_email': token_fshare_email.value.strip(),
@@ -711,12 +690,6 @@ def load_dir_settings(skip_ui_state=False):
                     quick_dl_subtitle_langs.value = tuple(settings['quick_dl_langs'])
                 if settings.get('debrid_service'):
                     debrid_service_toggle.value = settings['debrid_service']
-                if 'auto_retry' in settings:
-                    auto_retry_input.value = str(settings['auto_retry'])
-                if 'async_moves' in settings:
-                    async_moves_checkbox.value = bool(settings['async_moves'])
-                if settings.get('episode_numbering') in ('Season match', 'Absolute'):
-                    episode_numbering_toggle.value = settings['episode_numbering']
             update_main_ui_visibility()
     except Exception as e:
         # Use defaults if the file doesn't exist; warn if it exists but is unreadable
@@ -767,9 +740,6 @@ quick_dl_subtitle_langs.observe(on_dir_change, names='value')
 token_fshare_email.observe(on_dir_change, names='value')
 token_fshare_password.observe(on_dir_change, names='value')
 debrid_service_toggle.observe(on_dir_change, names='value')
-auto_retry_input.observe(on_dir_change, names='value')
-async_moves_checkbox.observe(on_dir_change, names='value')
-episode_numbering_toggle.observe(on_dir_change, names='value')
 
 # Try to load settings on startup (will work if Drive already mounted)
 load_dir_settings()
@@ -810,16 +780,6 @@ tmdb_match_row = widgets.HBox([
     tmdb_override_input, btn_tmdb_match, btn_tmdb_clear
 ], layout=widgets.Layout(display='none'))
 
-# Manual season override (for batches whose filenames carry no season marker —
-# without this, season 2+ files parse as season 1 and get skipped as duplicates)
-season_override_input = widgets.Text(placeholder='e.g. 2', tooltip='Season number to force (0 = Specials)', layout=widgets.Layout(width='80px'))
-btn_season_apply = widgets.Button(description='Set Season', button_style='info', tooltip='Force this season for the selected queue item(s) — overrides filename parsing and TMDB mapping', layout=widgets.Layout(width='110px'))
-btn_season_clear = widgets.Button(description='✖ Clear Season', button_style='', tooltip='Remove the forced season — use filename/TMDB detection again', layout=widgets.Layout(width='130px'))
-season_override_row = widgets.HBox([
-    widgets.HTML("<small><b>🗂️ Force Season:</b></small>"),
-    season_override_input, btn_season_apply, btn_season_clear
-])
-
 # Playlist range selector (shown only for YouTube playlists)
 playlist_options = widgets.HBox([
     widgets.HTML("<small><b>🎯 Playlist Range:</b></small>"),
@@ -829,7 +789,6 @@ queue_ui = widgets.VBox([
     widgets.HTML("<b>📋 Queue Preview</b> <small>(Select items to manage)</small>"),
     queue_list,
     tmdb_match_row,
-    season_override_row,
     playlist_options,
     queue_options,
     queue_controls
@@ -837,11 +796,11 @@ queue_ui = widgets.VBox([
 
 # Conditional row for organization options (shown when auto-organise is enabled)
 # Initial display based on current checkbox value
-organize_options_row = widgets.HBox([show_name_override, year_input, media_type_toggle, category_override],
+organize_options_row = widgets.HBox([show_name_override, year_input, media_type_toggle, category_override], 
     layout=widgets.Layout(display='flex' if auto_organize_checkbox.value else 'none'))
 
 input_ui = widgets.VBox([
-    widgets.HTML("<h3>🚀 Ultimate Downloader v6.4</h3>"),
+    widgets.HTML("<h3>🚀 Ultimate Downloader v6.3</h3>"),
     widgets.HBox([auto_organize_checkbox, debrid_service_toggle]),
     organize_options_row,
     widgets.HBox([concurrent_slider, auto_retry_input]),
@@ -902,7 +861,7 @@ def save_session(
         return
     try:
         session = {
-            "version": "6.4",
+            "version": "6.3",
             "started_at": datetime.now().isoformat(),
             "show_name_override": show_name,
             "year": year,
@@ -1150,9 +1109,6 @@ def update_queue_display():
                        "magnet": "🧲", "magnet_file": "🧲", "tb_magnet_file": "🧲", "archive": "📚",
                        "fshare": "🇻🇳", "okru": "🟠"}.get(task.link_type, "📄")
         name = task.filename[:50] if task.filename else task.url[:50]
-        sov = getattr(task, 'season_override', None)
-        if sov is not None:
-            name += f"  [S{sov:02d}]"  # forced season marker
         ov = getattr(task, 'tmdb_override', None)
         m = get_tmdb_match(task.filename) if task.filename else None
         if ov == TMDB_CLEARED:
@@ -1185,7 +1141,6 @@ def show_queue_preview(tasks: List[DownloadTask], mode: str):
         _apply_tmdb_overrides(pending_queue)  # reapply any prior manual corrections
         if tmdb_matched:
             print(f"   🎬 TMDB matched {tmdb_matched} of {len(filenames)} file(s)")
-    _apply_season_overrides(pending_queue)  # independent of TMDB — works either way
 
     update_queue_display()
 
@@ -1194,8 +1149,6 @@ def show_queue_preview(tasks: List[DownloadTask], mode: str):
     playlist_options.layout.display = 'none'
     # Manual TMDB correction row: only meaningful when TMDB matching is active
     tmdb_match_row.layout.display = 'flex' if tmdb_is_enabled() else 'none'
-    # Force Season row: only meaningful when auto-organise will rename/route files
-    season_override_row.layout.display = 'flex' if is_auto_organize_enabled() else 'none'
     queue_ui.layout.display = 'block'
     
     # Check for YouTube/streaming links
@@ -1271,7 +1224,6 @@ def hide_queue():
     playlist_options.layout.display = 'none'
     tmdb_match_row.layout.display = 'none'
     tmdb_override_input.value = ''
-    season_override_input.value = ''
     btn_queue_start_subs.layout.display = 'none'
     btn.disabled = False
     btn_quick.disabled = False
@@ -1486,54 +1438,6 @@ def _strip_size_suffix(filename: str) -> str:
     Cache keys use the stripped form so lookups work both at queue time (with suffix)
     and at download time (without)."""
     return re.sub(r'\s*\([^)]*[MG]i?B\s*\)\s*$', '', filename)
-
-def _split_subtitle_lang(filename: str) -> Tuple[str, str]:
-    """Split a subtitle's trailing 2-3 letter language tag from its name:
-    'Show.EP01.Eng.srt' -> ('Show.EP01.srt', 'Eng'). Applies to every subtitle format
-    (KEEP_EXTENSIONS: .srt/.ass/.sub/.vtt). Non-tagged subs and non-subs return
-    (filename, ''). Single source of truth for the subtitle language convention, shared
-    by handle_file_processing (which names the saved file) and _match_cache_key (so a
-    subtitle keys the same show as its video)."""
-    _, ext = os.path.splitext(filename)
-    if ext.lower() in KEEP_EXTENSIONS:
-        parts = filename.split('.')
-        if len(parts) >= 3 and len(parts[-2]) in (2, 3):
-            return ".".join(parts[:-2]) + ext, parts[-2]
-    return filename, ''
-
-# Release/fansub subtitle language tags → Plex-friendly ISO codes. 2-letter ISO 639-1,
-# with Traditional/Simplified Chinese kept distinct (zh-Hant/zh-Hans). Keys are
-# casefolded 2-3 char tags (all _split_subtitle_lang can yield); unmapped tags pass
-# through unchanged so an unexpected tag never regresses to a worse name.
-_SUB_LANG_MAP = {
-    'en': 'en', 'eng': 'en',
-    'vi': 'vi', 'vie': 'vi',
-    'ja': 'ja', 'jp': 'ja', 'jpn': 'ja',
-    'ko': 'ko', 'kor': 'ko',
-    'th': 'th', 'tha': 'th',
-    'id': 'id', 'ind': 'id',
-    'es': 'es', 'spa': 'es',
-    'fr': 'fr', 'fra': 'fr', 'fre': 'fr',
-    'de': 'de', 'ger': 'de', 'deu': 'de',
-    'pt': 'pt', 'por': 'pt',
-    'ru': 'ru', 'rus': 'ru',
-    'cht': 'zh-Hant', 'tc': 'zh-Hant',   # Traditional Chinese
-    'chs': 'zh-Hans', 'sc': 'zh-Hans',   # Simplified Chinese
-    'zh': 'zh', 'chi': 'zh', 'zho': 'zh',  # unspecified Chinese
-}
-
-def _normalize_sub_lang(tag: str) -> str:
-    """Map a source subtitle language tag ('Eng', 'Cht') to a Plex-friendly ISO code
-    ('en', 'zh-Hant'). Unrecognised tags are returned unchanged."""
-    return _SUB_LANG_MAP.get(tag.casefold(), tag)
-
-def _match_cache_key(filename: str) -> str:
-    """Canonical key for the TMDB-match and season-override caches. Strips the queue
-    size suffix AND any subtitle language tag, so 'Show.EP01.Eng.srt' resolves to the
-    same entry as the language-stripped name determine_destination_path looks up for
-    subtitles ('Show.EP01.srt') — otherwise subtitles miss the cache and fall back to
-    messy filename parsing while their video gets the clean TMDB name."""
-    return _split_subtitle_lang(_strip_size_suffix(sanitize_filename(filename)))[0]
 
 def analyze_batch_episodes(filenames: List[str]) -> Dict[str, int]:
     """
@@ -1836,7 +1740,7 @@ def _apply_tmdb_overrides(tasks: List[DownloadTask]):
         ov = getattr(t, 'tmdb_override', None)
         if ov is None or not t.filename:
             continue
-        key = _match_cache_key(t.filename)
+        key = _strip_size_suffix(sanitize_filename(t.filename))
         if ov == TMDB_CLEARED:
             _tmdb_match_cache.pop(key, None)  # force regex fallback
         else:
@@ -1867,7 +1771,7 @@ def apply_tmdb_override(b=None):
         task = pending_queue[i]
         task.tmdb_override = match
         if task.filename:
-            _tmdb_match_cache[_match_cache_key(task.filename)] = match
+            _tmdb_match_cache[_strip_size_suffix(sanitize_filename(task.filename))] = match
     tmdb_override_input.value = ""
     update_queue_display()
     label = match['name'] + (f" ({match['year']})" if match['year'] else "")
@@ -1883,65 +1787,9 @@ def clear_tmdb_override(b=None):
         task = pending_queue[i]
         task.tmdb_override = TMDB_CLEARED
         if task.filename:
-            _tmdb_match_cache.pop(_match_cache_key(task.filename), None)
+            _tmdb_match_cache.pop(_strip_size_suffix(sanitize_filename(task.filename)), None)
     update_queue_display()
     print(f"✖ Cleared TMDB match for {len(indices)} item(s) — will use filename parsing")
-
-# --- MANUAL SEASON OVERRIDE ---
-# Mirrors the TMDB Fix-Match pattern: the override lives on the task (so it persists
-# with the session across Stop/Resume) and is mirrored into a filename-keyed cache that
-# determine_destination_path can read from any thread. Solves multi-season batches
-# whose filenames carry no season marker — without it every file parses as season 1
-# and season 2+ gets skipped as duplicates of season 1.
-_season_override_cache: Dict[str, int] = {}  # stripped filename -> forced season (per batch)
-
-def get_season_override(filename: str) -> Optional[int]:
-    """Manual season for a filename (None when not overridden)."""
-    return _season_override_cache.get(_match_cache_key(filename))
-
-def _apply_season_overrides(tasks: List[DownloadTask]):
-    """Rebuild the season-override cache from the tasks' persisted season_override.
-    Called at every entry point (queue preview, start, quick, resume); clearing first
-    means overrides never leak across batches with colliding filenames."""
-    _season_override_cache.clear()
-    for t in tasks:
-        ov = getattr(t, 'season_override', None)
-        if ov is not None and t.filename:
-            _season_override_cache[_match_cache_key(t.filename)] = int(ov)
-
-def apply_season_override(b=None):
-    """Set Season: force a season number for the selected queue rows."""
-    text = season_override_input.value.strip()
-    if not text.isdigit():
-        print("⚠️ Enter a season number first (e.g. 2 — use 0 for Specials)")
-        return
-    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
-    if not indices:
-        print("⚠️ Select the queue item(s) to set the season for first")
-        return
-    season = int(text)
-    for i in indices:
-        task = pending_queue[i]
-        task.season_override = season
-        if task.filename:
-            _season_override_cache[_match_cache_key(task.filename)] = season
-    season_override_input.value = ""
-    update_queue_display()
-    print(f"✅ Season {season:02d} forced for {len(indices)} item(s)")
-
-def clear_season_override(b=None):
-    """Clear Season: drop the forced season for the selected rows."""
-    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
-    if not indices:
-        print("⚠️ Select the queue item(s) to clear first")
-        return
-    for i in indices:
-        task = pending_queue[i]
-        task.season_override = None
-        if task.filename:
-            _season_override_cache.pop(_match_cache_key(task.filename), None)
-    update_queue_display()
-    print(f"✖ Cleared forced season for {len(indices)} item(s) — will use filename/TMDB detection")
 
 def _map_absolute_episode(episode: int, seasons: Dict[str, int]) -> Tuple[int, int]:
     """Convert an absolute episode number to (season, episode) using per-season
@@ -1964,12 +1812,12 @@ def get_tmdb_match(filename: str) -> Optional[dict]:
     """Batch-cached TMDB match for a filename (None when disabled or unmatched)."""
     if not tmdb_is_enabled():
         return None
-    return _tmdb_match_cache.get(_match_cache_key(filename))
+    return _tmdb_match_cache.get(_strip_size_suffix(sanitize_filename(filename)))
 
 def analyze_batch_metadata(filenames: List[str]) -> int:
     """Match a batch of filenames against TMDB. Populates _tmdb_match_cache keyed
-    by _match_cache_key (size-suffix and subtitle-language stripped). One search per
-    distinct (kind, query, year). Returns the number of files matched."""
+    by the stripped+sanitized filename. One search per distinct (kind, query, year).
+    Returns the number of files matched."""
     _tmdb_match_cache.clear()
     if not tmdb_is_enabled() or not filenames:
         return 0
@@ -1979,7 +1827,7 @@ def analyze_batch_metadata(filenames: List[str]) -> int:
     cat = category_override.value
     queries: Dict[Tuple[str, str, Optional[str]], List[str]] = {}
     for fname in filenames:
-        key = _match_cache_key(fname)  # subtitle-lang stripped so subs key like their video
+        key = _strip_size_suffix(sanitize_filename(fname))
         info = detect_episode_info(key)
         if cat == 'Movie':
             kind = 'movie'
@@ -2057,10 +1905,7 @@ def detect_episode_info(filename: str) -> Dict[str, Any]:
 
     show_name = "Unknown Show"
     
-    # Optional 'P' after the E covers the SxxEPyy style (e.g. S02EP05 = S02E05); the
-    # glued 'EP' otherwise breaks both this and the loose \bEP pattern, so the episode
-    # goes undetected and every file in a season collapses to E01 (skipped as dupes).
-    sxe_strict = re.search(r'(?i)\bS(\d{1,2})EP?(\d{1,4})(?:v\d+)?\b', filename)
+    sxe_strict = re.search(r'(?i)\bS(\d{1,2})E(\d{1,4})(?:v\d+)?\b', filename)
     # NNxNN pattern: matches 01x05, 1x03, 02x15, etc. (common TV naming convention)
     sxe_nxn = re.search(r'(?i)\b(\d{1,2})x(\d{1,4})\b', filename)
     # Added Vietnamese "Tập", Korean "화", Portuguese "Episodio", and more flexible episode patterns
@@ -2237,12 +2082,6 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
         if not episode_detected:
             episode_num = 1  # Default to E01 if no episode detected
 
-    # Manual season override (queue 🗂️ Force Season) wins over filename parsing and
-    # TMDB mapping — the parsed number stays the episode, only the season is forced
-    season_ov = get_season_override(filename)
-    if season_ov is not None:
-        season_num = season_ov
-
     # TMDB metadata (populated by analyze_batch_metadata at queue/quick/resume time).
     # Force Name always wins; a match refines names/years, never user input.
     tmdb_match = None if manual_show_name else get_tmdb_match(filename)
@@ -2251,10 +2090,8 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
         show_name = tmdb_match['name']
         tmdb_tv_year = tmdb_match['year']
         # Absolute-numbering conversion (e.g. "One Piece - 1085" → S19Exx) applies only
-        # when the filename carried no explicit SxxExx/NxN season marker, no season is
-        # manually forced, and Numbering is 'Season match' (not 'Absolute')
-        if (episode_detected and not info['has_sxe'] and season_num == 1
-                and season_ov is None and episode_numbering_toggle.value == 'Season match'):
+        # when the filename carried no explicit SxxExx/NxN season marker
+        if episode_detected and not info['has_sxe'] and season_num == 1:
             season_num, episode_num = _map_absolute_episode(episode_num, tmdb_match.get('seasons') or {})
 
     # Apply Force Name override - affects both TV shows and movies
@@ -2908,15 +2745,18 @@ def handle_file_processing(file_path, source="generic"):
     _, ext = os.path.splitext(filename)
 
     if ext not in ['.rar', '.zip', '.7z']:
-        # Strip a subtitle's language tag before routing (so 'Show.EP01.Eng.srt' matches
-        # its video's TMDB/season entry) and re-attach it to the final name afterwards.
-        processing_name, lang = _split_subtitle_lang(filename)
+        processing_name = filename
+        if ext == '.srt':
+            parts = filename.split('.')
+            if len(parts) >= 3 and len(parts[-2]) in [2, 3]: processing_name = ".".join(parts[:-2]) + ext
 
         final_dest, cat = determine_destination_path(processing_name, source)
 
-        if lang:  # re-attach a Plex-friendly language code before the subtitle extension
-            base, sub_ext = os.path.splitext(final_dest)
-            final_dest = f"{base}.{_normalize_sub_lang(lang)}{sub_ext}"
+        if ext == '.srt':
+            parts = filename.split('.')
+            lang = parts[-2] if len(parts) >= 3 and len(parts[-2]) in [2, 3] else ""
+            base = os.path.splitext(final_dest)[0]
+            final_dest = f"{base}.{lang}.srt" if lang else f"{base}.srt"
 
         if os.path.exists(final_dest):
             # Subtitles are cheap and re-downloading them is an explicit user action - refresh.
@@ -3002,13 +2842,7 @@ def handle_file_processing(file_path, source="generic"):
         if os.path.getsize(extracted_full) < MIN_FILE_SIZE_MB * 1024 * 1024 and not f_path.endswith(tuple(KEEP_EXTENSIONS)):
             os.remove(extracted_full)
             continue
-        # Same subtitle-language handling as handle_file_processing: route on the
-        # language-stripped name, then re-attach a Plex-friendly code before the ext.
-        processing_name, lang = _split_subtitle_lang(f_path)
-        final_dest, cat = determine_destination_path(processing_name, source)
-        if lang:
-            base, sub_ext = os.path.splitext(final_dest)
-            final_dest = f"{base}.{_normalize_sub_lang(lang)}{sub_ext}"
+        final_dest, cat = determine_destination_path(f_path, source)
 
         if os.path.exists(final_dest):
             print(f"      -> ⚠️ Duplicate in Drive (kept existing): {os.path.basename(final_dest)}")
@@ -3527,10 +3361,7 @@ def resolve_tb_folder_files(url: str, tb_key: str) -> List[DownloadTask]:
     tasks = []
     for f in files:
         file_id = f.get('id', 0)
-        # TorBox 'name' is the file's path within the torrent; strip the leading folder
-        # (often a release/quality string) so it can't pollute show-name detection.
-        raw_name = f.get('name') or f.get('short_name') or f'file_{file_id}'
-        file_name = os.path.basename(raw_name.replace('\\', '/')) or raw_name
+        file_name = f.get('name', f.get('short_name', f'file_{file_id}'))
         task = _make_torrent_file_task(url, "tb_magnet_file", group_id,
                                        file_id, file_name, f.get('size', 0))
         if task:
@@ -3696,9 +3527,7 @@ def resolve_tb_magnet_files(magnet_url: str, tb_key: str) -> List[DownloadTask]:
                 tasks = []
                 for f in files:
                     file_id = f.get('id', 0)
-                    # Strip any leading folder from the torrent-relative path (see resolve_tb_folder_files)
-                    raw_name = f.get('name') or f.get('short_name') or f'file_{file_id}'
-                    file_name = os.path.basename(raw_name.replace('\\', '/')) or raw_name
+                    file_name = f.get('name', f.get('short_name', f'file_{file_id}'))
                     task = _make_torrent_file_task(magnet_url, "tb_magnet_file", torrent_id,
                                                    file_id, file_name, f.get('size', 0))
                     if task:
@@ -5236,7 +5065,6 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str):
             if not _tmdb_match_cache:  # Quick Download path — no queue preview ran
                 analyze_batch_metadata([t.filename for t in selected_tasks if t.filename])
             _apply_tmdb_overrides(selected_tasks)  # honor any manual corrections
-        _apply_season_overrides(selected_tasks)  # independent of TMDB — works either way
 
         # Separate by type: everything without a sequential processor goes parallel
         parallel_tasks = [t for t in selected_tasks if t.link_type not in SEQUENTIAL_LINK_TYPES]
@@ -5465,7 +5293,6 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False, aut
             if tmdb_is_enabled():
                 analyze_batch_metadata([t.filename for t in pending_tasks if t.filename])
                 _apply_tmdb_overrides(pending_tasks)
-            _apply_season_overrides(pending_tasks)  # forced seasons persist across resume
 
             # Install required tools first
             needs_pixeldrain_gofile_rd_tb = any(t.link_type in ['gofile', 'pixeldrain', 'rd', 'tb'] for t in pending_tasks)
@@ -5689,8 +5516,6 @@ btn_queue_cancel.on_click(queue_cancel)
 btn_queue_sort.on_click(queue_sort_alpha)
 btn_tmdb_match.on_click(apply_tmdb_override)
 btn_tmdb_clear.on_click(clear_tmdb_override)
-btn_season_apply.on_click(apply_season_override)
-btn_season_clear.on_click(clear_season_override)
 btn_queue_start.on_click(lambda b: start_from_queue(mode="video"))
 btn_queue_start_subs.on_click(lambda b: start_from_queue(mode="subs_only"))
 
