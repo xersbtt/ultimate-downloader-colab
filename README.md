@@ -372,8 +372,6 @@ Yes! Colab works in mobile browsers. The UI is functional on phones/tablets, tho
 ```
 Ultimate Downloader/
 ├── ultimate_downloader.py          # Latest version (always current)
-├── Ultimate_Downloader.ipynb       # Jupyter notebook launcher
-├── Ultimate Downloader.url         # Windows shortcut to Colab
 ├── CHANGELOG.md                    # Version history
 ├── README.md                       # This file
 ├── LICENSE                         # MIT Licence
