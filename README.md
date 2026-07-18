@@ -10,13 +10,14 @@ A powerful Google Colab-based tool for downloading media from multiple sources d
 - **Parallel Downloads**: Download up to 5 files concurrently for Gofile, Pixeldrain, debrid, and direct HTTP links
 - **Session Resume**: Automatically resume interrupted downloads after runtime restart
 - **Interrupt & Retry**: Stop a running batch cleanly with Runtime → Interrupt (progress saved); retry failures with one click via the Retry Failed button
-- **Queue Management**: Preview, reorder, sort (A-Z/Z-A), and select which files to download
+- **Queue Management**: Preview, reorder, sort (A-Z/Z-A), and select which files to download — every row shows a live preview of exactly where the file will go and what it will be named
 - **Download History**: Persistent log of completed downloads for debugging
 - **Debrid Integration**: Unrestrict premium links and process magnet links via Real-Debrid or TorBox
 - **Magnet File Selection**: Preview individual torrent files and choose which to download
 - **Smart Media Sorting**: Automatically organises into Plex-compatible folder structures
-  - TV Shows: `Show Name/Season XX/Show Name - S01E01.mkv`
-  - Movies: `Movie Name/Movie Name.mkv`
+  - TV Shows: `Show Name (Year)/Season XX/Show Name - S01E01.mkv`
+  - Movies: `Movie Name (Year)/Movie Name.mkv`
+- **Per-File Queue Overrides**: fix the TMDB match, force a name/year, route to any library folder (mix anime and live-action, series and movies in one batch), force a season, or renumber episodes — all per selection, all persisted across resume
 - **TMDB Metadata Matching**: Canonical names, years, and anime absolute-episode → season mapping via the free TMDB API (optional); correct or clear any auto-match per item in the queue, and corrections persist across resume
 - **Archive Extraction**: Handles RAR, ZIP, 7Z with sequential extraction to save Colab disk space
 - **Subtitle Preservation**: Keeps `.srt`, `.ass`, `.sub`, `.vtt` files regardless of size
@@ -90,12 +91,21 @@ Files are automatically organised and saved to your Google Drive.
 | Field | Description |
 |-------|-------------|
 | **Auto-organise** | Toggle automatic file renaming and organisation (uncheck to save with original filenames to Downloads) |
-| **Name** | Override auto-detected name for folder/filename (works for both TV shows and movies) |
-| **Year** | Append `(YYYY)` to folder name for movies and TV shows (file name unchanged) |
-| **Movies/TV \| Anime** | Toggle between regular folders (Movies, TV Shows) and anime folders (Anime Movies, Anime Series) |
-| **Category** | Force Movie or Series classification (Auto: detect from filename) |
+| **Debrid** | Select Real-Debrid, TorBox, or None — the active service for premium hosts and magnets |
 | **Parallel DLs** | Number of concurrent downloads (1-5, applies to Gofile/Pixeldrain/RD/HTTP) |
 | **Auto Retry** | Optional: when a batch ends with failures, automatically re-run 🔁 Retry Failed up to this many times (stops early once everything succeeds). Empty = off. A kernel interrupt cancels the chain |
+
+### Queue Overrides (per selection)
+
+Select rows in the Queue Preview, then apply any of these. Each shows its effect instantly in the rows' destination previews, and all of them persist with the session across Stop/Resume/Retry:
+
+| Control | Description |
+|---------|-------------|
+| **🎬 Fix Match** | Apply a specific TMDB match (a themoviedb.org URL, `tv:12345` / `movie:12345`, or a title to search) — or clear it to use filename parsing |
+| **✏️ Force Name / Year** | Manually set the show/movie name and optional year — wins over the TMDB match |
+| **🎯 Route as** | Send the selection to a library folder: TV Series, Anime Series, Movie, Anime Movie, or Downloads (as-is). Mix anime and live-action, series and movies, in one batch |
+| **🗂️ Force Season** | Force a season number regardless of filename parsing or TMDB mapping (0 = Specials) |
+| **🔢 Renumber** | Rewrite episode numbers sequentially from a chosen start, in queue order — a video and its subtitles share one number |
 
 ### Drive Folders
 
@@ -103,8 +113,8 @@ Files are automatically organised and saved to your Google Drive.
 - `My Drive/TV Shows/` - Files with detected episode patterns (S01E01, Ep 1, 第5集, etc.)
 - `My Drive/Movies/` - Files without episode patterns
 - `My Drive/YouTube/` - YouTube downloads without episode patterns
-- `My Drive/Anime Series/` - TV shows when Anime mode is enabled
-- `My Drive/Anime Movies/` - Movies when Anime mode is enabled
+- `My Drive/Anime Series/` - Series routed as Anime (queue 🎯 Route as)
+- `My Drive/Anime Movies/` - Movies routed as Anime (queue 🎯 Route as)
 - `My Drive/Downloads/` - All files when Auto-organise is disabled (original filenames)
 - `My Drive/Ultimate Downloader/` - Config files (session.json, history.json, settings.json)
 
@@ -159,6 +169,7 @@ Files are automatically organised and saved to your Google Drive.
 | v6.2 | TMDB metadata matching, anime season mapping, stop & retry controls |
 | v6.3 | TorBox share-link support, parallel cached-torrent downloads, auto retry, EP-range pack fix |
 | v6.4 | Season match/Absolute numbering toggle, Force Season queue override, sticky Auto Retry & Overlap-moves settings |
+| v6.5 | Live destination previews, per-file queue overrides (Route / Force Name / Renumber), SxxEyy detection priority, sticky-settings & history fixes |
 
 ## 🎬 Episode Detection Patterns
 
@@ -181,7 +192,7 @@ The downloader recognises these naming patterns:
 | Pipe/Dash | `Show Name \| 7.mkv` | Season 01, Episode 07 |
 | Asian Multi-Part | `Movie 上篇.mkv` | Adds `-pt1` suffix |
 
-> **Tip**: When using "Show Name" override with playlists, the playlist position (1, 2, 3...) will be used as the episode number if no pattern matches.
+> **Tip**: When forcing a name on YouTube playlist items (queue ✏️ Force Name), the playlist position (1, 2, 3...) is used as the episode number if no pattern matches.
 
 ### Limitations & Workarounds
 
@@ -189,18 +200,18 @@ The auto-organise feature works well for ~95% of standard naming conventions, bu
 
 | Edge Case | Issue | Workaround |
 |-----------|-------|------------|
-| Numbers in movie title | `21 Jump Street` detected as Episode 21 | Set **Category** to "Movie" |
-| "Part X" in movie title | `Movie Part 2` may detect as Episode 2 | Set **Category** to "Movie" |
-| No episode pattern | `Random_Video_Name.mkv` detected as Movie | Set **Category** to "Series" + use **Name** field |
-| Unusual separator | `Show.Name.01.Title.mkv` (no dash) | Use **Name** field to set show name |
+| Numbers in movie title | `21 Jump Street` detected as Episode 21 | 🎯 Route as "Movie" |
+| "Part X" in movie title | `Movie Part 2` may detect as Episode 2 | 🎯 Route as "Movie" |
+| No episode pattern | `Random_Video_Name.mkv` detected as Movie | 🎯 Route as "TV Series" + ✏️ Force Name |
+| Unusual separator | `Show.Name.01.Title.mkv` (no dash) | ✏️ Force Name to set the show name |
 | Decimal episodes | `Show - 01.5 [OVA].mkv` | Detected as Episode 1 (decimal ignored) |
-| Season in title | `Show Season 2 - 01.mkv` | Season not extracted; files go to Season 01 |
+| Season in title | `Show Season 2 - 01.mkv` | 🗂️ Force Season on those rows |
 
 **Best Practices:**
 - For consistent batch naming (e.g., fansub releases), auto-detect is very accurate
-- For mixed or unusual filenames, use **Name** + **Category** overrides before downloading
+- Check each row's destination preview before starting — it shows exactly where the file will land
+- For mixed or unusual filenames, select the affected rows and use the queue overrides (Fix Match, Force Name, Route as, Force Season, Renumber)
 - For movies with sequel numbers (`Toy Story 3`), auto-detect works if year is present (`2010`)
-- If unsure about a filename, set the **Name** and **Category** fields to guarantee correct organization
 
 ---
 

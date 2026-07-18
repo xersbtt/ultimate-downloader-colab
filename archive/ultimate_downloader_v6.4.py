@@ -33,17 +33,6 @@ def get_colab_secret(key: str, default: str = "") -> str:
         # This catches SecretNotFoundError and NotebookAccessError
         return default
 
-# --- SETTINGS CHANGE TRACKING ---
-# _loading_settings: True while load_dir_settings/check_and_load_secrets write widget
-# values programmatically, so the save-on-change observers neither rewrite settings.json
-# mid-load (which would persist half-loaded state over the file) nor mistake those
-# writes for user edits. _user_touched_settings: widgets the user actually changed this
-# session — the post-mount settings reload leaves these alone, so a stored value never
-# overrides a live choice.
-_loading_settings = False
-_user_touched_settings: set = set()
-
-
 def check_and_load_secrets():
     """Re-check secrets and populate fields if they were empty on initial load."""
     try:
@@ -59,21 +48,16 @@ def check_and_load_secrets():
         (token_fshare_email, 'FSHARE_EMAIL'),
         (token_fshare_password, 'FSHARE_PASSWORD'),
     ]
-    global _loading_settings
-    _loading_settings = True  # secret writes are programmatic, not user edits
-    try:
-        for widget, secret_name in secret_fields:
-            if widget.value:
-                continue
-            try:
-                val = userdata.get(secret_name)
-                if val:
-                    widget.value = val
-                    print(f"🔑 {secret_name} loaded from Colab Secrets")
-            except Exception:
-                pass
-    finally:
-        _loading_settings = False
+    for widget, secret_name in secret_fields:
+        if widget.value:
+            continue
+        try:
+            val = userdata.get(secret_name)
+            if val:
+                widget.value = val
+                print(f"🔑 {secret_name} loaded from Colab Secrets")
+        except Exception:
+            pass
 
 # --- CONFIGURATION ---
 COLAB_ROOT = "/content/"
@@ -134,10 +118,6 @@ class DownloadTask:
     original_url: Optional[str] = None  # Original user-provided URL (for re-resolving on resume)
     tmdb_override: Optional[dict] = None  # Manual TMDB correction (persisted); {'cleared': True} forces regex
     season_override: Optional[int] = None  # Manual season number (persisted); None = detect from filename/TMDB
-    episode_override: Optional[int] = None  # Manual episode number (persisted); set by queue 🔢 Renumber
-    name_override: Optional[str] = None  # Manual name for organise (persisted); set by queue ✏️ Force Name
-    year_override: Optional[str] = None  # Manual year accompanying name_override (persisted)
-    route_override: Optional[str] = None  # Manual destination category (persisted); set by queue 🎯 Route as
 
 _TASK_FIELDS = {f.name for f in fields(DownloadTask)}
 
@@ -250,11 +230,11 @@ def stop_keep_alive():
     _keep_alive_stop = True
 
 # --- UI ELEMENTS ---
-token_gf = widgets.Text(description='Gofile:', placeholder='Optional', value=get_colab_secret('GOFILE_TOKEN'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
-token_tmdb = widgets.Text(description='TMDB:', placeholder='API Key (optional)', value=get_colab_secret('TMDB_API_KEY'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
+token_gf = widgets.Text(description='Gofile:', placeholder='Optional', value=get_colab_secret('GOFILE_TOKEN'), style={'description_width': '80px'}, layout=widgets.Layout(width='270px'))
+token_tmdb = widgets.Text(description='TMDB:', placeholder='API Key (optional)', value=get_colab_secret('TMDB_API_KEY'), style={'description_width': '80px'}, layout=widgets.Layout(width='270px'))
 tmdb_enabled_checkbox = widgets.Checkbox(value=True, description='TMDB matching', tooltip='Match filenames against TMDB for canonical names, years, and season mapping', indent=False, layout=widgets.Layout(width='150px'))
-token_rd = widgets.Text(description='RD Token:', placeholder='Real-Debrid API Key', value=get_colab_secret('RD_TOKEN'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
-token_tb = widgets.Text(description='TB Token:', placeholder='TorBox API Key', value=get_colab_secret('TB_TOKEN'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
+token_rd = widgets.Text(description='RD Token:', placeholder='Real-Debrid API Key', value=get_colab_secret('RD_TOKEN'), style={'description_width': '100px'}, layout=widgets.Layout(width='290px'))
+token_tb = widgets.Text(description='TB Token:', placeholder='TorBox API Key', value=get_colab_secret('TB_TOKEN'), style={'description_width': '100px'}, layout=widgets.Layout(width='290px'))
 # Debrid sits second in its row, after the 280px auto-organise checkbox — the same slot
 # the 280px Name field occupies in the row below. Same 50px label width as Year:, so the
 # dropdown and the Year box line up without margin tweaks.
@@ -263,11 +243,27 @@ debrid_service_toggle = widgets.Dropdown(
     value='None',
     description='Debrid:',
     tooltip='Select debrid service for premium links & magnets',
-    style={'description_width': '75px'},  # matches Auto Retry so both label+field pairs align
-    layout=widgets.Layout(width='215px')
+    style={'description_width': '50px'},
+    layout=widgets.Layout(width='170px')
 )
-token_fshare_email = widgets.Text(description='FShare:', placeholder='Email', value=get_colab_secret('FSHARE_EMAIL'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
-token_fshare_password = widgets.Password(description='Password:', placeholder='FShare Password', value=get_colab_secret('FSHARE_PASSWORD'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
+token_fshare_email = widgets.Text(description='FShare:', placeholder='Email', value=get_colab_secret('FSHARE_EMAIL'), style={'description_width': '80px'}, layout=widgets.Layout(width='250px'))
+token_fshare_password = widgets.Password(description='Password:', placeholder='FShare Password', value=get_colab_secret('FSHARE_PASSWORD'), style={'description_width': '80px'}, layout=widgets.Layout(width='250px'))
+show_name_override = widgets.Text(description='Name:', placeholder='Optional (Forces folder/file name)', layout=widgets.Layout(width='280px'))
+year_input = widgets.Text(description='Year:', placeholder='e.g. 2025', style={'description_width': '50px'}, layout=widgets.Layout(width='135px'))
+media_type_toggle = widgets.ToggleButtons(
+    options=['Movies/TV', 'Anime'],
+    value='Movies/TV',
+    description='',
+    tooltips=['Organise to Movies and TV Shows folders', 'Organise to Anime Movies and Anime Series folders']
+)
+category_override = widgets.Dropdown(
+    options=['Auto', 'Movie', 'Series'],
+    value='Auto',
+    description='Category:',
+    tooltip='Auto: detect from filename. Movie/Series: force category regardless of filename pattern.',
+    style={'description_width': '60px'},
+    layout=widgets.Layout(width='140px')
+)
 # Season match (default): bare episode numbers on TMDB-matched shows are converted to
 # SxxEyy via per-season counts (e.g. "One Piece - 1085" → S19E..). Absolute: keep the
 # number as-is (S01E1085) for libraries scanned with absolute ordering. Only affects
@@ -278,18 +274,18 @@ episode_numbering_toggle = widgets.Dropdown(
     value='Season match',
     description='Episode numbering:',
     tooltip='Season match: convert absolute episode numbers to SxxEyy using TMDB season data. Absolute: keep the absolute number as-is (e.g. S01E1085). Applies only to TMDB-matched shows with no season marker in the filename.',
-    style={'description_width': '130px'},  # matches the settings key-field label column
-    layout=widgets.Layout(width='270px')
+    style={'description_width': '120px'},
+    layout=widgets.Layout(width='260px')
 )
 playlist_selection = widgets.Text(description='Playlist:', placeholder='e.g. 1,3,5-10 (Empty=All)', style={'description_width': '60px'}, layout=widgets.Layout(width='220px'))
-concurrent_slider = widgets.IntSlider(value=MAX_CONCURRENT_DEFAULT, min=1, max=5, description='Parallel DLs:', style={'description_width': '80px'}, layout=widgets.Layout(width='280px'))
+concurrent_slider = widgets.IntSlider(value=MAX_CONCURRENT_DEFAULT, min=1, max=5, description='Parallel DLs:', style={'description_width': '80px'})
 auto_retry_input = widgets.Text(description='Auto Retry:', placeholder='e.g. 3 (Empty=Off)', tooltip='Automatically re-run 🔁 Retry Failed when a batch ends with failures, up to this many extra passes. Empty or 0 = off. Stops early once nothing is left failed; a kernel interrupt cancels the chain.', style={'description_width': '75px'}, layout=widgets.Layout(width='215px'))
 # Opt-in: finished files move to Drive on a dedicated mover thread so the pool starts
 # the next download immediately. Off = each worker moves its own file before taking
 # another, which doubles as backpressure when Colab disk or debrid slots are tight.
 async_moves_checkbox = widgets.Checkbox(value=False, description='Overlap Drive moves with downloads', tooltip='Finished files move to Drive in the background while the next download starts immediately. Uses more local disk (up to 3 finished files can queue) and keeps more debrid slots busy — leave off if Colab disk space or your provider\'s concurrent slots are tight.', indent=False, layout=widgets.Layout(width='320px'))
-# Auto-organisation checkbox for main UI. Width matches the Parallel DLs slider
-# (280px) so the Debrid and Auto Retry label+field pairs align across both rows.
+# Auto-organisation checkbox for main UI. Width matches the Name field below (280px)
+# so the Debrid dropdown next to it starts exactly where the Year field starts.
 auto_organize_checkbox = widgets.Checkbox(value=True, description='Auto-organise', tooltip='Auto-rename and organise files. Uncheck to save with original filenames to Downloads.', indent=False, layout=widgets.Layout(width='280px'))
 
 text_area = widgets.Textarea(description='Links:', placeholder='Paste Links Here (Transfer.it, Mega, YouTube, etc.)...', layout=widgets.Layout(width='98%', height='150px'))
@@ -302,9 +298,9 @@ btn_restart = widgets.Button(description="🔄 Restart Runtime", button_style='d
 # the kernel. Shown only during an active batch.
 stop_hint = widgets.HTML(value="", layout=widgets.Layout(display='none'))
 btn_retry = widgets.Button(description="🔁 Retry Failed", button_style='warning', tooltip='Retry failed downloads from the saved session', layout=widgets.Layout(display='none', width='130px'))
-btn_history = widgets.Button(description="📜 History", button_style='', tooltip='View Download History', layout=widgets.Layout(width='100px'))
-btn_settings = widgets.Button(description="⚙️ Settings", button_style='', tooltip='Settings & Manage Files', layout=widgets.Layout(width='105px'))
-btn_about = widgets.Button(description="ℹ️ About", button_style='', tooltip='About', layout=widgets.Layout(width='90px'))
+btn_history = widgets.Button(description="📜", button_style='', tooltip='View Download History', layout=widgets.Layout(width='40px'))
+btn_settings = widgets.Button(description="⚙️", button_style='', tooltip='Settings & Manage Files', layout=widgets.Layout(width='40px'))
+btn_about = widgets.Button(description="ℹ️", button_style='', tooltip='About', layout=widgets.Layout(width='40px'))
 progress_bar = widgets.FloatProgress(value=0.0, min=0.0, max=100.0, description='Idle', bar_style='info', layout=widgets.Layout(width='98%'))
 status_label = widgets.HTML(value="")
 
@@ -323,7 +319,7 @@ _per_task_accordion.layout = widgets.Layout(width='98%', display='none')  # hidd
 # --- SETTINGS/MANAGEMENT UI ---
 btn_clear_history = widgets.Button(description="Clear Download History", button_style='warning', tooltip='Delete history.json', layout=widgets.Layout(width='180px'))
 btn_clear_ytarchive = widgets.Button(description="Clear YT Archive", button_style='warning', tooltip='Delete yt_history.txt (allows re-downloading videos)', layout=widgets.Layout(width='150px'))
-btn_clear_session = widgets.Button(description="Clear Session", button_style='warning', tooltip='Delete session.json', layout=widgets.Layout(width='120px'))
+btn_clear_session = widgets.Button(description="Clear Session", button_style='danger', tooltip='Delete session.json', layout=widgets.Layout(width='120px'))
 btn_settings_close = widgets.Button(description="Close", button_style='', layout=widgets.Layout(width='70px'))
 settings_status = widgets.HTML(value="")
 
@@ -335,12 +331,12 @@ cookie_status = widgets.HTML(value="")
 # Quick Download subtitle settings
 quick_dl_subs_checkbox = widgets.Checkbox(value=False, description='Include Subtitles in Quick Downloads', indent=False, layout=widgets.Layout(width='250px'))
 quick_dl_subtitle_langs = widgets.SelectMultiple(
-    options=[('English', 'en'), ('Vietnamese', 'vi'), ('Chinese', 'zh'), ('Japanese', 'ja'), ('Korean', 'ko'),
+    options=[('English', 'en'), ('Vietnamese', 'vi'), ('Chinese', 'zh'), ('Japanese', 'ja'), ('Korean', 'ko'), 
              ('Thai', 'th'), ('Indonesian', 'id'), ('Spanish', 'es'), ('French', 'fr'), ('German', 'de'), ('Portuguese', 'pt'), ('Russian', 'ru')],
     value=['en', 'vi'],
     description='Languages:',
-    rows=6,  # whole rows only — a fixed pixel height clipped the last visible item
-    layout=widgets.Layout(width='300px')
+    layout=widgets.Layout(width='220px', height='80px'),
+    style={'description_width': '70px'}
 )
 
 # Secrets status UI
@@ -357,12 +353,12 @@ confirm_box = widgets.HBox([confirm_message, btn_confirm_yes, btn_confirm_cancel
 pending_action = {'type': None}
 
 # Directory configuration widgets with browse buttons
-dir_tv_input = widgets.Text(value=DRIVE_TV_PATH, layout=widgets.Layout(width='200px'))
-dir_movie_input = widgets.Text(value=DRIVE_MOVIE_PATH, layout=widgets.Layout(width='200px'))
-dir_youtube_input = widgets.Text(value=DRIVE_YOUTUBE_PATH, layout=widgets.Layout(width='200px'))
-dir_downloads_input = widgets.Text(value=DRIVE_DOWNLOADS_PATH, layout=widgets.Layout(width='200px'))
-dir_anime_series_input = widgets.Text(value=DRIVE_ANIME_SERIES_PATH, layout=widgets.Layout(width='200px'))
-dir_anime_movies_input = widgets.Text(value=DRIVE_ANIME_MOVIES_PATH, layout=widgets.Layout(width='200px'))
+dir_tv_input = widgets.Text(value=DRIVE_TV_PATH, description='TV Shows:', layout=widgets.Layout(width='250px'), style={'description_width': '80px'})
+dir_movie_input = widgets.Text(value=DRIVE_MOVIE_PATH, description='Movies:', layout=widgets.Layout(width='250px'), style={'description_width': '80px'})
+dir_youtube_input = widgets.Text(value=DRIVE_YOUTUBE_PATH, description='YouTube:', layout=widgets.Layout(width='250px'), style={'description_width': '80px'})
+dir_downloads_input = widgets.Text(value=DRIVE_DOWNLOADS_PATH, description='Downloads:', layout=widgets.Layout(width='250px'), style={'description_width': '80px'})
+dir_anime_series_input = widgets.Text(value=DRIVE_ANIME_SERIES_PATH, description='Anime Series:', layout=widgets.Layout(width='250px'), style={'description_width': '80px'})
+dir_anime_movies_input = widgets.Text(value=DRIVE_ANIME_MOVIES_PATH, description='Anime Movies:', layout=widgets.Layout(width='250px'), style={'description_width': '80px'})
 
 btn_browse_tv = widgets.Button(description='📁', tooltip='Browse Drive folders', layout=widgets.Layout(width='35px'))
 btn_browse_movie = widgets.Button(description='📁', tooltip='Browse Drive folders', layout=widgets.Layout(width='35px'))
@@ -501,24 +497,19 @@ btn_browser_select.on_click(on_browser_select)
 btn_browser_close.on_click(on_browser_close)
 btn_create_folder.on_click(on_create_folder)
 
-# Organised folder config (shown when auto-organise is enabled). Labels sit on the
-# same right-aligned 130px column as the key fields above — wide enough that the
-# long ones (Anime Series/Movies) always show fully.
-def _dir_label(text):
-    return widgets.HTML(f"<div style='text-align:right; padding-right:8px'><small><b>{text}</b></small></div>", layout=widgets.Layout(width='130px'))
-
+# Organised folder config (shown when auto-organise is enabled)
 organized_dir_config = widgets.VBox([
-    widgets.HBox([_dir_label('TV Shows:'), dir_tv_input, btn_browse_tv]),
-    widgets.HBox([_dir_label('Movies:'), dir_movie_input, btn_browse_movie]),
-    widgets.HBox([_dir_label('YouTube:'), dir_youtube_input, btn_browse_youtube]),
-    widgets.HBox([_dir_label('Anime Series:'), dir_anime_series_input, btn_browse_anime_series]),
-    widgets.HBox([_dir_label('Anime Movies:'), dir_anime_movies_input, btn_browse_anime_movies]),
+    widgets.HBox([dir_tv_input, btn_browse_tv]),
+    widgets.HBox([dir_movie_input, btn_browse_movie]),
+    widgets.HBox([dir_youtube_input, btn_browse_youtube]),
+    widgets.HBox([dir_anime_series_input, btn_browse_anime_series]),
+    widgets.HBox([dir_anime_movies_input, btn_browse_anime_movies]),
     browser_ui
 ])
 
 # Simple downloads folder config (shown when auto-organise is disabled)
 downloads_dir_config = widgets.VBox([
-    widgets.HBox([_dir_label('Downloads:'), dir_downloads_input, btn_browse_downloads]),
+    widgets.HBox([dir_downloads_input, btn_browse_downloads]),
     browser_ui
 ], layout=widgets.Layout(display='none'))
 
@@ -530,36 +521,36 @@ dir_status = widgets.HTML("")
 
 settings_buttons = widgets.HBox([btn_clear_history, btn_clear_ytarchive, btn_clear_session, btn_settings_close])
 cookie_row = widgets.HBox([btn_upload_cookies, btn_clear_cookies, cookie_status])
-api_keys_row = widgets.HBox([token_gf, token_rd, token_tb], layout=widgets.Layout(flex_flow='row wrap'))
-tmdb_row = widgets.HBox([token_tmdb, tmdb_enabled_checkbox], layout=widgets.Layout(flex_flow='row wrap'))
+api_keys_row = widgets.HBox([token_gf, token_rd, token_tb])
+tmdb_row = widgets.HBox([token_tmdb, tmdb_enabled_checkbox])
 # Numbering toggle sits under the TMDB controls because it only affects TMDB-matched
-# shows (absolute-episode → SxxEyy conversion); its 130px label matches the key fields.
-tmdb_numbering_row = widgets.HBox([episode_numbering_toggle])
-fshare_keys_row = widgets.HBox([token_fshare_email, token_fshare_password], layout=widgets.Layout(flex_flow='row wrap'))
-# 55px indent = the settings label column (130px) minus Debrid's own 75px label, so
-# the dropdown box lines up under the key fields. (The toggle keeps 75px to stay
-# aligned with Auto Retry in the main UI — it's the same widget instance in both places.)
-debrid_row = widgets.HBox([debrid_service_toggle], layout=widgets.Layout(margin='0 0 0 55px'))
+# shows (absolute-episode → SxxEyy conversion); indented to line up under the key field.
+tmdb_numbering_row = widgets.HBox([episode_numbering_toggle], layout=widgets.Layout(margin='0 0 0 30px'))
+fshare_keys_row = widgets.HBox([token_fshare_email, token_fshare_password])
+# 30px indent = Gofile's 80px label width minus Debrid's 50px, so the dropdown box
+# lines up under the Gofile input. (The toggle itself keeps 50px to stay aligned with
+# Year: in the main UI — it's the same widget instance rendered in both places.)
+debrid_row = widgets.HBox([debrid_service_toggle], layout=widgets.Layout(margin='0 0 0 30px'))
 settings_ui = widgets.VBox([
     widgets.HTML("<b>⚙️ Settings & File Management</b>"),
-    widgets.HTML("<div style='margin-top:10px'><small><b>🔑 API Keys:</b></small></div>"),
+    widgets.HTML("<small><b>🔑 API Keys:</b></small>"),
     api_keys_row,
     debrid_row,
     tmdb_row,
     tmdb_numbering_row,
-    widgets.HTML("<div style='margin-top:10px'><small><b>🇻🇳 FShare Account:</b></small></div>"),
+    widgets.HTML("<small><b>🇻🇳 FShare Account:</b></small>"),
     fshare_keys_row,
     secrets_status,
-    widgets.HTML("<div style='margin-top:10px'><small><b>📁 Download Directories (relative to Google Drive):</b></small></div>"),
+    widgets.HTML("<small><b>📁 Download Directories (relative to Google Drive):</b></small>"),
     dir_config_row,
     dir_status,
-    widgets.HTML("<div style='margin-top:10px'><small><b>🍪 YouTube Cookies (Experimental):</b></small></div>"),
+    widgets.HTML("<small><b>🍪 YouTube Cookies (Experimental):</b></small>"),
     cookie_row,
-    widgets.HTML("<div style='margin-top:10px'><small><b>🚀 Performance:</b></small></div>"),
+    widgets.HTML("<small><b>🚀 Performance:</b></small>"),
     widgets.HBox([async_moves_checkbox]),
-    widgets.HTML("<div style='margin-top:10px'><small><b>⚡ Quick Download Options:</b></small></div>"),
+    widgets.HTML("<small><b>⚡ Quick Download Options:</b></small>"),
     widgets.HBox([quick_dl_subs_checkbox, quick_dl_subtitle_langs]),
-    widgets.HTML("<div style='margin-top:10px'><small><b>🗑️ Clear Data:</b></small></div>"),
+    widgets.HTML("<small><b>🗑️ Clear Data:</b></small>"),
     settings_buttons,
     confirm_box,
     settings_status
@@ -571,7 +562,7 @@ about_ui = widgets.VBox([
     widgets.HTML("""
         <div style='padding: 10px;'>
             <h3>ℹ️ About Ultimate Downloader</h3>
-            <p><strong>Version:</strong> 6.5</p>
+            <p><strong>Version:</strong> 6.4</p>
             <p><strong>Author:</strong> xersbtt</p>
             <p><strong>Repository:</strong> <a href='https://github.com/xersbtt/ultimate-downloader-colab' target='_blank'>github.com/xersbtt/ultimate-downloader-colab</a></p>
             <hr>
@@ -636,6 +627,10 @@ def is_auto_organize_enabled():
     """Check if auto-organization is enabled."""
     return auto_organize_checkbox.value
 
+def is_anime_mode_enabled():
+    """Check if anime mode is enabled."""
+    return media_type_toggle.value == 'Anime'
+
 # --- SETTINGS PERSISTENCE ---
 def save_dir_settings():
     """Save directory settings to settings.json."""
@@ -650,6 +645,8 @@ def save_dir_settings():
             'anime_series_path': dir_anime_series_input.value.strip(),
             'anime_movies_path': dir_anime_movies_input.value.strip(),
             'auto_organize': auto_organize_checkbox.value,
+            'media_type': media_type_toggle.value,
+            'category': category_override.value,
             'quick_dl_subs': quick_dl_subs_checkbox.value,
             'tmdb_enabled': tmdb_enabled_checkbox.value,
             'quick_dl_langs': list(quick_dl_subtitle_langs.value),
@@ -668,62 +665,63 @@ def save_dir_settings():
         if os.path.exists(DRIVE_BASE):
             print(f"⚠️ Could not save settings: {e}")
 
-def load_dir_settings():
-    """Restore settings.json into the widgets — directory paths and UI state alike.
-    A widget the user has already changed this session always keeps its value
-    (_user_touched_settings), so the post-mount reload in setup_environment restores
-    sticky settings without overriding in-progress choices. Runs at startup too,
-    where it is a no-op unless Drive happens to be mounted already."""
-    global _loading_settings
+def load_dir_settings(skip_ui_state=False):
+    """Load directory settings from settings.json.
+    
+    Args:
+        skip_ui_state: If True, skip loading UI state values (media_type, auto_organize)
+                       to avoid overriding user's current selections.
+    """
     try:
-        if not os.path.exists(SETTINGS_FILE):
-            return  # normal before the Drive mount — setup_environment reloads later
-        with open(SETTINGS_FILE, 'r') as f:
-            settings = json.load(f)
-        def keep(widget):  # True when the user's in-session change outranks the file
-            return widget in _user_touched_settings
-        _loading_settings = True  # suppress save-on-change while widgets are written
-        try:
-            if settings.get('tv_path') and not keep(dir_tv_input):
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, 'r') as f:
+                settings = json.load(f)
+            if settings.get('tv_path'):
                 dir_tv_input.value = settings['tv_path']
-            if settings.get('movie_path') and not keep(dir_movie_input):
+            if settings.get('movie_path'):
                 dir_movie_input.value = settings['movie_path']
-            if settings.get('youtube_path') and not keep(dir_youtube_input):
+            if settings.get('youtube_path'):
                 dir_youtube_input.value = settings['youtube_path']
-            if settings.get('downloads_path') and not keep(dir_downloads_input):
+            if settings.get('downloads_path'):
                 dir_downloads_input.value = settings['downloads_path']
-            if settings.get('anime_series_path') and not keep(dir_anime_series_input):
+            if settings.get('anime_series_path'):
                 dir_anime_series_input.value = settings['anime_series_path']
-            if settings.get('anime_movies_path') and not keep(dir_anime_movies_input):
+            if settings.get('anime_movies_path'):
                 dir_anime_movies_input.value = settings['anime_movies_path']
-            if settings.get('fshare_email') and not keep(token_fshare_email):
+            if settings.get('fshare_email'):
                 token_fshare_email.value = settings['fshare_email']
             # Legacy: older versions stored the password in settings.json.
             # Still read it so existing users aren't locked out, but it is
             # no longer written back (use Colab Secrets FSHARE_PASSWORD).
             if settings.get('fshare_password') and not token_fshare_password.value:
                 token_fshare_password.value = settings['fshare_password']
-            if 'auto_organize' in settings and not keep(auto_organize_checkbox):
-                auto_organize_checkbox.value = settings['auto_organize']
-            if 'quick_dl_subs' in settings and not keep(quick_dl_subs_checkbox):
-                quick_dl_subs_checkbox.value = settings['quick_dl_subs']
-            if 'tmdb_enabled' in settings and not keep(tmdb_enabled_checkbox):
-                tmdb_enabled_checkbox.value = settings['tmdb_enabled']
-            if 'quick_dl_langs' in settings and not keep(quick_dl_subtitle_langs):
-                quick_dl_subtitle_langs.value = tuple(settings['quick_dl_langs'])
-            if settings.get('debrid_service') and not keep(debrid_service_toggle):
-                debrid_service_toggle.value = settings['debrid_service']
-            if 'auto_retry' in settings and not keep(auto_retry_input):
-                auto_retry_input.value = str(settings['auto_retry'])
-            if 'async_moves' in settings and not keep(async_moves_checkbox):
-                async_moves_checkbox.value = bool(settings['async_moves'])
-            if settings.get('episode_numbering') in ('Season match', 'Absolute') and not keep(episode_numbering_toggle):
-                episode_numbering_toggle.value = settings['episode_numbering']
-        finally:
-            _loading_settings = False
-        update_main_ui_visibility()
+            # Only load UI state on initial load, not when re-loading after Drive mount
+            if not skip_ui_state:
+                if 'auto_organize' in settings:
+                    auto_organize_checkbox.value = settings['auto_organize']
+                if settings.get('media_type'):
+                    media_type_toggle.value = settings['media_type']
+                if settings.get('category'):
+                    category_override.value = settings['category']
+                if 'quick_dl_subs' in settings:
+                    quick_dl_subs_checkbox.value = settings['quick_dl_subs']
+                if 'tmdb_enabled' in settings:
+                    tmdb_enabled_checkbox.value = settings['tmdb_enabled']
+                if 'quick_dl_langs' in settings:
+                    quick_dl_subtitle_langs.value = tuple(settings['quick_dl_langs'])
+                if settings.get('debrid_service'):
+                    debrid_service_toggle.value = settings['debrid_service']
+                if 'auto_retry' in settings:
+                    auto_retry_input.value = str(settings['auto_retry'])
+                if 'async_moves' in settings:
+                    async_moves_checkbox.value = bool(settings['async_moves'])
+                if settings.get('episode_numbering') in ('Season match', 'Absolute'):
+                    episode_numbering_toggle.value = settings['episode_numbering']
+            update_main_ui_visibility()
     except Exception as e:
-        print(f"⚠️ Could not load settings (using defaults): {e}")
+        # Use defaults if the file doesn't exist; warn if it exists but is unreadable
+        if os.path.exists(SETTINGS_FILE):
+            print(f"⚠️ Could not load settings (using defaults): {e}")
 
 def update_folder_config_visibility():
     """Show/hide appropriate folder config based on auto-organise checkbox."""
@@ -735,24 +733,23 @@ def update_folder_config_visibility():
         downloads_dir_config.layout.display = 'block'
 
 def update_main_ui_visibility():
-    """Refresh visibility of settings that depend on the auto-organise checkbox."""
+    """Show/hide Force Name and Media Type based on auto-organise checkbox."""
+    if auto_organize_checkbox.value:
+        organize_options_row.layout.display = 'flex'
+    else:
+        organize_options_row.layout.display = 'none'
     update_folder_config_visibility()
 
 def on_auto_organize_change(change):
     """Handle auto-organise checkbox change."""
     if change['type'] == 'change' and change['name'] == 'value':
         update_main_ui_visibility()
-        if not _loading_settings:
-            _user_touched_settings.add(change['owner'])
-            save_dir_settings()
+        save_dir_settings()
 
-# Auto-save when an observed setting changes — real user edits only: programmatic
-# writes during load_dir_settings/check_and_load_secrets are ignored, and the widget
-# is remembered as user-touched so a later reload never overrides the user's choice.
+# Auto-save when directory inputs change
 def on_dir_change(change):
-    """Save settings when the user changes any observed input."""
-    if change['type'] == 'change' and change['name'] == 'value' and not _loading_settings:
-        _user_touched_settings.add(change['owner'])
+    """Save settings when any directory input changes."""
+    if change['type'] == 'change' and change['name'] == 'value':
         save_dir_settings()
 
 auto_organize_checkbox.observe(on_auto_organize_change, names='value')
@@ -762,6 +759,8 @@ dir_youtube_input.observe(on_dir_change, names='value')
 dir_downloads_input.observe(on_dir_change, names='value')
 dir_anime_series_input.observe(on_dir_change, names='value')
 dir_anime_movies_input.observe(on_dir_change, names='value')
+media_type_toggle.observe(on_dir_change, names='value')
+category_override.observe(on_dir_change, names='value')
 quick_dl_subs_checkbox.observe(on_dir_change, names='value')
 tmdb_enabled_checkbox.observe(on_dir_change, names='value')
 quick_dl_subtitle_langs.observe(on_dir_change, names='value')
@@ -778,9 +777,9 @@ load_dir_settings()
 
 # --- QUEUE MANAGEMENT UI ---
 queue_list = widgets.SelectMultiple(options=[], description='Queue:', layout=widgets.Layout(width='98%', height='200px'))
-btn_queue_up = widgets.Button(description="▲ Up", button_style='', layout=widgets.Layout(width='80px'))
-btn_queue_down = widgets.Button(description="▼ Down", button_style='', layout=widgets.Layout(width='80px'))
-btn_queue_select_all = widgets.Button(description="Select All", button_style='', layout=widgets.Layout(width='80px'))
+btn_queue_up = widgets.Button(description="▲ Up", button_style='', layout=widgets.Layout(width='60px'))
+btn_queue_down = widgets.Button(description="▼ Down", button_style='', layout=widgets.Layout(width='60px'))
+btn_queue_select_all = widgets.Button(description="Select All", button_style='info', layout=widgets.Layout(width='80px'))
 btn_queue_select_none = widgets.Button(description="None", button_style='', layout=widgets.Layout(width='60px'))
 btn_queue_remove = widgets.Button(description="Remove", button_style='danger', layout=widgets.Layout(width='70px'))
 btn_queue_sort = widgets.Button(description="Sort A-Z", button_style='', icon='sort-alpha-asc', tooltip='Sort queue alphabetically by filename', layout=widgets.Layout(width='90px'))
@@ -799,83 +798,52 @@ subtitle_langs = widgets.SelectMultiple(
     layout=widgets.Layout(width='200px', height='80px')
 )
 
-queue_controls = widgets.HBox([
-    widgets.HTML("", layout=widgets.Layout(width='115px')),  # spacer — buttons start where the row fields do
-    btn_queue_up, btn_queue_down, btn_queue_sort, btn_queue_select_all, btn_queue_select_none,
-    btn_queue_start, btn_queue_start_subs, btn_queue_cancel, btn_queue_remove])
+queue_controls = widgets.HBox([btn_queue_up, btn_queue_down, btn_queue_sort, btn_queue_select_all, btn_queue_select_none, btn_queue_remove, btn_queue_start, btn_queue_start_subs, btn_queue_cancel])
 queue_options = widgets.HBox([subtitle_langs])  # Uses description for alignment like queue_list
 
-# Manual identity correction: a TMDB match (automatic canonical name/year) or a
-# forced Name/Year (its manual counterpart, which wins over a match). The TMDB group
-# shows only when TMDB matching is enabled; the whole row only when auto-organise is
-# on — identity only matters when files are renamed and routed.
-tmdb_override_input = widgets.Text(placeholder='TMDB URL, tv:12345 / movie:12345, or a title to search', layout=widgets.Layout(width='300px'))
+# Manual TMDB correction (shown in queue only when TMDB matching is enabled)
+tmdb_override_input = widgets.Text(placeholder='TMDB URL, tv:12345 / movie:12345, or a title to search', layout=widgets.Layout(width='360px'))
 btn_tmdb_match = widgets.Button(description='🔍 Match Selected', button_style='info', tooltip='Apply a TMDB match to the selected queue item(s)', layout=widgets.Layout(width='150px'))
 btn_tmdb_clear = widgets.Button(description='✖ Clear Match', button_style='', tooltip='Remove the TMDB match — use filename parsing instead', layout=widgets.Layout(width='120px'))
-tmdb_group = widgets.HBox([
-    widgets.HTML("<div style='text-align:right; padding-right:8px'><small><b>🎬 Fix Match:</b></small></div>", layout=widgets.Layout(width='115px')),
+tmdb_match_row = widgets.HBox([
+    widgets.HTML("<small><b>🎬 Fix Match:</b></small>"),
     tmdb_override_input, btn_tmdb_match, btn_tmdb_clear
-])
-queue_name_input = widgets.Text(placeholder='Name (forces folder/file name)', tooltip='Manual show/movie name for the selected queue item(s) — wins over the TMDB match', layout=widgets.Layout(width='220px'))
-queue_year_input = widgets.Text(placeholder='Year', tooltip='Optional year for the folder name (e.g. 2025)', layout=widgets.Layout(width='70px'))
-btn_name_apply = widgets.Button(description='Set Name', button_style='info', tooltip='Force this name/year for the selected queue item(s)', layout=widgets.Layout(width='100px'))
-btn_name_clear = widgets.Button(description='✖ Clear Name', button_style='', tooltip='Remove the forced name — use TMDB/filename detection again', layout=widgets.Layout(width='120px'))
-name_group = widgets.HBox([
-    widgets.HTML("<small><b>&nbsp;&nbsp;✏️ Force Name:</b></small>"),
-    queue_name_input, queue_year_input, btn_name_apply, btn_name_clear
-])
-identity_row = widgets.HBox([tmdb_group, name_group], layout=widgets.Layout(flex_flow='row wrap', display='none'))
-
-# Manual routing: send the selected rows to a specific library folder — so one batch
-# can mix anime and live-action, series and movies ('Downloads (as-is)' skips
-# organising for those rows). Auto = use filename/TMDB detection.
-route_dropdown = widgets.Dropdown(
-    options=[('Auto', ''), ('TV Series', 'tv'), ('Anime Series', 'anime_series'),
-             ('Movie', 'movie'), ('Anime Movie', 'anime_movie'), ('Downloads (as-is)', 'downloads')],
-    value='', layout=widgets.Layout(width='150px'))
-btn_route_apply = widgets.Button(description='Apply Route', button_style='info', tooltip='Route the selected queue item(s) to this folder (Auto = clear the override)', layout=widgets.Layout(width='110px'))
-btn_route_clear = widgets.Button(description='✖ Clear Route', button_style='', tooltip='Remove the forced route — detect the category again', layout=widgets.Layout(width='120px'))
-route_row = widgets.HBox([
-    widgets.HTML("<div style='text-align:right; padding-right:8px'><small><b>🎯 Route as:</b></small></div>", layout=widgets.Layout(width='115px')),
-    route_dropdown, btn_route_apply, btn_route_clear
-])
-
+], layout=widgets.Layout(display='none'))
 
 # Manual season override (for batches whose filenames carry no season marker —
 # without this, season 2+ files parse as season 1 and get skipped as duplicates)
 season_override_input = widgets.Text(placeholder='e.g. 2', tooltip='Season number to force (0 = Specials)', layout=widgets.Layout(width='80px'))
 btn_season_apply = widgets.Button(description='Set Season', button_style='info', tooltip='Force this season for the selected queue item(s) — overrides filename parsing and TMDB mapping', layout=widgets.Layout(width='110px'))
 btn_season_clear = widgets.Button(description='✖ Clear Season', button_style='', tooltip='Remove the forced season — use filename/TMDB detection again', layout=widgets.Layout(width='130px'))
-renumber_start_input = widgets.Text(placeholder='1', tooltip='Episode number to start renumbering from (default 1)', layout=widgets.Layout(width='60px'))
-btn_renumber = widgets.Button(description='Renumber', button_style='info', tooltip='Renumber the selected queue item(s) sequentially from this episode, in queue order — a video and its subtitle share one number', layout=widgets.Layout(width='100px'))
-btn_renumber_clear = widgets.Button(description='✖ Clear', button_style='', tooltip='Remove the forced episode numbers — use filename/TMDB detection again', layout=widgets.Layout(width='90px'))
 season_override_row = widgets.HBox([
-    widgets.HTML("<div style='text-align:right; padding-right:8px'><small><b>🗂️ Force Season:</b></small></div>", layout=widgets.Layout(width='115px')),
-    season_override_input, btn_season_apply, btn_season_clear,
-    widgets.HTML("<small><b>&nbsp;&nbsp;🔢 Renumber from:</b></small>"),
-    renumber_start_input, btn_renumber, btn_renumber_clear
+    widgets.HTML("<small><b>🗂️ Force Season:</b></small>"),
+    season_override_input, btn_season_apply, btn_season_clear
 ])
 
 # Playlist range selector (shown only for YouTube playlists)
 playlist_options = widgets.HBox([
-    widgets.HTML("<div style='text-align:right; padding-right:8px'><small><b>🎯 Playlist Range:</b></small></div>", layout=widgets.Layout(width='115px')),
+    widgets.HTML("<small><b>🎯 Playlist Range:</b></small>"),
     playlist_selection
 ], layout=widgets.Layout(display='none'))  # Hidden by default
 queue_ui = widgets.VBox([
     widgets.HTML("<b>📋 Queue Preview</b> <small>(Select items to manage)</small>"),
     queue_list,
-    identity_row,
-    route_row,
+    tmdb_match_row,
     season_override_row,
     playlist_options,
     queue_options,
     queue_controls
 ], layout=widgets.Layout(display='none'))  # Hidden by default
 
+# Conditional row for organization options (shown when auto-organise is enabled)
+# Initial display based on current checkbox value
+organize_options_row = widgets.HBox([show_name_override, year_input, media_type_toggle, category_override],
+    layout=widgets.Layout(display='flex' if auto_organize_checkbox.value else 'none'))
 
 input_ui = widgets.VBox([
-    widgets.HTML("<h3>🚀 Ultimate Downloader v6.5</h3>"),
+    widgets.HTML("<h3>🚀 Ultimate Downloader v6.4</h3>"),
     widgets.HBox([auto_organize_checkbox, debrid_service_toggle]),
+    organize_options_row,
     widgets.HBox([concurrent_slider, auto_retry_input]),
     text_area,
     widgets.HBox([btn, btn_quick, btn_retry, btn_resume, btn_restart, btn_history, btn_settings, btn_about]),
@@ -913,6 +881,8 @@ SESSION_SAVE_MIN_INTERVAL = 5.0  # seconds between throttled session writes (Dri
 def save_session(
     tasks: List[DownloadTask],
     *,  # Force all following parameters to be keyword-only
+    show_name: str = "",
+    year: str = "",
     playlist_range: str = "",
     yt_success: int = 0,
     yt_fail: int = 0,
@@ -932,12 +902,16 @@ def save_session(
         return
     try:
         session = {
-            "version": "6.5",
+            "version": "6.4",
             "started_at": datetime.now().isoformat(),
+            "show_name_override": show_name,
+            "year": year,
             "playlist_range": playlist_range,
             "yt_success": yt_success,
             "yt_fail": yt_fail,
             "subtitle_langs": list(subtitle_langs_value) if subtitle_langs_value else ['en', 'vi'],
+            "media_type": media_type_toggle.value,
+            "category": category_override.value,
             "tasks": [asdict(t) for t in tasks]
         }
         with _session_save_lock, open(SESSION_FILE, 'w') as f:
@@ -962,49 +936,27 @@ def check_resume_available():
         btn_resume.layout.display = 'none'
 
 # --- DOWNLOAD HISTORY ---
-_history_lock = Lock()  # parallel workers all log downloads — serialise the read-modify-write
-
-def _load_history() -> list:
-    """Read history.json tolerantly. Before writes were locked and atomic, concurrent
-    workers could leave trailing garbage after the JSON array ('Extra data' errors) —
-    recover such files by taking the first complete JSON document and ignoring the
-    tail. Raises only when nothing parseable is left."""
-    if not os.path.exists(HISTORY_FILE):
-        return []
-    with open(HISTORY_FILE, 'r') as f:
-        text = f.read()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        history, _ = json.JSONDecoder().raw_decode(text.lstrip())
-        if not isinstance(history, list):
-            raise ValueError("history is not a list")
-        return history
-
 def log_download(filename: str, source: str, size_mb: float, destination: str, status: str = "success"):
-    """Append download to persistent history log for debugging. Locked and written
-    via temp-file + atomic replace: unsynchronised plain writes from parallel
-    workers are what used to corrupt the file with trailing garbage."""
+    """Append download to persistent history log for debugging."""
     try:
-        with _history_lock:
-            try:
-                history = _load_history()
-            except Exception:
-                history = []  # unrecoverable file — restart the log rather than stop logging
-            entry = {
-                "timestamp": datetime.now().isoformat(),
-                "filename": filename,
-                "source": source,
-                "size_mb": round(size_mb, 2),
-                "destination": destination,
-                "status": status
-            }
-            history.insert(0, entry)  # Newest first
-            history = history[:500]   # Keep last 500 entries
-            tmp = HISTORY_FILE + '.tmp'
-            with open(tmp, 'w') as f:
-                json.dump(history, f, indent=2)
-            os.replace(tmp, HISTORY_FILE)  # readers never see a partial file
+        history = []
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, 'r') as f:
+                history = json.load(f)
+        
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "filename": filename,
+            "source": source,
+            "size_mb": round(size_mb, 2),
+            "destination": destination,
+            "status": status
+        }
+        history.insert(0, entry)  # Newest first
+        history = history[:500]   # Keep last 500 entries
+        
+        with open(HISTORY_FILE, 'w') as f:
+            json.dump(history, f, indent=2)
     except Exception:
         pass  # Silent fail for logging
 
@@ -1014,7 +966,8 @@ def view_history(b=None):
         print(f"📜 History file: {HISTORY_FILE}")
         print(f"   (Open in Google Drive to view)")
         try:
-            history = _load_history()
+            with open(HISTORY_FILE, 'r') as f:
+                history = json.load(f)
             print(f"\n📊 Last 10 downloads (times in UTC):")
             for i, entry in enumerate(history[:10], 1):
                 ts = entry.get('timestamp', '')[:16].replace('T', ' ')
@@ -1023,10 +976,9 @@ def view_history(b=None):
                 size = entry.get('size_mb', 0)
                 print(f"   {i}. [{ts}] {fn} ({src}, {size:.1f}MB)")
         except Exception as e:
-            print(f"   ⚠️ Could not read history ({str(e)[:60]}) — clear it in ⚙️ Settings to start fresh")
+            print(f"   ⚠️ Could not read history: {e}")
     else:
         print("📜 No download history yet.")
-
 
 def check_secrets_status():
     """Check Colab secrets status and update display."""
@@ -1044,7 +996,7 @@ def check_cookie_status():
     if os.path.exists(COOKIE_PATH):
         cookie_status.value = "<span style='color:green'>✅ Loaded</span>"
     else:
-        cookie_status.value = "<span style='color:gray'>— None</span>"
+        cookie_status.value = "<span style='color:gray'>❌ None</span>"
 
 def upload_cookies(b=None):
     """Upload cookies.txt file for YouTube authentication (experimental)."""
@@ -1189,42 +1141,9 @@ def _do_clear_session():
 # --- QUEUE MANAGEMENT ---
 pending_queue: List[DownloadTask] = []  # Global queue state
 
-def _queue_dest_preview(task) -> Optional[str]:
-    """Resolved destination for a queue row — the full Drive-relative path the file
-    will take, library folder included (e.g. 'TV Shows/Detective Conan (1996)/
-    Season 01/Detective Conan - S01E1206.mkv'). Uses the same determine_destination_path
-    the download itself uses (dry_run), mirroring handle_file_processing's naming steps:
-    the queue size suffix is stripped and a subtitle's language tag is split off before
-    routing, then re-attached as a Plex ISO code. Returns None when no preview is
-    possible (no filename yet, or an archive whose contents are only known after
-    extraction) — the caller falls back to the plain row display."""
-    if not task.filename:
-        return None
-    clean = _strip_size_suffix(task.filename)
-    if os.path.splitext(clean)[1].lower() in ('.rar', '.zip', '.7z'):
-        return None
-    try:
-        processing_name, lang = _split_subtitle_lang(clean)
-        dest, _ = determine_destination_path(processing_name, task.source or "generic", dry_run=True)
-        if lang:  # same re-attachment as handle_file_processing
-            base, sub_ext = os.path.splitext(dest)
-            dest = f"{base}.{_normalize_sub_lang(lang)}{sub_ext}"
-        # Full Drive-relative path: with per-row routing the library folder is
-        # the part being controlled, so it belongs in the preview
-        return os.path.relpath(dest, DRIVE_BASE).replace(os.sep, '/')
-    except Exception:
-        return None  # a preview glitch must never break the queue display
-
-
-def update_queue_display(preserve_selection: bool = False):
-    """Update the queue list widget with current pending_queue. Each row carries a
-    live destination preview (where the file will go and its final name), recomputed
-    from the current settings, TMDB matches, and forced seasons. preserve_selection
-    keeps the current row selection across the refresh (used by the live settings
-    observers); the default reselects everything, as at queue creation."""
-    selected = set(_selected_queue_indices()) if preserve_selection else None
+def update_queue_display():
+    """Update the queue list widget with current pending_queue."""
     options = []
-
     for i, task in enumerate(pending_queue):
         source_icon = {"gofile": "📁", "pixeldrain": "💾", "rd": "⚡", "tb": "📦", "tb_host": "📦", "direct": "🔗", 
                        "youtube": "▶️", "mega": "☁️", "mediafire": "🔥", "1fichier": "📦",
@@ -1234,17 +1153,9 @@ def update_queue_display(preserve_selection: bool = False):
         sov = getattr(task, 'season_override', None)
         if sov is not None:
             name += f"  [S{sov:02d}]"  # forced season marker
-        eov = getattr(task, 'episode_override', None)
-        if eov is not None:
-            name += f"  [E{eov:02d}]"  # forced episode marker
         ov = getattr(task, 'tmdb_override', None)
         m = get_tmdb_match(task.filename) if task.filename else None
-        dest = _queue_dest_preview(task)
-        if dest is not None:
-            # ✎ = manual TMDB correction, ✖ = match cleared — the path shows the outcome
-            mark = " ✖" if ov == TMDB_CLEARED else (" ✎" if (m and ov) else "")
-            options.append(f"{i+1}. {source_icon} {name}{mark} → {dest}")
-        elif ov == TMDB_CLEARED:
+        if ov == TMDB_CLEARED:
             options.append(f"{i+1}. {source_icon} {name}  ✖ no TMDB")
         elif m:
             edited = " ✎" if ov else ""  # pencil marks a manual correction
@@ -1252,39 +1163,8 @@ def update_queue_display(preserve_selection: bool = False):
             options.append(f"{i+1}. {source_icon} {name}{tag}")
         else:
             options.append(f"{i+1}. {source_icon} {name}")
-
     queue_list.options = options
-    if selected is not None:
-        # Keep the user's selection across a live settings refresh (matched by row index)
-        queue_list.value = tuple(opt for i, opt in enumerate(options) if i in selected)
-    else:
-        queue_list.value = tuple(options)  # Select all by default
-
-def _on_dest_setting_change(change):
-    """Live-refresh the queue's destination previews when a setting that affects
-    routing changes (Auto-organise, Force Name/Year, Type, Category, Numbering,
-    TMDB on/off). When TMDB matching becomes newly applicable (just enabled, or
-    Force Name cleared) with an empty match cache, the batch match runs first —
-    Start would do the same, so the preview keeps showing what will actually happen."""
-    if change.get('name') != 'value' or not pending_queue:
-        return
-    try:
-        if tmdb_is_enabled() and not _tmdb_match_cache:
-            analyze_batch_metadata([t.filename for t in pending_queue if t.filename])
-            _apply_tmdb_overrides(pending_queue)
-        # Keep the queue's conditional rows in sync with the toggles they depend on
-        tmdb_group.layout.display = 'flex' if tmdb_is_enabled() else 'none'
-        _org = 'flex' if is_auto_organize_enabled() else 'none'
-        identity_row.layout.display = _org
-        route_row.layout.display = _org
-        season_override_row.layout.display = _org
-        update_queue_display(preserve_selection=True)
-    except Exception:
-        pass  # never let a preview refresh break a settings change
-
-for _w in (auto_organize_checkbox, episode_numbering_toggle, tmdb_enabled_checkbox):
-    _w.observe(_on_dest_setting_change, names='value')
-
+    queue_list.value = tuple(options)  # Select all by default
 
 def show_queue_preview(tasks: List[DownloadTask], mode: str):
     """Show queue UI with resolved tasks."""
@@ -1305,20 +1185,17 @@ def show_queue_preview(tasks: List[DownloadTask], mode: str):
         _apply_tmdb_overrides(pending_queue)  # reapply any prior manual corrections
         if tmdb_matched:
             print(f"   🎬 TMDB matched {tmdb_matched} of {len(filenames)} file(s)")
-    _apply_queue_overrides(pending_queue)  # independent of TMDB — works either way
+    _apply_season_overrides(pending_queue)  # independent of TMDB — works either way
 
     update_queue_display()
 
     # Hide subtitle and playlist options initially to prevent flash of old content
     queue_options.layout.display = 'none'
     playlist_options.layout.display = 'none'
-    # Identity / Route / Force Season rows: only meaningful when auto-organise will
-    # rename and route files; the TMDB group additionally needs TMDB matching active
-    tmdb_group.layout.display = 'flex' if tmdb_is_enabled() else 'none'
-    _org = 'flex' if is_auto_organize_enabled() else 'none'
-    identity_row.layout.display = _org
-    route_row.layout.display = _org
-    season_override_row.layout.display = _org
+    # Manual TMDB correction row: only meaningful when TMDB matching is active
+    tmdb_match_row.layout.display = 'flex' if tmdb_is_enabled() else 'none'
+    # Force Season row: only meaningful when auto-organise will rename/route files
+    season_override_row.layout.display = 'flex' if is_auto_organize_enabled() else 'none'
     queue_ui.layout.display = 'block'
     
     # Check for YouTube/streaming links
@@ -1392,14 +1269,9 @@ def hide_queue():
     queue_ui.layout.display = 'none'
     queue_list.options = []
     playlist_options.layout.display = 'none'
-    identity_row.layout.display = 'none'
-    route_row.layout.display = 'none'
+    tmdb_match_row.layout.display = 'none'
     tmdb_override_input.value = ''
-    queue_name_input.value = ''
-    queue_year_input.value = ''
-    route_dropdown.value = ''
     season_override_input.value = ''
-    renumber_start_input.value = ''
     btn_queue_start_subs.layout.display = 'none'
     btn.disabled = False
     btn_quick.disabled = False
@@ -1613,7 +1485,7 @@ def _strip_size_suffix(filename: str) -> str:
     """Remove trailing file-size annotations like ' (126.7 MB)' added for queue display.
     Cache keys use the stripped form so lookups work both at queue time (with suffix)
     and at download time (without)."""
-    return re.sub(r'\s*\([^)]*[KMG]i?B\s*\)\s*$', '', filename)
+    return re.sub(r'\s*\([^)]*[MG]i?B\s*\)\s*$', '', filename)
 
 def _split_subtitle_lang(filename: str) -> Tuple[str, str]:
     """Split a subtitle's trailing 2-3 letter language tag from its name:
@@ -1791,23 +1663,6 @@ def analyze_batch_episodes(filenames: List[str]) -> Dict[str, int]:
             if pos_idx == episode_position:
                 result[_strip_size_suffix(fname)] = num_val
                 break
-
-    # Explicit SxxEyy markers outrank the varying-number heuristic: when a file's
-    # strict marker VARIES across the batch it is that file's real season/episode,
-    # so leave the file out of the batch result and let per-file regex parsing read
-    # it (e.g. '... - 28 - S02E01v2' is S02E01, not E28 — the dash number is only
-    # the absolute count). A strict marker constant across 2+ files is a pack label
-    # ('Show.S01E01-E24.../03.mp4'), and for those the heuristic result stands.
-    strict_pairs = {}
-    for fname in filenames:
-        key = _strip_size_suffix(fname)
-        m = re.search(r'(?i)\bS(\d{1,2})EP?(\d{1,4})(?:v\d+)?\b', key)
-        if m:
-            strict_pairs[key] = (int(m.group(1)), int(m.group(2)))
-    if strict_pairs and (len(strict_pairs) == 1 or len(set(strict_pairs.values())) > 1):
-        for key in strict_pairs:
-            result.pop(key, None)
-
 
     _batch_episode_cache = result
     return result
@@ -2032,61 +1887,27 @@ def clear_tmdb_override(b=None):
     update_queue_display()
     print(f"✖ Cleared TMDB match for {len(indices)} item(s) — will use filename parsing")
 
-# --- MANUAL QUEUE OVERRIDES (season / episode / name / route) ---
-# Mirror the TMDB Fix-Match pattern: overrides live on the task (so they persist
-# with the session across Stop/Resume) and are mirrored into filename-keyed caches
-# that determine_destination_path can read from any thread. Force Season solves
-# multi-season batches whose filenames carry no season marker; Renumber solves
-# absolute-numbered batches whose real season split TMDB can't provide (select the
-# season's files, Force Season, then Renumber from 1).
+# --- MANUAL SEASON OVERRIDE ---
+# Mirrors the TMDB Fix-Match pattern: the override lives on the task (so it persists
+# with the session across Stop/Resume) and is mirrored into a filename-keyed cache that
+# determine_destination_path can read from any thread. Solves multi-season batches
+# whose filenames carry no season marker — without it every file parses as season 1
+# and season 2+ gets skipped as duplicates of season 1.
 _season_override_cache: Dict[str, int] = {}  # stripped filename -> forced season (per batch)
-_episode_override_cache: Dict[str, int] = {}  # stripped filename -> forced episode (per batch)
-_name_override_cache: Dict[str, Tuple[str, str]] = {}  # stripped filename -> (forced name, year)
-_route_override_cache: Dict[str, str] = {}  # stripped filename -> forced route category
 
 def get_season_override(filename: str) -> Optional[int]:
     """Manual season for a filename (None when not overridden)."""
     return _season_override_cache.get(_match_cache_key(filename))
 
-def get_episode_override(filename: str) -> Optional[int]:
-    """Manual episode for a filename (None when not overridden)."""
-    return _episode_override_cache.get(_match_cache_key(filename))
-
-def get_name_override(filename: str) -> Optional[Tuple[str, str]]:
-    """Manual (name, year) for a filename (None when not overridden)."""
-    return _name_override_cache.get(_match_cache_key(filename))
-
-def get_route_override(filename: str) -> Optional[str]:
-    """Manual route category for a filename (None when not overridden):
-    'tv' | 'anime_series' | 'movie' | 'anime_movie' | 'downloads'."""
-    return _route_override_cache.get(_match_cache_key(filename))
-
-def _apply_queue_overrides(tasks: List[DownloadTask]):
-    """Rebuild the season/episode/name/route override caches from the tasks'
-    persisted overrides. Called at every entry point (queue preview, start, quick,
-    resume); clearing first means overrides never leak across batches with
-    colliding filenames."""
+def _apply_season_overrides(tasks: List[DownloadTask]):
+    """Rebuild the season-override cache from the tasks' persisted season_override.
+    Called at every entry point (queue preview, start, quick, resume); clearing first
+    means overrides never leak across batches with colliding filenames."""
     _season_override_cache.clear()
-    _episode_override_cache.clear()
-    _name_override_cache.clear()
-    _route_override_cache.clear()
     for t in tasks:
-        if not t.filename:
-            continue
-        key = _match_cache_key(t.filename)
-        sov = getattr(t, 'season_override', None)
-        if sov is not None:
-            _season_override_cache[key] = int(sov)
-        eov = getattr(t, 'episode_override', None)
-        if eov is not None:
-            _episode_override_cache[key] = int(eov)
-        nov = getattr(t, 'name_override', None)
-        if nov:
-            _name_override_cache[key] = (nov, getattr(t, 'year_override', None) or '')
-        rov = getattr(t, 'route_override', None)
-        if rov:
-            _route_override_cache[key] = rov
-
+        ov = getattr(t, 'season_override', None)
+        if ov is not None and t.filename:
+            _season_override_cache[_match_cache_key(t.filename)] = int(ov)
 
 def apply_season_override(b=None):
     """Set Season: force a season number for the selected queue rows."""
@@ -2122,157 +1943,6 @@ def clear_season_override(b=None):
     update_queue_display()
     print(f"✖ Cleared forced season for {len(indices)} item(s) — will use filename/TMDB detection")
 
-def apply_renumber(b=None):
-    """Renumber: rewrite the selected rows' episode numbers sequentially, in queue
-    order, starting from the 🔢 field (default 1). Subtitles never consume numbers:
-    each inherits the number of the video its name extends — matched by stem, so the
-    pairing works no matter how the release spells the language tag (Eng, big5,
-    zh-Hant, …). Subtitles with no video in the selection number themselves."""
-    text = renumber_start_input.value.strip() or '1'
-    if not text.isdigit():
-        print("⚠️ Enter the episode number to start from (e.g. 1)")
-        return
-    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
-    if not indices:
-        print("⚠️ Select the queue item(s) to renumber first")
-        return
-    start = int(text)
-
-    def key_stem(task):
-        return os.path.splitext(_match_cache_key(task.filename))[0]
-
-    rows = [pending_queue[i] for i in sorted(indices) if pending_queue[i].filename]
-    skipped = len(indices) - len(rows)
-
-    # Pass 1: number the videos (every non-subtitle row) by stem, in queue order
-    assigned: Dict[str, int] = {}  # stem -> episode (deduped, so a re-run is stable)
-    subs, video_stems = [], []
-    for task in rows:
-        if os.path.splitext(_strip_size_suffix(task.filename))[1].lower() in KEEP_EXTENSIONS:
-            subs.append(task)
-            continue
-        stem = key_stem(task)
-        if stem not in assigned:
-            assigned[stem] = start + len(assigned)
-            video_stems.append(stem)
-        task.episode_override = assigned[stem]
-        _episode_override_cache[_match_cache_key(task.filename)] = assigned[stem]
-
-    # Pass 2: subtitles pair with the video whose stem equals theirs or is a
-    # dot-boundary prefix of it ('Show - 28.big5.ass' → 'Show - 28.mkv'), longest
-    # match winning; unmatched subtitles get their own numbers like any other row
-    for task in subs:
-        stem = key_stem(task)
-        match = max((v for v in video_stems if stem == v or stem.startswith(v + '.')),
-                    key=len, default=None)
-        pair = match if match is not None else stem
-        if pair not in assigned:
-            assigned[pair] = start + len(assigned)
-        task.episode_override = assigned[pair]
-        _episode_override_cache[_match_cache_key(task.filename)] = assigned[pair]
-
-    renumber_start_input.value = ""
-    update_queue_display()
-    if assigned:
-        last = start + len(assigned) - 1
-        note = f" ({skipped} without filenames skipped)" if skipped else ""
-        print(f"✅ Renumbered {len(rows)} item(s) → E{start:02d}–E{last:02d}{note}")
-    else:
-        print("⚠️ Selected item(s) have no filenames yet — resolve them first")
-
-
-def clear_renumber(b=None):
-    """Clear Renumber: drop the forced episode numbers for the selected rows."""
-    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
-    if not indices:
-        print("⚠️ Select the queue item(s) to clear first")
-        return
-    for i in indices:
-        task = pending_queue[i]
-        task.episode_override = None
-        if task.filename:
-            _episode_override_cache.pop(_match_cache_key(task.filename), None)
-    update_queue_display()
-    print(f"✖ Cleared forced episode numbers for {len(indices)} item(s) — will use filename/TMDB detection")
-
-def apply_name_override(b=None):
-    """Set Name: force a show/movie name (and optional year) for the selected rows —
-    the manual counterpart of a TMDB match, and it wins over one."""
-    name = sanitize_filename(queue_name_input.value.strip())
-    year = queue_year_input.value.strip()
-    if not name:
-        print("⚠️ Enter the name to force first")
-        return
-    if year and not re.fullmatch(r'(19|20)\d{2}', year):
-        print("⚠️ Year should look like 2025 (leave it empty to omit)")
-        return
-    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
-    if not indices:
-        print("⚠️ Select the queue item(s) to name first")
-        return
-    for i in indices:
-        task = pending_queue[i]
-        task.name_override = name
-        task.year_override = year or None
-        if task.filename:
-            _name_override_cache[_match_cache_key(task.filename)] = (name, year)
-    queue_name_input.value = ""
-    queue_year_input.value = ""
-    update_queue_display()
-    label = f"{name} ({year})" if year else name
-    print(f"✅ Name forced for {len(indices)} item(s) → {label}")
-
-def clear_name_override(b=None):
-    """Clear Name: drop the forced name/year for the selected rows."""
-    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
-    if not indices:
-        print("⚠️ Select the queue item(s) to clear first")
-        return
-    for i in indices:
-        task = pending_queue[i]
-        task.name_override = None
-        task.year_override = None
-        if task.filename:
-            _name_override_cache.pop(_match_cache_key(task.filename), None)
-    update_queue_display()
-    print(f"✖ Cleared forced name for {len(indices)} item(s) — will use TMDB/filename detection")
-
-def apply_route_override(b=None):
-    """Apply Route: send the selected rows to a specific library folder. Selecting
-    'Auto' clears the override (same as ✖ Clear Route)."""
-    route = route_dropdown.value
-    if not route:
-        clear_route_override()
-        return
-    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
-    if not indices:
-        print("⚠️ Select the queue item(s) to route first")
-        return
-    for i in indices:
-        task = pending_queue[i]
-        task.route_override = route
-        if task.filename:
-            _route_override_cache[_match_cache_key(task.filename)] = route
-    update_queue_display()
-    label = next(l for l, v in route_dropdown.options if v == route)
-    print(f"✅ Routed {len(indices)} item(s) → {label}")
-
-def clear_route_override(b=None):
-    """Clear Route: drop the forced route for the selected rows."""
-    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
-    if not indices:
-        print("⚠️ Select the queue item(s) to clear first")
-        return
-    for i in indices:
-        task = pending_queue[i]
-        task.route_override = None
-        if task.filename:
-            _route_override_cache.pop(_match_cache_key(task.filename), None)
-    update_queue_display()
-    print(f"✖ Cleared forced route for {len(indices)} item(s) — will detect the category again")
-
-
-
 def _map_absolute_episode(episode: int, seasons: Dict[str, int]) -> Tuple[int, int]:
     """Convert an absolute episode number to (season, episode) using per-season
     counts. Returns (1, episode) unchanged when mapping doesn't apply — including
@@ -2303,11 +1973,20 @@ def analyze_batch_metadata(filenames: List[str]) -> int:
     _tmdb_match_cache.clear()
     if not tmdb_is_enabled() or not filenames:
         return 0
+    if show_name_override.value.strip():
+        return 0  # Force Name wins — don't spend lookups that would be ignored
+
+    cat = category_override.value
     queries: Dict[Tuple[str, str, Optional[str]], List[str]] = {}
     for fname in filenames:
         key = _match_cache_key(fname)  # subtitle-lang stripped so subs key like their video
         info = detect_episode_info(key)
-        kind = 'tv' if info['episode_detected'] else 'movie'
+        if cat == 'Movie':
+            kind = 'movie'
+        elif cat == 'Series':
+            kind = 'tv'
+        else:
+            kind = 'tv' if info['episode_detected'] else 'movie'
         year_m = re.search(r'\b(19|20)\d{2}\b', key)
         year = year_m.group(0) if year_m else None
         if kind == 'tv':
@@ -2504,15 +2183,6 @@ def detect_episode_info(filename: str) -> Dict[str, Any]:
             elif m_type == 'trailing':
                 episode_num = int(match.group(1))
                 
-            # An explicit SxxEyy/NxN anywhere in the name outranks the value read
-            # from an earlier loose/absolute number ('Show - 28 - S02E01v2' is
-            # S02E01, not E28) — the earliest match still splits the show name.
-            if m_type not in ('strict', 'nxn'):
-                if sxe_strict:
-                    season_num, episode_num = int(sxe_strict.group(1)), int(sxe_strict.group(2))
-                elif sxe_nxn:
-                    season_num, episode_num = int(sxe_nxn.group(1)), int(sxe_nxn.group(2))
-
             # For trailing pattern, use base_name (without extension) for show name extraction
             name_source = base_name if m_type == 'trailing' else filename
             show_name = clean_show_name(name_source[:_name_cut(match.start())])
@@ -2544,17 +2214,6 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
         if not dry_run and not os.path.exists(downloads_dir):
             os.makedirs(downloads_dir, exist_ok=True)
         return os.path.join(downloads_dir, filename), "Downloads"
-
-    # 🎯 Route as 'Downloads (as-is)': keep the original name, skip organising —
-    # the per-file version of switching auto-organise off
-    route_ov = get_route_override(filename)
-    if route_ov == 'downloads':
-        downloads_dir = os.path.join(DRIVE_BASE, get_downloads_path())
-        if not dry_run and not os.path.exists(downloads_dir):
-            os.makedirs(downloads_dir, exist_ok=True)
-        return os.path.join(downloads_dir, filename), "Downloads"
-    # Anime routes pick the anime library folders in the branches below
-    is_anime = route_ov in ('anime_series', 'anime_movie')
     
     # Parse episode/show info from the filename (pure logic, unit-testable)
     info = detect_episode_info(filename)
@@ -2565,16 +2224,15 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
     is_tv = info['is_tv']
     episode_detected = info['episode_detected']
 
-    # Manual name/year (queue ✏️ Force Name) — the manual counterpart of a TMDB match
-    name_ov = get_name_override(filename)
-    manual_show_name = name_ov[0] if name_ov else ''
-    manual_year = name_ov[1] if name_ov else ''
+    manual_show_name = show_name_override.value.strip()
+    manual_year = year_input.value.strip()
 
-    # 🎯 Route override decides movie-vs-series regardless of filename detection
-    if route_ov in ('movie', 'anime_movie'):
+    # Apply category override if set
+    cat_override = category_override.value
+    if cat_override == 'Movie':
         is_tv = False
         episode_detected = False  # Treat as movie, ignore detected episode
-    elif route_ov in ('tv', 'anime_series'):
+    elif cat_override == 'Series':
         is_tv = True
         if not episode_detected:
             episode_num = 1  # Default to E01 if no episode detected
@@ -2584,19 +2242,6 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
     season_ov = get_season_override(filename)
     if season_ov is not None:
         season_num = season_ov
-
-    # Manual renumbering (queue 🔢 Renumber) wins over every episode source, and
-    # marks the file as an episode even when detection found none
-    episode_ov = get_episode_override(filename)
-    if episode_ov is not None:
-        episode_num = episode_ov
-        is_tv = True
-        if not episode_detected:
-            episode_detected = True
-            # Nothing was parsed from the name, so 'Unknown Show' would become the
-            # folder — use the cleaned filename stem instead (Force Name still wins)
-            if show_name == 'Unknown Show':
-                show_name = clean_show_name(os.path.splitext(filename)[0]) or show_name
 
     # TMDB metadata (populated by analyze_batch_metadata at queue/quick/resume time).
     # Force Name always wins; a match refines names/years, never user input.
@@ -2609,8 +2254,7 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
         # when the filename carried no explicit SxxExx/NxN season marker, no season is
         # manually forced, and Numbering is 'Season match' (not 'Absolute')
         if (episode_detected and not info['has_sxe'] and season_num == 1
-                and season_ov is None and episode_ov is None
-                and episode_numbering_toggle.value == 'Season match'):
+                and season_ov is None and episode_numbering_toggle.value == 'Season match'):
             season_num, episode_num = _map_absolute_episode(episode_num, tmdb_match.get('seasons') or {})
 
     # Apply Force Name override - affects both TV shows and movies
@@ -2625,7 +2269,7 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
             folder_name = f"{manual_show_name} ({manual_year})" if manual_year else manual_show_name
             _, ext = os.path.splitext(filename)
             new_filename = f"{manual_show_name}{ext}"
-            if is_anime:
+            if is_anime_mode_enabled():
                 full_dir = os.path.join(f"{DRIVE_BASE}{get_anime_movies_path()}", folder_name)
                 if not dry_run and not os.path.exists(full_dir): os.makedirs(full_dir, exist_ok=True)
                 return os.path.join(full_dir, new_filename), "Anime Movies"
@@ -2652,10 +2296,9 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
                 movie_name = clean_show_name(os.path.splitext(filename)[0])
                 folder_name = movie_name
         _, ext = os.path.splitext(filename)
-        # Year goes on the folder only — the file keeps just the movie name
-        new_filename = f"{movie_name}{ext}"
+        new_filename = f"{folder_name}{ext}"
         # Use anime folder if anime mode is enabled
-        if is_anime:
+        if is_anime_mode_enabled():
             full_dir = os.path.join(f"{DRIVE_BASE}{get_anime_movies_path()}", folder_name)
             if not dry_run and not os.path.exists(full_dir): os.makedirs(full_dir, exist_ok=True)
             return os.path.join(full_dir, new_filename), "Anime Movies"
@@ -2676,7 +2319,7 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
     show_folder = f"{show_name} ({folder_year})" if folder_year else show_name
     
     # Use anime folder if anime mode is enabled
-    if is_anime:
+    if is_anime_mode_enabled():
         base_path = f"{DRIVE_BASE}{get_anime_series_path()}"
         full_dir = os.path.join(base_path, show_folder, season_folder)
         if not dry_run and not os.path.exists(full_dir): os.makedirs(full_dir, exist_ok=True)
@@ -2695,12 +2338,8 @@ def setup_environment(needs_mega, needs_ytdlp, needs_aria):
     # Try to load secrets again (may not have been accessible on initial load)
     check_and_load_secrets()
     
-    # Restore saved settings now that Drive (and settings.json) is finally readable —
-    # the startup load ran before the mount and found nothing. Widgets the user already
-    # changed this session keep their values; then save once so choices made before the
-    # mount (unsaveable at the time — no Drive) are persisted too.
-    load_dir_settings()
-    save_dir_settings()
+    # Load saved directory settings from Drive (skip UI state to preserve user's current selection)
+    load_dir_settings(skip_ui_state=True)
     
     # Create media folders and config folder
     for p in [get_tv_path(), get_movie_path(), get_youtube_path()]:
@@ -5336,6 +4975,8 @@ def _run_download_pipeline(
         """Persist batch state; throttled by default so per-task completions
         don't hammer the (slow) Drive FUSE mount with JSON writes."""
         save_session(all_tasks,
+                     show_name=show_name_override.value.strip(),
+                     year=year_input.value.strip(),
                      playlist_range=playlist_selection.value.strip(),
                      yt_success=yt_success_cumulative,
                      yt_fail=yt_fail_cumulative,
@@ -5595,7 +5236,7 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str):
             if not _tmdb_match_cache:  # Quick Download path — no queue preview ran
                 analyze_batch_metadata([t.filename for t in selected_tasks if t.filename])
             _apply_tmdb_overrides(selected_tasks)  # honor any manual corrections
-        _apply_queue_overrides(selected_tasks)  # independent of TMDB — works either way
+        _apply_season_overrides(selected_tasks)  # independent of TMDB — works either way
 
         # Separate by type: everything without a sequential processor goes parallel
         parallel_tasks = [t for t in selected_tasks if t.link_type not in SEQUENTIAL_LINK_TYPES]
@@ -5699,6 +5340,7 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str):
                     print(f"   ... and {len(failed_files) - 5} more")
 
             save_session(all_tasks,
+                        show_name=show_name_override.value.strip(), year=year_input.value.strip(),
                         playlist_range=playlist_selection.value.strip(),
                         yt_success=yt_success_cumulative, yt_fail=yt_fail_cumulative)
             print(f"\n💾 Session saved. Click '🔁 Retry Failed' to try again, or 'Clear Session' in Settings to mark complete.")
@@ -5721,6 +5363,7 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str):
         _auto_retry_state['remaining'] = 0  # user stopped — don't auto-retry
         print(f"\n🛑 Stopped by user (kernel interrupt). Progress saved.")
         save_session(selected_tasks,
+                    show_name=show_name_override.value.strip(), year=year_input.value.strip(),
                     playlist_range=playlist_selection.value.strip(),
                     yt_success=yt_success_cumulative, yt_fail=yt_fail_cumulative)
         print(f"💾 Session saved. Click '🔁 Retry Failed' to continue.")
@@ -5777,6 +5420,16 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False, aut
             gofile_token = gofile_token or session_data.get('gofile_token', '')
             rd_key = rd_key or session_data.get('rd_token', '')
             tb_key = tb_key or session_data.get('tb_token', '')
+            # Restore show name override from session
+            saved_show_name = session_data.get('show_name_override', '')
+            if saved_show_name:
+                show_name_override.value = saved_show_name
+                print(f"   🎬 Restored show name: {saved_show_name}")
+            # Restore year from session
+            saved_year = session_data.get('year', '')
+            if saved_year:
+                year_input.value = saved_year
+                print(f"   📅 Restored year: {saved_year}")
             # Restore playlist range from session
             saved_playlist_range = session_data.get('playlist_range', '')
             if saved_playlist_range:
@@ -5787,6 +5440,15 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False, aut
             if saved_subtitle_langs:
                 subtitle_langs.value = tuple(saved_subtitle_langs)
                 print(f"   🔤 Restored subtitle languages: {', '.join(saved_subtitle_langs)}")
+            # Restore media type and category from session
+            saved_media_type = session_data.get('media_type', '')
+            if saved_media_type:
+                media_type_toggle.value = saved_media_type
+                print(f"   🎭 Restored media type: {saved_media_type}")
+            saved_category = session_data.get('category', '')
+            if saved_category:
+                category_override.value = saved_category
+                print(f"   📂 Restored category: {saved_category}")
             # Restore cumulative YouTube counters
             # Only restore success count - reset fail count so previous 403s don't persist
             yt_success_cumulative = session_data.get('yt_success', 0)
@@ -5803,7 +5465,7 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False, aut
             if tmdb_is_enabled():
                 analyze_batch_metadata([t.filename for t in pending_tasks if t.filename])
                 _apply_tmdb_overrides(pending_tasks)
-            _apply_queue_overrides(pending_tasks)  # forced seasons/episodes persist across resume
+            _apply_season_overrides(pending_tasks)  # forced seasons persist across resume
 
             # Install required tools first
             needs_pixeldrain_gofile_rd_tb = any(t.link_type in ['gofile', 'pixeldrain', 'rd', 'tb'] for t in pending_tasks)
@@ -5907,6 +5569,7 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False, aut
 
             # Save initial session
             save_session(all_tasks,
+                        show_name=show_name_override.value.strip(), year=year_input.value.strip(),
                         playlist_range=playlist_selection.value.strip())
 
             if quick_mode:
@@ -5966,6 +5629,7 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False, aut
         print(f"\n🛑 Stopped by user (kernel interrupt). Progress saved.")
         if all_tasks:
             save_session(all_tasks,
+                        show_name=show_name_override.value.strip(), year=year_input.value.strip(),
                         playlist_range=playlist_selection.value.strip(),
                         yt_success=yt_success_cumulative, yt_fail=yt_fail_cumulative)
         print(f"💾 Session saved. Click '🔁 Retry Failed' to continue.")
@@ -6027,12 +5691,6 @@ btn_tmdb_match.on_click(apply_tmdb_override)
 btn_tmdb_clear.on_click(clear_tmdb_override)
 btn_season_apply.on_click(apply_season_override)
 btn_season_clear.on_click(clear_season_override)
-btn_renumber.on_click(apply_renumber)
-btn_renumber_clear.on_click(clear_renumber)
-btn_name_apply.on_click(apply_name_override)
-btn_name_clear.on_click(clear_name_override)
-btn_route_apply.on_click(apply_route_override)
-btn_route_clear.on_click(clear_route_override)
 btn_queue_start.on_click(lambda b: start_from_queue(mode="video"))
 btn_queue_start_subs.on_click(lambda b: start_from_queue(mode="subs_only"))
 

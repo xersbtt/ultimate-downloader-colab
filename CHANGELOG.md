@@ -4,7 +4,27 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 
 ---
 
-## v6.4 (Latest)
+## v6.5 (Latest)
+**Theme: Live Destination Preview & Per-File Queue Control**
+
+### ✨ New Features
+- **Live destination preview in the queue**: every resolved row shows the full Drive-relative path the file will take — `filename → TV Shows/Detective Conan (1996)/Season 01/Detective Conan - S01E1206.mkv` — computed by the same routing logic the download itself uses (dry run), so the preview is exactly what will happen. It recomputes live as settings and overrides change, with row selection preserved; subtitles preview with their final Plex language code; archives and still-unresolved rows keep the plain display. If TMDB matching becomes newly applicable while a queue is open, the batch match runs first so the preview stays truthful
+- **Per-file queue overrides replace the global organise fields**: the old Name / Year / Movies-TV|Anime / Category fields above the link box are gone — corrections now happen per selection in the queue, where the preview shows their effect instantly:
+  - **✏️ Force Name / Year** (beside Fix Match): manually set the show/movie name and optional year — the manual counterpart of a TMDB match, and it wins over one for its rows (without suppressing matching for the rest of the batch, which the old global field did)
+  - **🎯 Route as**: send the selected rows to TV Series, Anime Series, Movie, Anime Movie, or Downloads (as-is) — one batch can now mix anime and live-action, series and movies; *Downloads (as-is)* skips organising for just those rows
+  - **🔢 Renumber** (beside Force Season): rewrite episode numbers sequentially from a chosen start (default 1), in queue order — built for absolute-numbered multi-season packs whose real split TMDB can't provide: select the season's files → Force Season → Renumber. Videos number first and each subtitle inherits its video's number by name-stem matching, so pairs stay together no matter how the release spells the language tag (`Eng`, `big5`, `zh-Hant`, …)
+  - All overrides persist with the session (survive Stop/Resume/Retry). Quick Download now runs pure auto-detection
+- **UI alignment & polish**: one right-aligned label column across the queue rows, controls, and settings panel (every colon on one vertical line); Debrid/Auto Retry pairs aligned in the main UI; settings key fields on a uniform 130px column with breathing room between sections; directory labels never truncate; utility buttons labelled (📜 History / ⚙️ Settings / ℹ️ About); Remove moved to the end of the control row away from Start Download; consistent warning colour for the Clear buttons; Up/Down buttons sized to fit their labels
+
+### 🐛 Bug Fixes
+- **Explicit `SxxEyy` markers lost to absolute numbering**: filenames carrying both an absolute number and a real season marker (`... - 28 - S02E01v2 ...`) organised as `S01E28` instead of `S02E01` — the batch varying-number heuristic has no SxxEyy extractor so the dash number won, and single-file parsing took its values from the earliest match in the name. Now a strict marker that varies across the batch outranks the heuristic (a marker constant across the batch is still treated as a pack label, e.g. `Show.S01E01-E24.../03.mp4`), and single-file parsing takes season/episode values from `SxxEyy`/`NxN` wherever they sit in the name while the earliest match still splits the show name. Also repairs single-file `NxN` parsing, where `Show - 01x05 - Title.mkv` previously read as E01 (verified over the detection corpora — the only behaviour changes are these fixes)
+- **Sticky settings never restored on a fresh runtime (and could be silently un-saved)**: the only full settings load ran when the cell first executed — before the Drive mount, when settings.json is unreachable — and the post-mount reload deliberately skipped all UI state, so saved toggles like Overlap Drive moves and Auto Retry never took effect on a new Colab VM. Worse, loading secrets/folder paths after the mount fired the save-on-change observers, overwriting the stored values with the session's defaults. The post-mount reload now restores every setting the user hasn't changed this session (an in-session choice always outranks the file), programmatic widget writes no longer trigger saves or count as user edits, and one save after the reload persists choices made before the mount, when saving was impossible
+- **Download history corrupted by parallel workers**: `log_download` ran unlocked from concurrent download threads with plain writes, which could leave trailing garbage after the JSON array — the `Extra data` errors that broke 📜 History. Writes are now serialised and atomic (temp file + replace), and the reader recovers already-corrupt files by taking the valid document and ignoring the tail, so an existing broken history displays fine and heals itself on the next logged download
+- **Movies no longer carry the year in the filename**: TMDB-matched and year-parsed movies saved as `Movie (Year)/Movie (Year).mkv`; the year belongs to the folder only, so the file is now `Movie (Year)/Movie.mkv` — consistent with how a forced name always behaved
+
+---
+
+## v6.4
 **Theme: Season Control & Sticky Settings**
 
 ### ✨ New Features
