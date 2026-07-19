@@ -4,7 +4,22 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 
 ---
 
-## v6.5 (Latest)
+## v6.6 (Latest)
+**Theme: Multi-Episode Files & Smarter Matching**
+
+### ✨ New Features
+- **Multi-episode files keep their span (Plex convention)**: a single file covering several episodes — `S01E01-E03`, `S01E01-03`, `S01E01E02`, `S01E01-S01E03`, `1x01-02` — now organises as `Show - S01E01-E03.mkv` instead of collapsing to the first episode. This also fixes two real failure modes: a range file no longer collides with (and gets skipped as a duplicate of) a genuine `E01` file, and glued double-episode names (`S01E01E02`) — which previously matched no episode pattern at all — no longer misroute to Movies. Guarded against false positives: episode titles starting with a number (`S01E05 - 12 Angry Men`), resolution/year tails (`-1080p`, `-2019`), backwards or cross-season ranges, and `EP01-70` pack labels all still parse as before
+- **🔢 Renumber accepts a range for multi-episode files**: enter `7-9` and the first selected file becomes a span (`S01E07-E09`) — its paired subtitle inherits the full span — while the remaining files continue as single episodes from the end of the range (`E10`, `E11`, …). A plain number still renumbers everything singly (and collapses a detected span, since a manual number replaces the episode identity outright); spans show as `[E07-E09]` in the queue and persist with the session
+- **📎 Part suffix control in the queue**: new input + **Set Part** / **✖ No Part** buttons beside Renumber. *Set Part* appends `-ptN` sequentially across the selection in queue order (input `1` with three files → `-pt1`, `-pt2`, `-pt3`; a video and its subtitle share one number, same pairing as Renumber); *No Part* strips any part suffix, detected or forced — both win over `Part X` / `上篇` filename detection. And renumbering alone now suppresses the auto-detected English `Part X` suffix: renumbering `... Part 1` / `... Part 2` files to E08/E09 yields clean `S01E08`/`S01E09`, no leftover `-pt1`/`-pt2` (CJK 上篇/下篇 markers keep theirs — those genuinely split one episode across two files). Persists with the session like every queue override
+- **TMDB matching retries harder before giving up**: a year embedded in the parsed show name (`True.Detective.2019.S03E01` → query "True Detective 2019") used to return zero TMDB results and fail the whole match. Search now degrades through four tiers — original query with and without the year filter, then the trailing year stripped from the query text with and without the filter — so the first tier that matches wins and exact titles keep priority. The persistent query cache is versioned: cached misses from the old matcher are retried once under the new logic, while cached matches are kept
+
+### 🐛 Bug Fixes
+- **TorBox JDownloader links stalled unless TorBox was the selected debrid service**: `torbox.app/download` share links resolved into the queue regardless of the toggle (by design), but the download pipeline gated their tasks on the toggle-derived key — with Real-Debrid or None selected the tasks were silently skipped and sat pending forever. The pipeline now falls back to the TB Token field, and a missing token prints an explicit error instead of stalling silently. Same fix applied to Resume/Retry URL re-resolution, which only refreshed `rd`/`tb` task links when that service was toggled: RD links always route through Real-Debrid and TorBox links through TorBox — resolve, download, and resume — so mixed RD + TB batches work with any toggle setting
+- **Marker-first filenames organised as "Unknown Show"**: names with the episode marker up front (`1x02 - Chernobyl [x265].mkv`, `S01E02 - Chernobyl.mkv`) have nothing before the marker, and show-name extraction only ever looked there — the after-the-marker fallback was restricted to loose matches and its emptiness check could never trigger (an empty prefix returns the "Unknown Show" sentinel, which isn't short). The fallback now covers every pattern type and the batch-detection path, reads the name from after the marker, and strips the extension so a bare `01.mkv` stays Unknown Show rather than becoming a show called "mkv". With a real name extracted, TMDB matching gets a usable query for these files too
+
+---
+
+## v6.5
 **Theme: Live Destination Preview & Per-File Queue Control**
 
 ### ✨ New Features

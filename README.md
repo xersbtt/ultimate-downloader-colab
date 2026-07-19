@@ -170,6 +170,7 @@ Select rows in the Queue Preview, then apply any of these. Each shows its effect
 | v6.3 | TorBox share-link support, parallel cached-torrent downloads, auto retry, EP-range pack fix |
 | v6.4 | Season match/Absolute numbering toggle, Force Season queue override, sticky Auto Retry & Overlap-moves settings |
 | v6.5 | Live destination previews, per-file queue overrides (Route / Force Name / Renumber), SxxEyy detection priority, sticky-settings & history fixes |
+| v6.6 | Multi-episode file spans (S01E01-E03) with range renumbering, part-suffix queue control, smarter TMDB matching, marker-first name detection, TorBox link routing fix |
 
 ## 🎬 Episode Detection Patterns
 
@@ -178,6 +179,7 @@ The downloader recognises these naming patterns:
 | Pattern | Example | Result |
 |---------|---------|--------|
 | Standard | `Show.Name.S01E05.mkv` | Season 01, Episode 05 |
+| Multi-episode | `Show.S01E01-E03.mkv` | Episodes 01–03 in one file (kept as `S01E01-E03`) |
 | Asian Drama | `Drama EP01.mkv` | Season 01, Episode 01 |
 | Chinese | `电视剧 第5集.mkv` | Season 01, Episode 05 |
 | Japanese | `アニメ 第10話.mkv` | Season 01, Episode 10 |
@@ -388,7 +390,7 @@ Ultimate Downloader/
 ├── LICENSE                         # MIT Licence
 ├── banner_2x1.png                  # GitHub banner image
 ├── .gitignore                      # Git ignore rules
-└── archive/                        # Previous versions (v5.5 and earlier)
+└── archive/                        # Previous version snapshots
 ```
 
 ---

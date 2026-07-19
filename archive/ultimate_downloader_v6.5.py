@@ -102,7 +102,6 @@ TORBOX_API_BASE = "https://api.torbox.app/v1/api"  # TorBox API base URL
 TMDB_API_BASE = "https://api.themoviedb.org/3"  # TMDB v3 API (metadata matching)
 TMDB_MATCH_THRESHOLD = 0.60  # Minimum title similarity to accept a search result
 TMDB_QUERY_CACHE_MAX = 500   # Persistent query cache cap (oldest dropped first)
-TMDB_CACHE_VERSION = 2       # Bump when matching gets smarter so cached misses are retried
 TMDB_CLEARED = {'cleared': True}  # DownloadTask.tmdb_override value meaning "force regex, no TMDB"
 
 # Known resolution values (for filename parsing)
@@ -136,11 +135,9 @@ class DownloadTask:
     tmdb_override: Optional[dict] = None  # Manual TMDB correction (persisted); {'cleared': True} forces regex
     season_override: Optional[int] = None  # Manual season number (persisted); None = detect from filename/TMDB
     episode_override: Optional[int] = None  # Manual episode number (persisted); set by queue 🔢 Renumber
-    episode_end_override: Optional[int] = None  # Manual range end (persisted); with episode_override N, names the file ENN-Eend
     name_override: Optional[str] = None  # Manual name for organise (persisted); set by queue ✏️ Force Name
     year_override: Optional[str] = None  # Manual year accompanying name_override (persisted)
     route_override: Optional[str] = None  # Manual destination category (persisted); set by queue 🎯 Route as
-    part_override: Optional[int] = None  # Manual part suffix (persisted); N = force -ptN, 0 = force none
 
 _TASK_FIELDS = {f.name for f in fields(DownloadTask)}
 
@@ -574,7 +571,7 @@ about_ui = widgets.VBox([
     widgets.HTML("""
         <div style='padding: 10px;'>
             <h3>ℹ️ About Ultimate Downloader</h3>
-            <p><strong>Version:</strong> 6.6</p>
+            <p><strong>Version:</strong> 6.5</p>
             <p><strong>Author:</strong> xersbtt</p>
             <p><strong>Repository:</strong> <a href='https://github.com/xersbtt/ultimate-downloader-colab' target='_blank'>github.com/xersbtt/ultimate-downloader-colab</a></p>
             <hr>
@@ -849,22 +846,15 @@ route_row = widgets.HBox([
 season_override_input = widgets.Text(placeholder='e.g. 2', tooltip='Season number to force (0 = Specials)', layout=widgets.Layout(width='80px'))
 btn_season_apply = widgets.Button(description='Set Season', button_style='info', tooltip='Force this season for the selected queue item(s) — overrides filename parsing and TMDB mapping', layout=widgets.Layout(width='110px'))
 btn_season_clear = widgets.Button(description='✖ Clear Season', button_style='', tooltip='Remove the forced season — use filename/TMDB detection again', layout=widgets.Layout(width='130px'))
-renumber_start_input = widgets.Text(placeholder='1', tooltip='Episode number to start renumbering from (default 1). A range like 7-9 names the first file S01E07-E09 (multi-episode file); later files continue from E10', layout=widgets.Layout(width='60px'))
+renumber_start_input = widgets.Text(placeholder='1', tooltip='Episode number to start renumbering from (default 1)', layout=widgets.Layout(width='60px'))
 btn_renumber = widgets.Button(description='Renumber', button_style='info', tooltip='Renumber the selected queue item(s) sequentially from this episode, in queue order — a video and its subtitle share one number', layout=widgets.Layout(width='100px'))
 btn_renumber_clear = widgets.Button(description='✖ Clear', button_style='', tooltip='Remove the forced episode numbers — use filename/TMDB detection again', layout=widgets.Layout(width='90px'))
-# Manual part suffix (multi-file episodes): append -ptN sequentially to the selected
-# rows, or strip a detected/forced suffix entirely — wins over Part X / 上篇 detection
-part_override_input = widgets.Text(placeholder='1', tooltip='Part number to start from (default 1)', layout=widgets.Layout(width='55px'))
-btn_part_apply = widgets.Button(description='Set Part', button_style='info', tooltip='Append -ptN sequentially to the selected item(s) in queue order (e.g. 1 → -pt1, -pt2, …) — a video and its subtitle share one number', layout=widgets.Layout(width='90px'))
-btn_part_remove = widgets.Button(description='✖ No Part', button_style='', tooltip='Strip any -ptN suffix from the selected item(s), detected or forced', layout=widgets.Layout(width='95px'))
 season_override_row = widgets.HBox([
     widgets.HTML("<div style='text-align:right; padding-right:8px'><small><b>🗂️ Force Season:</b></small></div>", layout=widgets.Layout(width='115px')),
     season_override_input, btn_season_apply, btn_season_clear,
     widgets.HTML("<small><b>&nbsp;&nbsp;🔢 Renumber from:</b></small>"),
-    renumber_start_input, btn_renumber, btn_renumber_clear,
-    widgets.HTML("<small><b>&nbsp;&nbsp;📎 Part:</b></small>"),
-    part_override_input, btn_part_apply, btn_part_remove
-], layout=widgets.Layout(flex_flow='row wrap'))
+    renumber_start_input, btn_renumber, btn_renumber_clear
+])
 
 # Playlist range selector (shown only for YouTube playlists)
 playlist_options = widgets.HBox([
@@ -884,7 +874,7 @@ queue_ui = widgets.VBox([
 
 
 input_ui = widgets.VBox([
-    widgets.HTML("<h3>🚀 Ultimate Downloader v6.6</h3>"),
+    widgets.HTML("<h3>🚀 Ultimate Downloader v6.5</h3>"),
     widgets.HBox([auto_organize_checkbox, debrid_service_toggle]),
     widgets.HBox([concurrent_slider, auto_retry_input]),
     text_area,
@@ -942,7 +932,7 @@ def save_session(
         return
     try:
         session = {
-            "version": "6.6",
+            "version": "6.5",
             "started_at": datetime.now().isoformat(),
             "playlist_range": playlist_range,
             "yt_success": yt_success,
@@ -1246,12 +1236,7 @@ def update_queue_display(preserve_selection: bool = False):
             name += f"  [S{sov:02d}]"  # forced season marker
         eov = getattr(task, 'episode_override', None)
         if eov is not None:
-            eev = getattr(task, 'episode_end_override', None)
-            # forced episode marker; a range renumber shows its span (E07-E09)
-            name += f"  [E{eov:02d}-E{eev:02d}]" if eev else f"  [E{eov:02d}]"
-        pov = getattr(task, 'part_override', None)
-        if pov is not None:
-            name += f"  [pt{pov}]" if pov else "  [no pt]"  # forced part suffix marker
+            name += f"  [E{eov:02d}]"  # forced episode marker
         ov = getattr(task, 'tmdb_override', None)
         m = get_tmdb_match(task.filename) if task.filename else None
         dest = _queue_dest_preview(task)
@@ -1415,7 +1400,6 @@ def hide_queue():
     route_dropdown.value = ''
     season_override_input.value = ''
     renumber_start_input.value = ''
-    part_override_input.value = ''
     btn_queue_start_subs.layout.display = 'none'
     btn.disabled = False
     btn_quick.disabled = False
@@ -1817,7 +1801,7 @@ def analyze_batch_episodes(filenames: List[str]) -> Dict[str, int]:
     strict_pairs = {}
     for fname in filenames:
         key = _strip_size_suffix(fname)
-        m = re.search(r'(?i)\bS(\d{1,2})EP?(\d{1,4})(?:v\d+)?(?:\b|(?=EP?\d))', key)
+        m = re.search(r'(?i)\bS(\d{1,2})EP?(\d{1,4})(?:v\d+)?\b', key)
         if m:
             strict_pairs[key] = (int(m.group(1)), int(m.group(2)))
     if strict_pairs and (len(strict_pairs) == 1 or len(set(strict_pairs.values())) > 1):
@@ -1869,12 +1853,6 @@ def _load_tmdb_query_cache():
                 _tmdb_query_cache = json.load(f)
     except Exception:
         _tmdb_query_cache = {}  # Corrupt/unreadable cache — start fresh
-    if _tmdb_query_cache.get('__version__') != TMDB_CACHE_VERSION:
-        # Search got smarter since this cache was written — cached misses (None)
-        # may match now, so drop them; successful matches stay valid.
-        _tmdb_query_cache = {k: v for k, v in _tmdb_query_cache.items()
-                             if v is not None and k != '__version__'}
-        _tmdb_query_cache['__version__'] = TMDB_CACHE_VERSION
 
 def _save_tmdb_query_cache():
     try:
@@ -1914,43 +1892,31 @@ def _tmdb_search(kind: str, query: str, year: Optional[str]) -> Optional[dict]:
     if cache_key in _tmdb_query_cache:
         return _tmdb_query_cache[cache_key]
 
-    # Attempt tiers, most specific first. Filename years are often wrong (encode
-    # year, not release year), and a year left inside the query text ("True
-    # Detective 2019") makes TMDB's text search return nothing — so degrade
-    # gracefully: drop the year filter, then retry with the year stripped from
-    # the query itself. First match wins, so exact titles still take priority.
-    attempts = [(query, year)]
+    params = {'query': query, 'include_adult': 'false'}
     if year:
-        attempts.append((query, None))
-    stripped = re.sub(r"[\s.]*\(?(19|20)\d{2}\)?\s*$", '', query).strip()
-    if stripped and stripped.casefold() != query.casefold():
-        attempts.append((stripped, year))
-        if year:
-            attempts.append((stripped, None))
+        params['first_air_date_year' if kind == 'tv' else 'year'] = year
+    data = _tmdb_get(f"/search/{kind}", params)
+    results = (data or {}).get('results') or []
+    if not results and year:
+        # Filename years are often wrong (encode year, not release year) — retry without
+        data = _tmdb_get(f"/search/{kind}", {'query': query, 'include_adult': 'false'})
+        results = (data or {}).get('results') or []
 
     match = None
-    for q, y in attempts:
-        params = {'query': q, 'include_adult': 'false'}
-        if y:
-            params['first_air_date_year' if kind == 'tv' else 'year'] = y
-        data = _tmdb_get(f"/search/{kind}", params)
-        results = (data or {}).get('results') or []
-        for r in results[:5]:
-            name = r.get('name') or r.get('title') or ''
-            orig = r.get('original_name') or r.get('original_title') or ''
-            score = max(_tmdb_similarity(q, name), _tmdb_similarity(q, orig))
-            if score >= TMDB_MATCH_THRESHOLD:
-                match = r
-                break
-        if match is None and results:
-            # Romaji queries score poorly against localized/original names but live in
-            # alternative titles — check them for the top result only
-            top = results[0]
-            if any(_tmdb_similarity(q, alt) >= TMDB_MATCH_THRESHOLD
-                   for alt in _tmdb_alt_titles(kind, top['id'])):
-                match = top
-        if match is not None:
+    for r in results[:5]:
+        name = r.get('name') or r.get('title') or ''
+        orig = r.get('original_name') or r.get('original_title') or ''
+        score = max(_tmdb_similarity(query, name), _tmdb_similarity(query, orig))
+        if score >= TMDB_MATCH_THRESHOLD:
+            match = r
             break
+    if match is None and results:
+        # Romaji queries score poorly against localized/original names but live in
+        # alternative titles — check them for the top result only
+        top = results[0]
+        if any(_tmdb_similarity(query, alt) >= TMDB_MATCH_THRESHOLD
+               for alt in _tmdb_alt_titles(kind, top['id'])):
+            match = top
 
     normalized = _tmdb_normalize(kind, match) if match is not None else None
     _tmdb_query_cache[cache_key] = normalized
@@ -2075,10 +2041,8 @@ def clear_tmdb_override(b=None):
 # season's files, Force Season, then Renumber from 1).
 _season_override_cache: Dict[str, int] = {}  # stripped filename -> forced season (per batch)
 _episode_override_cache: Dict[str, int] = {}  # stripped filename -> forced episode (per batch)
-_episode_end_override_cache: Dict[str, int] = {}  # stripped filename -> forced range end (per batch)
 _name_override_cache: Dict[str, Tuple[str, str]] = {}  # stripped filename -> (forced name, year)
 _route_override_cache: Dict[str, str] = {}  # stripped filename -> forced route category
-_part_override_cache: Dict[str, int] = {}  # stripped filename -> forced part (N = -ptN, 0 = none)
 
 def get_season_override(filename: str) -> Optional[int]:
     """Manual season for a filename (None when not overridden)."""
@@ -2087,10 +2051,6 @@ def get_season_override(filename: str) -> Optional[int]:
 def get_episode_override(filename: str) -> Optional[int]:
     """Manual episode for a filename (None when not overridden)."""
     return _episode_override_cache.get(_match_cache_key(filename))
-
-def get_episode_end_override(filename: str) -> Optional[int]:
-    """Manual multi-episode range end for a filename (None = single episode)."""
-    return _episode_end_override_cache.get(_match_cache_key(filename))
 
 def get_name_override(filename: str) -> Optional[Tuple[str, str]]:
     """Manual (name, year) for a filename (None when not overridden)."""
@@ -2101,11 +2061,6 @@ def get_route_override(filename: str) -> Optional[str]:
     'tv' | 'anime_series' | 'movie' | 'anime_movie' | 'downloads'."""
     return _route_override_cache.get(_match_cache_key(filename))
 
-def get_part_override(filename: str) -> Optional[int]:
-    """Manual part suffix for a filename: None = auto-detect, 0 = force no
-    suffix, N >= 1 = force -ptN."""
-    return _part_override_cache.get(_match_cache_key(filename))
-
 def _apply_queue_overrides(tasks: List[DownloadTask]):
     """Rebuild the season/episode/name/route override caches from the tasks'
     persisted overrides. Called at every entry point (queue preview, start, quick,
@@ -2113,10 +2068,8 @@ def _apply_queue_overrides(tasks: List[DownloadTask]):
     colliding filenames."""
     _season_override_cache.clear()
     _episode_override_cache.clear()
-    _episode_end_override_cache.clear()
     _name_override_cache.clear()
     _route_override_cache.clear()
-    _part_override_cache.clear()
     for t in tasks:
         if not t.filename:
             continue
@@ -2127,18 +2080,12 @@ def _apply_queue_overrides(tasks: List[DownloadTask]):
         eov = getattr(t, 'episode_override', None)
         if eov is not None:
             _episode_override_cache[key] = int(eov)
-        eev = getattr(t, 'episode_end_override', None)
-        if eev is not None:
-            _episode_end_override_cache[key] = int(eev)
         nov = getattr(t, 'name_override', None)
         if nov:
             _name_override_cache[key] = (nov, getattr(t, 'year_override', None) or '')
         rov = getattr(t, 'route_override', None)
         if rov:
             _route_override_cache[key] = rov
-        pov = getattr(t, 'part_override', None)
-        if pov is not None:
-            _part_override_cache[key] = int(pov)
 
 
 def apply_season_override(b=None):
@@ -2175,18 +2122,30 @@ def clear_season_override(b=None):
     update_queue_display()
     print(f"✖ Cleared forced season for {len(indices)} item(s) — will use filename/TMDB detection")
 
-def _number_rows_sequentially(rows: List[DownloadTask], start: int) -> Dict[str, int]:
-    """Assign sequential numbers to the rows in queue order, returned as
-    {task.id: number}. Subtitles never consume numbers: each inherits the number
-    of the video its name extends — matched by stem, so the pairing works no
-    matter how the release spells the language tag (Eng, big5, zh-Hant, …).
-    Subtitles with no video in the selection number themselves."""
+def apply_renumber(b=None):
+    """Renumber: rewrite the selected rows' episode numbers sequentially, in queue
+    order, starting from the 🔢 field (default 1). Subtitles never consume numbers:
+    each inherits the number of the video its name extends — matched by stem, so the
+    pairing works no matter how the release spells the language tag (Eng, big5,
+    zh-Hant, …). Subtitles with no video in the selection number themselves."""
+    text = renumber_start_input.value.strip() or '1'
+    if not text.isdigit():
+        print("⚠️ Enter the episode number to start from (e.g. 1)")
+        return
+    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
+    if not indices:
+        print("⚠️ Select the queue item(s) to renumber first")
+        return
+    start = int(text)
+
     def key_stem(task):
         return os.path.splitext(_match_cache_key(task.filename))[0]
 
+    rows = [pending_queue[i] for i in sorted(indices) if pending_queue[i].filename]
+    skipped = len(indices) - len(rows)
+
     # Pass 1: number the videos (every non-subtitle row) by stem, in queue order
-    assigned: Dict[str, int] = {}  # stem -> number (deduped, so a re-run is stable)
-    numbers: Dict[str, int] = {}
+    assigned: Dict[str, int] = {}  # stem -> episode (deduped, so a re-run is stable)
     subs, video_stems = [], []
     for task in rows:
         if os.path.splitext(_strip_size_suffix(task.filename))[1].lower() in KEEP_EXTENSIONS:
@@ -2196,7 +2155,8 @@ def _number_rows_sequentially(rows: List[DownloadTask], start: int) -> Dict[str,
         if stem not in assigned:
             assigned[stem] = start + len(assigned)
             video_stems.append(stem)
-        numbers[task.id] = assigned[stem]
+        task.episode_override = assigned[stem]
+        _episode_override_cache[_match_cache_key(task.filename)] = assigned[stem]
 
     # Pass 2: subtitles pair with the video whose stem equals theirs or is a
     # dot-boundary prefix of it ('Show - 28.big5.ass' → 'Show - 28.mkv'), longest
@@ -2208,58 +2168,15 @@ def _number_rows_sequentially(rows: List[DownloadTask], start: int) -> Dict[str,
         pair = match if match is not None else stem
         if pair not in assigned:
             assigned[pair] = start + len(assigned)
-        numbers[task.id] = assigned[pair]
-    return numbers
-
-def apply_renumber(b=None):
-    """Renumber: rewrite the selected rows' episode numbers sequentially, in queue
-    order, starting from the 🔢 field (default 1). A video and its subtitle share
-    one number (see _number_rows_sequentially). A range like 7-9 makes the FIRST
-    file a multi-episode span (S01E07-E09); the rest continue as single episodes
-    from the end of the range (E10, E11, …)."""
-    text = renumber_start_input.value.strip() or '1'
-    range_m = re.fullmatch(r'(\d{1,4})(?:\s*[-~–—]\s*(\d{1,4}))?', text)
-    if not range_m:
-        print("⚠️ Enter the episode number to start from (e.g. 7), or a range for a multi-episode file (e.g. 7-9)")
-        return
-    start = int(range_m.group(1))
-    span_end = int(range_m.group(2)) if range_m.group(2) else None
-    if span_end is not None and span_end <= start:
-        print("⚠️ The range end must be greater than the start (e.g. 7-9)")
-        return
-    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
-    if not indices:
-        print("⚠️ Select the queue item(s) to renumber first")
-        return
-    rows = [pending_queue[i] for i in sorted(indices) if pending_queue[i].filename]
-    skipped = len(indices) - len(rows)
-    numbers = _number_rows_sequentially(rows, start)
-    # Range mode: the first file (number == start) absorbs the whole span; later
-    # files shift past it so numbering continues from the end of the range
-    offset = (span_end - start) if span_end else 0
-    for task in rows:
-        key = _match_cache_key(task.filename)
-        if span_end and numbers[task.id] == start:
-            task.episode_override, task.episode_end_override = start, span_end
-            _episode_override_cache[key], _episode_end_override_cache[key] = start, span_end
-        else:
-            task.episode_override = numbers[task.id] + offset
-            task.episode_end_override = None
-            _episode_override_cache[key] = task.episode_override
-            _episode_end_override_cache.pop(key, None)
+        task.episode_override = assigned[pair]
+        _episode_override_cache[_match_cache_key(task.filename)] = assigned[pair]
 
     renumber_start_input.value = ""
     update_queue_display()
-    if numbers:
-        last = max(numbers.values()) + offset
+    if assigned:
+        last = start + len(assigned) - 1
         note = f" ({skipped} without filenames skipped)" if skipped else ""
-        first = f"E{start:02d}-E{span_end:02d}" if span_end else f"E{start:02d}"
-        tail = ""
-        if span_end and last > span_end:
-            tail = f", then E{span_end + 1:02d}" + (f"–E{last:02d}" if last > span_end + 1 else "")
-        elif not span_end and last > start:
-            tail = f"–E{last:02d}"
-        print(f"✅ Renumbered {len(rows)} item(s) → {first}{tail}{note}")
+        print(f"✅ Renumbered {len(rows)} item(s) → E{start:02d}–E{last:02d}{note}")
     else:
         print("⚠️ Selected item(s) have no filenames yet — resolve them first")
 
@@ -2273,57 +2190,10 @@ def clear_renumber(b=None):
     for i in indices:
         task = pending_queue[i]
         task.episode_override = None
-        task.episode_end_override = None
         if task.filename:
             _episode_override_cache.pop(_match_cache_key(task.filename), None)
-            _episode_end_override_cache.pop(_match_cache_key(task.filename), None)
     update_queue_display()
     print(f"✖ Cleared forced episode numbers for {len(indices)} item(s) — will use filename/TMDB detection")
-
-def apply_part_override(b=None):
-    """Set Part: append -ptN suffixes to the selected rows sequentially, in queue
-    order, starting from the 📎 field (default 1) — e.g. 1 with three files
-    selected → -pt1, -pt2, -pt3. A video and its subtitle share one part number.
-    Wins over Part X / 上篇 filename detection."""
-    text = part_override_input.value.strip() or '1'
-    if not text.isdigit() or int(text) < 1:
-        print("⚠️ Enter the part number to start from (e.g. 1 → -pt1)")
-        return
-    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
-    if not indices:
-        print("⚠️ Select the queue item(s) to set the part for first")
-        return
-    start = int(text)
-    rows = [pending_queue[i] for i in sorted(indices) if pending_queue[i].filename]
-    skipped = len(indices) - len(rows)
-    numbers = _number_rows_sequentially(rows, start)
-    for task in rows:
-        task.part_override = numbers[task.id]
-        _part_override_cache[_match_cache_key(task.filename)] = numbers[task.id]
-
-    part_override_input.value = ""
-    update_queue_display()
-    if numbers:
-        last = max(numbers.values())
-        note = f" ({skipped} without filenames skipped)" if skipped else ""
-        label = f"-pt{start}" if last == start else f"-pt{start}…-pt{last}"
-        print(f"✅ Part suffix {label} set for {len(rows)} item(s){note}")
-    else:
-        print("⚠️ Selected item(s) have no filenames yet — resolve them first")
-
-def remove_part_override(b=None):
-    """No Part: strip any part suffix (detected or forced) from the selected rows."""
-    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
-    if not indices:
-        print("⚠️ Select the queue item(s) to strip the part suffix from first")
-        return
-    for i in indices:
-        task = pending_queue[i]
-        task.part_override = 0
-        if task.filename:
-            _part_override_cache[_match_cache_key(task.filename)] = 0
-    update_queue_display()
-    print(f"✖ Part suffix removed for {len(indices)} item(s)")
 
 def apply_name_override(b=None):
     """Set Name: force a show/movie name (and optional year) for the selected rows —
@@ -2474,36 +2344,13 @@ def check_duplicate_in_drive(filename: str, source: str = "generic", playlist_in
         return True
     return False
 
-# Multi-episode continuation glued directly to a strict/NxN match: '-E03',
-# '-S01E03', 'E02' (S01E01E02), '-03', '-1x03'. Anchored — a space before the
-# tail means an episode title ('S01E05 - 12 Angry Men'), not a range.
-_MULTI_EP_TAIL = re.compile(r'(?i)^(?:[-~–—]\s*(?:S(\d{1,2})\s*)?(?:\d{1,2}x)?EP?(\d{1,4})|EP?(\d{1,4})|[-~–—]\s*(\d{1,4}))\b')
-
-def _multi_ep_end(filename: str, m, season_num: int) -> Optional[int]:
-    """End episode of a multi-episode file ('S01E01-E03', 'S01E01E02',
-    'S01E01-03', '1x01-02') read from the text directly after the strict/NxN
-    match m. None when absent or implausible: resolution/year tails, a
-    different season on the end marker, or end <= start."""
-    tail_m = _MULTI_EP_TAIL.match(filename[m.end():])
-    if not tail_m:
-        return None
-    if tail_m.group(1) is not None and int(tail_m.group(1)) != season_num:
-        return None
-    end = int(next(g for g in tail_m.groups()[1:] if g))
-    if end <= int(m.group(2)):
-        return None
-    if end in (360, 480, 540, 720, 1080, 1440, 2160, 4320) or 1900 <= end <= 2099:
-        return None
-    return end
-
 def detect_episode_info(filename: str) -> Dict[str, Any]:
     """Parse a filename for episode/season/show-name markers.
 
     Pure function (no widget/UI access) so the detection logic can be
     unit-tested directly. Returns a dict with keys: episode_detected,
     is_tv, season, episode, show_name, part_suffix (CJK multi-part),
-    english_part_suffix ("Part X"), has_sxe (strict SxxExx/NxN present),
-    episode_end (end of a multi-episode range, None for single episodes).
+    english_part_suffix ("Part X"), has_sxe (strict SxxExx/NxN present).
     """
     # CJK multi-part markers always apply (these genuinely split one episode into parts)
     part_suffix = ""
@@ -2529,23 +2376,12 @@ def detect_episode_info(filename: str) -> Dict[str, Any]:
         """Show name ends at the first marker — episode match or masked range."""
         return min(idx, range_m.start()) if range_m else idx
 
-    f_ext = os.path.splitext(filename)[1]
-    def _name_after(marker_end: int) -> str:
-        """Show name read from AFTER the episode marker — for marker-first names
-        ('1x02 - Chernobyl [x265].mkv') where nothing usable precedes it."""
-        tail = filename[marker_end:]
-        if f_ext and tail.lower().endswith(f_ext.lower()):
-            tail = tail[:-len(f_ext)]
-        return clean_show_name(tail) if len(tail.strip(' ._-')) > 2 else "Unknown Show"
-
     show_name = "Unknown Show"
     
     # Optional 'P' after the E covers the SxxEPyy style (e.g. S02EP05 = S02E05); the
     # glued 'EP' otherwise breaks both this and the loose \bEP pattern, so the episode
     # goes undetected and every file in a season collapses to E01 (skipped as dupes).
-    # The (?=EP?\d) alternative lets glued double-episode names (S01E01E02) match
-    # their first episode — \b alone fails between the digits and the second E.
-    sxe_strict = re.search(r'(?i)\bS(\d{1,2})EP?(\d{1,4})(?:v\d+)?(?:\b|(?=EP?\d))', filename)
+    sxe_strict = re.search(r'(?i)\bS(\d{1,2})EP?(\d{1,4})(?:v\d+)?\b', filename)
     # NNxNN pattern: matches 01x05, 1x03, 02x15, etc. (common TV naming convention)
     sxe_nxn = re.search(r'(?i)\b(\d{1,2})x(\d{1,4})\b', filename)
     # Added Vietnamese "Tập", Korean "화", Portuguese "Episodio", and more flexible episode patterns
@@ -2614,7 +2450,6 @@ def detect_episode_info(filename: str) -> Dict[str, Any]:
         # Handle: [01], " 01 ", "0724 [Tag]", "- 01", "_-_01_", "01x05" (NNxNN)
         # Try NNxNN pattern first (extracts both season and episode marker position)
         nxn_marker = re.search(r'(?i)\b(\d{1,2})x0*' + str(batch_ep) + r'\b', filename)
-        ep_marker = None
         if nxn_marker:
             season_num = int(nxn_marker.group(1))
             show_name = clean_show_name(filename[:_name_cut(nxn_marker.start())])
@@ -2624,10 +2459,6 @@ def detect_episode_info(filename: str) -> Dict[str, Any]:
                 show_name = clean_show_name(filename[:_name_cut(ep_marker.start())])
             else:
                 show_name = clean_show_name(filename[:_name_cut(len(filename))])
-        # Marker-first names: nothing usable before the marker — look after it
-        marker = nxn_marker or ep_marker
-        if marker is not None and (show_name == 'Unknown Show' or len(show_name) < 2):
-            show_name = _name_after(marker.end())
     
     # PRIORITY 2: Fall back to regex pattern matching if batch detection didn't find it
     if not episode_detected:
@@ -2685,21 +2516,13 @@ def detect_episode_info(filename: str) -> Dict[str, Any]:
             # For trailing pattern, use base_name (without extension) for show name extraction
             name_source = base_name if m_type == 'trailing' else filename
             show_name = clean_show_name(name_source[:_name_cut(match.start())])
-            # Marker-first names ('1x02 - Chernobyl [x265].mkv') have nothing usable
-            # before the marker — read the show name from the text after it instead
-            if show_name == 'Unknown Show' or len(show_name) < 2:
-                show_name = _name_after(match.end())
+            # If show name is too short/empty, try looking after the match (rare case)
+            if len(show_name) < 2 and m_type == 'loose': 
+                parts = os.path.splitext(filename[match.end():])[0]
+                if len(parts) > 2: show_name = clean_show_name(parts)
                 
             is_tv = True
             episode_detected = True
-
-    # Multi-episode range (S01E01-E03 → 3): only when the strict/NxN marker is
-    # what actually set the episode — a batch-detected number means the marker
-    # was a pack label, so its glued range is not this file's span
-    episode_end = None
-    span_src = sxe_strict or sxe_nxn
-    if episode_detected and span_src is not None and episode_num == int(span_src.group(2)):
-        episode_end = _multi_ep_end(filename, span_src, season_num)
 
     return {
         'episode_detected': episode_detected,
@@ -2710,7 +2533,6 @@ def detect_episode_info(filename: str) -> Dict[str, Any]:
         'part_suffix': part_suffix,
         'english_part_suffix': english_part_suffix,
         'has_sxe': bool(sxe_strict or sxe_nxn),
-        'episode_end': episode_end,
     }
 
 def determine_destination_path(filename: str, source: str = "generic", dry_run: bool = False, playlist_index: Optional[int] = None) -> Tuple[str, str]:
@@ -2740,7 +2562,6 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
     english_part_suffix = info['english_part_suffix']
     show_name = info['show_name']
     season_num, episode_num = info['season'], info['episode']
-    episode_end = info['episode_end']  # multi-episode file (S01E01-E03), else None
     is_tv = info['is_tv']
     episode_detected = info['episode_detected']
 
@@ -2769,9 +2590,6 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
     episode_ov = get_episode_override(filename)
     if episode_ov is not None:
         episode_num = episode_ov
-        # A renumber replaces the episode identity outright: a plain number makes
-        # the file a single episode, a range (🔢 7-9) makes it span E07-E09
-        episode_end = get_episode_end_override(filename)
         is_tv = True
         if not episode_detected:
             episode_detected = True
@@ -2847,18 +2665,11 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
             return os.path.join(full_dir, new_filename), "Movies"
 
     _, ext = os.path.splitext(filename)
-    # Apply English part suffix only when no SxxExx/NxN pattern was detected and the
-    # episode wasn't manually renumbered — either one already uniquely identifies the
-    # episode (Part 2 is typically the next episode, or the user assigned it a number)
-    if english_part_suffix and not info['has_sxe'] and episode_ov is None:
+    # Apply English part suffix only when no SxxExx/NxN pattern was detected
+    # (SxxExx already uniquely identifies the episode — Part 2 is typically the next episode)
+    if english_part_suffix and not info['has_sxe']:
         part_suffix = part_suffix or english_part_suffix
-    # Manual part override (queue 📎 Set Part / ✖ No Part) wins over all detection
-    part_ov = get_part_override(filename)
-    if part_ov is not None:
-        part_suffix = f"-pt{part_ov}" if part_ov else ""
-    # Multi-episode files keep their span in the Plex convention (S01E01-E03)
-    ep_span = f"-E{episode_end:02d}" if episode_end and episode_end > episode_num else ""
-    new_filename = f"{show_name} - S{season_num:02d}E{episode_num:02d}{ep_span}{part_suffix}{ext}"
+    new_filename = f"{show_name} - S{season_num:02d}E{episode_num:02d}{part_suffix}{ext}"
     season_folder = "Specials" if season_num == 0 else f"Season {season_num:02d}"
     # Append year to show folder name only (file name stays without year)
     folder_year = manual_year or tmdb_tv_year
@@ -5531,14 +5342,9 @@ def _run_download_pipeline(
                      subtitle_langs_value=subtitle_langs.value,
                      throttle=throttle)
 
-    # tb_magnet_file tasks come from torbox.app share links (which resolve via
-    # TorBox regardless of the debrid toggle) or TorBox magnet selections — so
-    # downloading them must not depend on the toggle either.
-    tb_file_key = tb_key or token_tb.value.strip()
-
     # --- TORBOX: cached items download in parallel, not one-by-one ---
-    if tb_magnet_file_tasks and tb_file_key:
-        tb_ready, tb_magnet_file_tasks = convert_tb_tasks_to_parallel(tb_magnet_file_tasks, tb_file_key)
+    if tb_magnet_file_tasks and tb_key:
+        tb_ready, tb_magnet_file_tasks = convert_tb_tasks_to_parallel(tb_magnet_file_tasks, tb_key)
         if tb_ready:
             print(f"🔗 TorBox: {len(tb_ready)} cached file(s) moved to the parallel queue")
             parallel_tasks = list(parallel_tasks) + tb_ready
@@ -5707,11 +5513,9 @@ def _run_download_pipeline(
         process_magnet_file_tasks(magnet_file_tasks, rd_key)
 
     # --- MAGNET FILE TASKS (TorBox) ---
-    if tb_magnet_file_tasks and tb_file_key and not _cancel_requested:
+    if tb_magnet_file_tasks and tb_key and not _cancel_requested:
         print(f"\n🧲 Processing {len(tb_magnet_file_tasks)} selected magnet files (TorBox)...")
-        process_tb_magnet_file_tasks(tb_magnet_file_tasks, tb_file_key)
-    elif tb_magnet_file_tasks and not tb_file_key:
-        print(f"\n❌ TorBox token required for {len(tb_magnet_file_tasks)} TorBox file(s) — enter TB Token, then Resume/Retry")
+        process_tb_magnet_file_tasks(tb_magnet_file_tasks, tb_key)
     
     # --- SUMMARY ---
     save_progress(throttle=False)  # Final state must always hit disk (throttled saves may have skipped it)
@@ -6013,11 +5817,6 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False, aut
             if needs_pixeldrain_gofile_rd_tb:
                 print("🔄 Re-resolving links with fresh session...")
                 s, t = get_gofile_session(gofile_token)
-                # rd/tb tasks keep their original service on resume regardless of
-                # the debrid toggle (mirrors the resolve/download phases) — fall
-                # back to the token widgets when the toggle-derived key is empty.
-                rd_refresh_key = rd_key or token_rd.value.strip()
-                tb_refresh_key = tb_key or token_tb.value.strip()
                 
                 for task in pending_tasks:
                     if task.original_url and task.link_type in ['gofile', 'pixeldrain', 'rd', 'tb']:
@@ -6031,12 +5830,12 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False, aut
                                 resolved = resolve_pixeldrain(task.original_url, s)
                                 if resolved:
                                     task.url = resolved[0][0]  # Update with fresh API URL
-                            elif task.link_type == 'rd' and rd_refresh_key:
-                                resolved = resolve_rd_link(task.original_url, rd_refresh_key)
+                            elif task.link_type == 'rd' and rd_key:
+                                resolved = resolve_rd_link(task.original_url, rd_key)
                                 if resolved:
                                     task.url = resolved[0][0]  # Update with fresh API URL
-                            elif task.link_type == 'tb' and tb_refresh_key:
-                                resolved = resolve_tb_link(task.original_url, tb_refresh_key)
+                            elif task.link_type == 'tb' and tb_key:
+                                resolved = resolve_tb_link(task.original_url, tb_key)
                                 if resolved:
                                     task.url = resolved[0][0]  # Update with fresh API URL
                         except Exception as e:
@@ -6230,8 +6029,6 @@ btn_season_apply.on_click(apply_season_override)
 btn_season_clear.on_click(clear_season_override)
 btn_renumber.on_click(apply_renumber)
 btn_renumber_clear.on_click(clear_renumber)
-btn_part_apply.on_click(apply_part_override)
-btn_part_remove.on_click(remove_part_override)
 btn_name_apply.on_click(apply_name_override)
 btn_name_clear.on_click(clear_name_override)
 btn_route_apply.on_click(apply_route_override)
