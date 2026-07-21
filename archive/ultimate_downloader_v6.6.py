@@ -7,7 +7,7 @@ import shutil
 import time
 import difflib
 import queue
-from typing import Optional, Tuple, List, Dict, Any, Callable
+from typing import Optional, Tuple, List, Dict, Any
 from dataclasses import dataclass, field, fields, asdict
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -205,127 +205,10 @@ def _unregister_proc(key: str):
 
 def _reset_cancel_state():
     """Clear the cancel flag and process registry between batches."""
-    global _cancel_requested, _disk_stall_abort
+    global _cancel_requested
     _cancel_requested = False
-    _disk_stall_abort = False
     with _active_procs_lock:
         _active_procs.clear()
-
-# --- DISK-SPACE GUARD ---
-# Colab hard-terminates the runtime when the local disk fills up. Debrid
-# downloads are faster than the FUSE move to Drive, so a big batch of large
-# files can fill /content before the mover drains it. The guard delays new
-# downloads (and pauses running ones) until moves free enough space, instead
-# of letting the session die.
-DISK_FLOOR_GB = 4.0         # Pause a running download when free space drops below this
-DISK_START_GB = 10.0        # Don't start a new download with less than this free
-DISK_CHECK_SECS = 5         # How often a running download polls free space
-DISK_WAIT_POLL_SECS = 10    # How often a blocked download re-checks free space
-DISK_WAIT_STALL_SECS = 600  # Give up when space stops improving and nothing can free it
-
-# --- RATE-LIMITED HOSTS ---
-# Hosts that meter by request count, not just bandwidth. aria2's stock behaviour
-# here (16 connections, and a 1M split floor) fires a burst of fresh Range
-# requests as a file nears completion — worst on resume, where the whole
-# remainder is small and still gets split every way at once. TorBox answers that
-# burst with HTTP 429, so the last few percent of a file never lands, and the
-# partial it leaves behind is exactly the state that triggers the burst again.
-#
-# Connection counts here are deliberately small: TorBox sells concurrency by tier
-# (the entry plan allows 3 slots), so the budget that matters is
-# Parallel DLs x connections-per-file, not either number alone. Two connections
-# leaves headroom at any slider setting, and costs no throughput — a throttled
-# transfer runs far slower than a clean single-stream one.
-# Measured on the entry tier: 3 parallel x 2 connections (6 at once) runs clean,
-# so a "slot" meters transfers, not TCP connections. Don't tighten below this
-# without evidence; the old 16-connection default was the actual fault.
-RATE_LIMITED_HOSTS = ('torbox.app', 'tb-cdn.io')
-THROTTLE_BACKOFF_SECS = 30  # Cool-off after a 429 (multiplied by the wait count)
-MAX_THROTTLE_WAITS = 4      # 429 cool-offs allowed before a download really fails
-
-_disk_guard_lock = Lock()
-_moves_in_flight = 0        # Drive transfers currently copying — each frees local space when done
-_disk_stall_abort = False   # A wait already timed out this batch; fail fast instead of re-stalling
-
-def _disk_free_gb() -> float:
-    """Free space on the Colab local disk in GB (inf when unmeasurable, e.g. locally)."""
-    try:
-        return shutil.disk_usage(COLAB_ROOT).free / (1024 ** 3)
-    except Exception:
-        return float('inf')
-
-def _move_in_flight() -> bool:
-    return _moves_in_flight > 0
-
-def _downloads_running() -> bool:
-    """True while any registered download subprocess is alive — it will either
-    finish (and free space via its Drive move) or pause itself at the floor."""
-    with _active_procs_lock:
-        return bool(_active_procs)
-
-def _mark_disk_gave_up(task_id):
-    """Tag a task's stats so download_worker reports an accurate failure reason."""
-    if task_id and not _cancel_requested:
-        with progress_lock:
-            download_stats.setdefault(task_id, {'pct': 0.0, 'speed_mbs': 0.0})['disk_gave_up'] = True
-
-def _wait_for_disk_space(needed_gb: float, label: str = "", task_id: Optional[str] = None) -> bool:
-    """Block until at least needed_gb is free on the local disk.
-
-    Returns True once enough space is free. Returns False when cancelled, or when
-    free space stops improving with nothing left that could free it (no Drive move
-    in flight, no download still running) — waiting longer would deadlock, e.g.
-    every worker paused on a huge partial. The caller fails that one download and
-    the session survives; partials stay on disk for Resume/Retry.
-    """
-    global _disk_stall_abort
-    free = _disk_free_gb()
-    if free >= needed_gb:
-        _disk_stall_abort = False  # Space recovered — future waits are worth trying again
-        return True
-    if _disk_stall_abort and not _move_in_flight() and not _downloads_running():
-        with print_lock:
-            print(f"   ⏭️ Skipped — local disk still full ({free:.1f} GB free) and nothing is freeing space")
-        return False
-    with print_lock:
-        print(f"   ⏸️ Low disk: {free:.1f} GB free (need {needed_gb:.0f} GB) — waiting for Drive moves to free space...")
-    if task_id:
-        with progress_lock:
-            stats = download_stats.setdefault(task_id, {'pct': 0.0, 'speed_mbs': 0.0})
-            stats['speed_mbs'] = 0.0
-            stats['disk_wait'] = True
-    try:
-        best = free
-        last_gain = time.time()
-        while not _cancel_requested:
-            for _ in range(DISK_WAIT_POLL_SECS):
-                time.sleep(1)
-                if _cancel_requested:
-                    return False
-            free = _disk_free_gb()
-            if free >= needed_gb:
-                _disk_stall_abort = False
-                with print_lock:
-                    print(f"   ▶️ Disk space recovered ({free:.1f} GB free) — resuming {label or 'download'}")
-                return True
-            if free > best + 0.5 or _move_in_flight() or _downloads_running():
-                # Space is draining, or something is still running that will free
-                # space when it completes — keep waiting
-                best = max(best, free)
-                last_gain = time.time()
-            elif time.time() - last_gain > DISK_WAIT_STALL_SECS:
-                _disk_stall_abort = True
-                with print_lock:
-                    print(f"   ❌ Still only {free:.1f} GB free after {DISK_WAIT_STALL_SECS // 60} min with nothing freeing space — giving up on {label or 'this download'}")
-                    print(f"      💡 Partial files are kept: Retry re-uses them. For very large files, lower Parallel DLs.")
-                return False
-        return False  # Cancelled while waiting
-    finally:
-        if task_id:
-            with progress_lock:
-                stats = download_stats.get(task_id)
-                if stats:
-                    stats.pop('disk_wait', None)
 
 # --- COLAB KEEP-ALIVE ---
 _keep_alive_stop = False
@@ -462,24 +345,6 @@ quick_dl_subtitle_langs = widgets.SelectMultiple(
     rows=6,  # whole rows only — a fixed pixel height clipped the last visible item
     layout=widgets.Layout(width='300px')
 )
-
-# Embedded subtitle extraction settings — auto-extract toggle + retroactive library
-# scan tool (merged from the standalone Smart Subtitle Extractor)
-auto_extract_subs_checkbox = widgets.Checkbox(value=False, description='Extract embedded subs after download', indent=False, layout=widgets.Layout(width='250px'))
-extract_sub_langs = widgets.SelectMultiple(
-    options=[('English', 'en'), ('Vietnamese', 'vi'), ('Chinese', 'zh'), ('Japanese', 'ja'), ('Korean', 'ko'),
-             ('Thai', 'th'), ('Indonesian', 'id'), ('Spanish', 'es'), ('French', 'fr'), ('German', 'de'), ('Portuguese', 'pt'), ('Russian', 'ru')],
-    value=['en', 'vi'],
-    description='Languages:',
-    rows=6,  # whole rows only — a fixed pixel height clipped the last visible item
-    layout=widgets.Layout(width='300px')
-)
-extract_any_track_checkbox = widgets.Checkbox(value=False, description='Fall back to first text track when no language matches', indent=False, layout=widgets.Layout(width='380px'))
-extract_dir_input = widgets.Text(value=DRIVE_TV_PATH, layout=widgets.Layout(width='200px'))
-btn_browse_extract = widgets.Button(description='📁', tooltip='Browse Drive folders', layout=widgets.Layout(width='35px'))
-btn_extract_library = widgets.Button(description='📑 Extract from Library', button_style='info',
-                                     tooltip='Scan the folder for videos with embedded subtitle tracks and write missing .srt sidecars',
-                                     layout=widgets.Layout(width='180px'))
 
 # Secrets status UI
 secrets_status = widgets.HTML(value="")
@@ -633,7 +498,6 @@ btn_browse_youtube.on_click(open_browser(dir_youtube_input))
 btn_browse_downloads.on_click(open_browser(dir_downloads_input))
 btn_browse_anime_series.on_click(open_browser(dir_anime_series_input))
 btn_browse_anime_movies.on_click(open_browser(dir_anime_movies_input))
-btn_browse_extract.on_click(open_browser(extract_dir_input))
 btn_browser_up.on_click(on_browser_up)
 btn_browser_open.on_click(on_browser_open)
 btn_browser_select.on_click(on_browser_select)
@@ -698,10 +562,6 @@ settings_ui = widgets.VBox([
     widgets.HBox([async_moves_checkbox]),
     widgets.HTML("<div style='margin-top:10px'><small><b>⚡ Quick Download Options:</b></small></div>"),
     widgets.HBox([quick_dl_subs_checkbox, quick_dl_subtitle_langs]),
-    widgets.HTML("<div style='margin-top:10px'><small><b>📑 Embedded Subtitles:</b></small></div>"),
-    widgets.HBox([auto_extract_subs_checkbox, extract_sub_langs]),
-    widgets.HBox([extract_any_track_checkbox]),
-    widgets.HBox([_dir_label('Library folder:'), extract_dir_input, btn_browse_extract, btn_extract_library]),
     widgets.HTML("<div style='margin-top:10px'><small><b>🗑️ Clear Data:</b></small></div>"),
     settings_buttons,
     confirm_box,
@@ -714,7 +574,7 @@ about_ui = widgets.VBox([
     widgets.HTML("""
         <div style='padding: 10px;'>
             <h3>ℹ️ About Ultimate Downloader</h3>
-            <p><strong>Version:</strong> 6.7</p>
+            <p><strong>Version:</strong> 6.6</p>
             <p><strong>Author:</strong> xersbtt</p>
             <p><strong>Repository:</strong> <a href='https://github.com/xersbtt/ultimate-downloader-colab' target='_blank'>github.com/xersbtt/ultimate-downloader-colab</a></p>
             <hr>
@@ -802,11 +662,7 @@ def save_dir_settings():
             # FShare password is intentionally NOT saved — plaintext credentials
             # don't belong on Drive. Use Colab Secrets (FSHARE_PASSWORD) instead.
             'fshare_email': token_fshare_email.value.strip(),
-            'debrid_service': debrid_service_toggle.value,
-            'auto_extract_subs': auto_extract_subs_checkbox.value,
-            'extract_langs': list(extract_sub_langs.value),
-            'extract_any_track': extract_any_track_checkbox.value,
-            'extract_dir': extract_dir_input.value.strip()
+            'debrid_service': debrid_service_toggle.value
         }
         with open(SETTINGS_FILE, 'w') as f:
             json.dump(settings, f)
@@ -858,14 +714,6 @@ def load_dir_settings():
                 tmdb_enabled_checkbox.value = settings['tmdb_enabled']
             if 'quick_dl_langs' in settings and not keep(quick_dl_subtitle_langs):
                 quick_dl_subtitle_langs.value = tuple(settings['quick_dl_langs'])
-            if 'auto_extract_subs' in settings and not keep(auto_extract_subs_checkbox):
-                auto_extract_subs_checkbox.value = bool(settings['auto_extract_subs'])
-            if 'extract_langs' in settings and not keep(extract_sub_langs):
-                extract_sub_langs.value = tuple(settings['extract_langs'])
-            if 'extract_any_track' in settings and not keep(extract_any_track_checkbox):
-                extract_any_track_checkbox.value = bool(settings['extract_any_track'])
-            if settings.get('extract_dir') and not keep(extract_dir_input):
-                extract_dir_input.value = settings['extract_dir']
             if settings.get('debrid_service') and not keep(debrid_service_toggle):
                 debrid_service_toggle.value = settings['debrid_service']
             if 'auto_retry' in settings and not keep(auto_retry_input):
@@ -926,10 +774,6 @@ debrid_service_toggle.observe(on_dir_change, names='value')
 auto_retry_input.observe(on_dir_change, names='value')
 async_moves_checkbox.observe(on_dir_change, names='value')
 episode_numbering_toggle.observe(on_dir_change, names='value')
-auto_extract_subs_checkbox.observe(on_dir_change, names='value')
-extract_sub_langs.observe(on_dir_change, names='value')
-extract_any_track_checkbox.observe(on_dir_change, names='value')
-extract_dir_input.observe(on_dir_change, names='value')
 
 # Try to load settings on startup (will work if Drive already mounted)
 load_dir_settings()
@@ -1040,7 +884,7 @@ queue_ui = widgets.VBox([
 
 
 input_ui = widgets.VBox([
-    widgets.HTML("<h3>🚀 Ultimate Downloader v6.7</h3>"),
+    widgets.HTML("<h3>🚀 Ultimate Downloader v6.6</h3>"),
     widgets.HBox([auto_organize_checkbox, debrid_service_toggle]),
     widgets.HBox([concurrent_slider, auto_retry_input]),
     text_area,
@@ -1098,7 +942,7 @@ def save_session(
         return
     try:
         session = {
-            "version": "6.7",
+            "version": "6.6",
             "started_at": datetime.now().isoformat(),
             "playlist_range": playlist_range,
             "yt_success": yt_success,
@@ -3229,8 +3073,6 @@ def process_youtube_link(url, mode="video", apply_playlist_range=True) -> Tuple[
     """
     import yt_dlp
     print(f"   ▶️ Processing Video: {url}")
-    if not _wait_for_disk_space(DISK_START_GB, label="YouTube download"):
-        return (0, 1, 1)
     with progress_lock:
         progress_bar.value = 0
         progress_bar.description = "Starting..."
@@ -3359,8 +3201,6 @@ def process_youtube_link(url, mode="video", apply_playlist_range=True) -> Tuple[
 def process_mega_link(url) -> bool:
     """Process Mega.nz download. Returns True on success, False on failure."""
     print(f"   ☁️ Processing Mega: {url}")
-    if not _wait_for_disk_space(DISK_START_GB, label="Mega download"):
-        return False
     with progress_lock:
         progress_bar.description = "Mega DL..."
         progress_bar.value = 0
@@ -3433,19 +3273,11 @@ def _speed_to_mbs(value: float, unit: str) -> float:
     return value
 
 def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optional[str] = None,
-                        task_id: Optional[str] = None, update_bar: bool = True,
-                        url_refresh: Optional[Callable[[], str]] = None) -> Optional[str]:
+                        task_id: Optional[str] = None, update_bar: bool = True) -> Optional[str]:
     """Thread-safe aria2 download with progress tracking.
 
     update_bar=False leaves the shared progress bar to the batch monitor thread
     (parallel downloads); sequential callers keep direct bar updates.
-
-    url_refresh re-mints the download URL between attempts. Debrid direct links
-    are time-limited, and a batch pre-requests every link before the first
-    download starts — so on a long batch the later files' URLs have expired by
-    the time a worker reaches them, and aria2 gets an error page instead of a
-    file (exit 22). Retrying the same dead URL can never succeed, so callers
-    that can mint a fresh one pass this and each retry gets a live link.
     """
     filename = sanitize_filename(filename)
 
@@ -3460,14 +3292,7 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
         return DUPLICATE_SKIP
 
     final_path = os.path.join(dest_folder, filename)
-    # A file already sitting at final_path is only genuinely complete if aria2 left
-    # NO .aria2 control file beside it. A large partial WITH a control file — the disk
-    # guard terminating aria2, a give-up, or a runtime restart mid-download — must not
-    # be treated as done, or a truncated video moves to Drive as if complete. Fall
-    # through so the aria2 command below resumes it via -c and finishes the pieces.
-    if (os.path.exists(final_path) and os.path.getsize(final_path) > 1024*1024
-            and not os.path.exists(final_path + '.aria2')):
-        return final_path
+    if os.path.exists(final_path) and os.path.getsize(final_path) > 1024*1024: return final_path
     with print_lock:
         print(f"   ⬇️ Downloading: {filename}")
 
@@ -3479,37 +3304,19 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
             progress_bar.bar_style = 'info'
             progress_bar.description = "Starting..."
 
-    # Disk-space guard: don't start writing into a nearly-full disk — wait for
-    # queued Drive moves to drain first (Colab terminates the session when the
-    # local disk fills). Bails out if nothing is freeing space.
-    if not _wait_for_disk_space(DISK_START_GB, label=filename[:40], task_id=task_id):
-        _mark_disk_gave_up(task_id)
-        return None
-
-    # Request-metered hosts get fewer connections and aria2's stock 20M split
-    # floor, so a near-complete file can't spray Range requests at the limiter.
-    rate_limited = url_matches_host(url, RATE_LIMITED_HOSTS)
-    conn_args = ['-x', '2', '-s', '2'] if rate_limited else ['-x', '16', '-s', '16']
-    retry_wait = '30' if rate_limited else '2'
-    cmd = ['aria2c', url, '-d', dest_folder, '-o', filename, *conn_args, '-k', '20M',
+    cmd = ['aria2c', url, '-d', dest_folder, '-o', filename, '-x', '16', '-s', '16', '-k', '1M',
            '-c', '--file-allocation=none', '--user-agent', 'Mozilla/5.0',
-           '--connect-timeout=30', '--timeout=60', '--max-tries=3', f'--retry-wait={retry_wait}',
+           '--connect-timeout=30', '--timeout=60', '--max-tries=3', '--retry-wait=2',
            '--summary-interval=1', '--show-console-readout=true']
     if cookie: cmd.extend(['--header', f'Cookie: accountToken={cookie}'])
 
     proc_key = task_id or str(uuid4())
-    attempt = 0
-    throttle_waits = 0  # 429 cool-offs taken so far (they don't consume an attempt)
-    while attempt < 3:
-        attempt += 1
+    for attempt in range(1, 4):
         if _cancel_requested:
             return None
         try:
             dl_start = time.time()
             completed_path = None  # Path reported by aria2's "Download complete:" line
-            last_error_line = ""  # aria2's own error text, surfaced when the attempt fails
-            disk_paused = False  # Set by the watchdog when it terminates aria2 on low disk
-            last_disk_check = time.time()
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
             _register_proc(proc_key, process)
             last_speed = ""
@@ -3518,13 +3325,6 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
                 complete_match = re.search(r'Download complete:\s*(\S.*)', line)
                 if complete_match:
                     completed_path = complete_match.group(1).strip()
-                # Keep aria2's own diagnosis (status codes, "Timeout", "errorCode")
-                # — without it a failure only ever surfaced as a generic exit code
-                # and the real cause (403/429/expired link) was invisible.
-                err_match = re.search(r'(errorCode=\d+.*|status=\d{3}.*|Timeout\b.*|'
-                                      r'Authorization failed.*|Resource not found.*)', line)
-                if err_match:
-                    last_error_line = err_match.group(1).strip()[:120]
                 match = re.search(r'\((\d+)%\)', line)
                 # aria2 outputs speed as "DL:5.2MiB" or "DL: 5.2MiB/s" - capture various formats
                 speed_match = re.search(r'DL:\s*(\d+\.?\d*)\s*([KMG])i?B', line)
@@ -3541,32 +3341,10 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
                                 progress_bar.value = val
                                 progress_bar.description = f"DL: {int(val)}% ({last_speed})" if last_speed else f"DL: {int(val)}%"
                     except Exception: pass
-                # Disk-space watchdog: pause before the disk actually fills —
-                # Colab kills the whole session at 0 bytes free. aria2 resumes
-                # the partial via its .aria2 control file when space returns.
-                if not disk_paused and time.time() - last_disk_check >= DISK_CHECK_SECS:
-                    last_disk_check = time.time()
-                    if _disk_free_gb() < DISK_FLOOR_GB and not _cancel_requested:
-                        disk_paused = True
-                        with print_lock:
-                            print(f"      ⏸️ Local disk nearly full — pausing {filename[:40]} until Drive moves free space")
-                        try:
-                            process.terminate()
-                        except Exception:
-                            pass
             process.wait()
             _unregister_proc(proc_key)
             if _cancel_requested:
                 return None  # Terminated by Stop — no fallback scan, no retries
-            if disk_paused:
-                # A disk pause is not a failure — wait for space, then resume the
-                # partial (aria2 -c picks up the .aria2 control file) without
-                # consuming a retry attempt.
-                attempt -= 1
-                if _wait_for_disk_space(DISK_START_GB, label=filename[:40], task_id=task_id):
-                    continue
-                _mark_disk_gave_up(task_id)
-                return None
             if process.returncode == 0 and os.path.exists(final_path):
                 return final_path
             if process.returncode == 0:
@@ -3590,44 +3368,12 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
                     with print_lock:
                         print(f"      ✓ Found downloaded file: {f}")
                     return candidate
-            detail = f" — {last_error_line}" if last_error_line else ""
             with print_lock:
                 if not os.path.exists(final_path):
-                    print(f"      ⚠️ Retry {attempt}/3 - File not found at expected path{detail}")
+                    print(f"      ⚠️ Retry {attempt}/3 - File not found at expected path")
                     print(f"         Expected: {final_path}")
                 else:
-                    print(f"      ⚠️ Retry {attempt}/3 - aria2 returned code {process.returncode}{detail}")
-            # A 429 says the account is being throttled, not that the link died:
-            # the URL is still good and aria2 -c has a resumable partial on disk.
-            # Re-minting would only spend more of the rate budget on requestdl
-            # (TorBox's most rate-limited endpoint) and make the throttle worse.
-            throttled = 'status=429' in last_error_line
-            if url_refresh and attempt < 3 and not throttled:
-                # The prefetched debrid link may simply have expired while this file
-                # waited its turn — re-mint it so the retry has a live URL to use.
-                # aria2 -c still resumes whatever partial is already on disk.
-                try:
-                    fresh_url = url_refresh()
-                except Exception:
-                    fresh_url = ''
-                if fresh_url and fresh_url != cmd[1]:
-                    cmd[1] = fresh_url
-                    with print_lock:
-                        print(f"      🔄 Re-requested a fresh download link")
-            if throttled and throttle_waits < MAX_THROTTLE_WAITS:
-                # Same treatment as a disk pause: the file is fine and -c resumes it,
-                # so a throttle must not burn a retry — otherwise a 99%-complete file
-                # exhausts its 3 attempts on the last few MB and can never land.
-                throttle_waits += 1
-                attempt -= 1
-                cool_off = THROTTLE_BACKOFF_SECS * throttle_waits
-                with print_lock:
-                    print(f"      ⏳ Rate limited (429) — cooling off {cool_off}s, then resuming from where it stopped")
-                for _ in range(cool_off):
-                    if _cancel_requested:
-                        return None
-                    time.sleep(1)
-                continue
+                    print(f"      ⚠️ Retry {attempt}/3 - aria2 returned code {process.returncode}")
             time.sleep(2**attempt)
         except Exception as e:
             _unregister_proc(proc_key)
@@ -3641,201 +3387,7 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
         print(f"   ❌ Download failed after 3 attempts - Check URL validity or network connection")
     return None
 
-# --- EMBEDDED SUBTITLE EXTRACTION ---
-# Merged from the standalone Smart Subtitle Extractor. Containers worth probing
-# for embedded subtitle tracks (text subs live almost exclusively in mkv/mp4,
-# but probing the others is one cheap ffprobe call).
-SUB_EXTRACT_VIDEO_EXTS = {'.mkv', '.mp4', '.m4v', '.webm', '.avi', '.ts'}
-# Codecs ffmpeg can convert to .srt. Image-based tracks (PGS/VobSub/DVB) would
-# need OCR, so they are reported and skipped rather than failing the file.
-_TEXT_SUB_CODECS = {'subrip', 'srt', 'ass', 'ssa', 'mov_text', 'webvtt', 'text', 'sami', 'subviewer', 'mpl2', 'realtext', 'stl', 'vplayer'}
-
-def _ensure_ffmpeg() -> bool:
-    """ffmpeg/ffprobe come preinstalled on Colab images; install only when missing
-    (setup_environment installs ffmpeg only when yt-dlp is in play)."""
-    if shutil.which('ffmpeg') and shutil.which('ffprobe'):
-        return True
-    print("🛠️ Installing ffmpeg...")
-    subprocess.run(["apt-get", "install", "-y", "ffmpeg"], check=False,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return bool(shutil.which('ffmpeg') and shutil.which('ffprobe'))
-
-def _probe_subtitle_streams(video_path: str) -> List[dict]:
-    """List a video's subtitle streams as [{'rel', 'lang', 'codec'}]. 'rel' is the
-    index among subtitle streams (what ffmpeg's 0:s:N specifier counts); 'lang'
-    is the tag mapped through _normalize_sub_lang ('' when untagged/und)."""
-    try:
-        res = subprocess.run(
-            ['ffprobe', '-v', 'error', '-select_streams', 's',
-             '-show_entries', 'stream=index,codec_name:stream_tags=language',
-             '-of', 'json', video_path],
-            capture_output=True, text=True, timeout=300)
-        streams = json.loads(res.stdout or '{}').get('streams', []) if res.returncode == 0 else []
-    except Exception:
-        return []
-    out = []
-    for rel, s in enumerate(streams):
-        tag = ((s.get('tags') or {}).get('language') or '').strip()
-        lang = '' if tag.casefold() in ('', 'und') else _normalize_sub_lang(tag)
-        out.append({'rel': rel, 'lang': lang, 'codec': (s.get('codec_name') or '').lower()})
-    return out
-
-def extract_embedded_subs(video_path: str, langs: List[str], any_fallback: bool = False,
-                          quiet: bool = False) -> List[str]:
-    """Extract embedded subtitle tracks to .srt sidecars beside the video.
-
-    For each requested language (Plex-friendly codes, the _normalize_sub_lang
-    convention) the first matching text track becomes '{video base}.{lang}.srt'
-    — the exact naming handle_file_processing gives downloaded subtitles. A track
-    tagged more precisely than the request keeps its precision ('zh' request +
-    'cht' track → '.zh-Hant.srt'). With any_fallback, a video whose tracks match
-    no requested language at all yields its first text track as '{base}.srt'.
-    Existing sidecars are never overwritten; results under 100 bytes (track
-    exists but is empty) are deleted. Returns the sidecar paths written."""
-    if not (langs or any_fallback) or not _ensure_ffmpeg():
-        return []
-    streams = _probe_subtitle_streams(video_path)
-    if not streams:
-        return []
-    base = os.path.splitext(video_path)[0]
-    targets = []          # (subtitle-relative stream index, sidecar path)
-    lang_matched = False  # a request matched SOME track, even an unconvertible one
-    for want in langs:
-        pick = next((s for s in streams if s['lang'] and
-                     (s['lang'] == want or s['lang'].split('-')[0] == want)), None)
-        if pick is None:
-            continue
-        lang_matched = True
-        if pick['codec'] not in _TEXT_SUB_CODECS:
-            if not quiet:
-                print(f"      ⚠️ '{want}' track is image-based ({pick['codec']}) — can't convert to .srt: {os.path.basename(video_path)}")
-            continue
-        targets.append((pick['rel'], f"{base}.{pick['lang']}.srt"))
-    if not targets and any_fallback and not lang_matched:
-        pick = next((s for s in streams if s['codec'] in _TEXT_SUB_CODECS), None)
-        if pick is not None:
-            targets.append((pick['rel'], f"{base}.srt"))
-    written = []
-    for rel, srt_path in targets:
-        if os.path.exists(srt_path):
-            continue
-        if cancel_requested():
-            break  # batch cancelled mid-file — stop starting new track extractions
-        try:
-            res = subprocess.run(
-                ['ffmpeg', '-nostdin', '-v', 'error', '-i', video_path,
-                 '-map', f'0:s:{rel}', '-c:s', 'srt', srt_path],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1800)
-            ok = res.returncode == 0 and os.path.exists(srt_path) and os.path.getsize(srt_path) > 100
-        except KeyboardInterrupt:
-            # Runtime → Interrupt mid-track: subprocess.run has already killed the
-            # ffmpeg child — drop the partial sidecar so a rescan doesn't mistake
-            # it for a finished subtitle, then let the caller handle the stop.
-            try:
-                if os.path.exists(srt_path): os.remove(srt_path)
-            except Exception:
-                pass
-            raise
-        except Exception:
-            ok = False
-        if ok:
-            written.append(srt_path)
-            if not quiet:
-                print(f"      ✅ Extracted: {os.path.basename(srt_path)}")
-        elif os.path.exists(srt_path):
-            try: os.remove(srt_path)
-            except Exception: pass
-    return written
-
-def _sidecar_exists(f_base: str, lang: str, fset: set) -> bool:
-    """True when '{f_base}' already has a sidecar satisfying a request for 'lang'.
-
-    extract_embedded_subs names sidecars after the TRACK's tag, which can be more
-    precise than the request: a 'cht' track under a 'zh' request is written as
-    '.zh-Hant.srt'. Matching only '.zh.srt' here would leave those files looking
-    permanently unextracted, so every rescan would re-probe them over the Drive
-    FUSE mount — the whole cost this listing check exists to avoid."""
-    if f"{f_base}.{lang}.srt" in fset:
-        return True
-    prefix = f"{f_base}.{lang}-"
-    return any(n.startswith(prefix) and n.endswith('.srt') for n in fset)
-
-def run_library_extract(b=None):
-    """Retroactive counterpart of the auto-extract checkbox: walk a Drive folder
-    and write missing .srt sidecars from embedded tracks. Synchronous like every
-    download (Runtime → Interrupt execution to stop a long scan). Probing reads
-    each video over the Drive FUSE mount, so files whose requested sidecars all
-    exist are skipped straight from the directory listing without touching the
-    video at all."""
-    folder = extract_dir_input.value.strip().strip('/')
-    langs = list(extract_sub_langs.value)
-    any_fb = extract_any_track_checkbox.value
-    if not langs and not any_fb:
-        print("❌ Select at least one subtitle language (or the first-track fallback).")
-        return
-    if drive is not None and not os.path.exists(DRIVE_BASE):
-        print("📂 Mounting Google Drive...")
-        drive.mount(f"{COLAB_ROOT}drive")
-    target = os.path.join(DRIVE_BASE, folder) if folder else DRIVE_BASE
-    if not os.path.isdir(target):
-        print(f"❌ Folder not found: {target}")
-        return
-    if not _ensure_ffmpeg():
-        print("❌ ffmpeg unavailable — cannot extract subtitles.")
-        return
-    btn_extract_library.disabled = True
-    _reset_cancel_state()  # a stale cancel flag from an interrupted batch must not mute extraction
-    probed = extracted = 0
-    try:
-        label = ', '.join(langs) if langs else 'first text track'
-        print(f"🚀 Scanning '{folder or 'My Drive'}' for embedded subtitle tracks ({label})...")
-        for root, dirs, files in os.walk(target):
-            fset = set(files)
-            for f in sorted(files):
-                f_base, f_ext = os.path.splitext(f)
-                if f_ext.lower() not in SUB_EXTRACT_VIDEO_EXTS:
-                    continue
-                if langs:
-                    needed = [l for l in langs if not _sidecar_exists(f_base, l, fset)]
-                    if not needed:
-                        continue  # every requested sidecar already exists
-                else:
-                    needed = []
-                    if f"{f_base}.srt" in fset:
-                        continue
-                probed += 1
-                print(f"   🔎 {f[:70]}...", end='\r')
-                # Fallback only when NOTHING pre-existed for this file — if some
-                # languages already have sidecars, the missing ones are genuinely
-                # absent from the file, and a first-track grab would just
-                # duplicate an existing language under no name.
-                extracted += len(extract_embedded_subs(
-                    os.path.join(root, f), needed,
-                    any_fallback=any_fb and len(needed) == len(langs)))
-        print(f"\n✨ Finished: {extracted} subtitle file(s) extracted ({probed} video(s) probed).")
-    except KeyboardInterrupt:
-        # Same contract as a download batch: kernel interrupt stops cleanly.
-        # Every sidecar written so far is complete (the interrupted track's
-        # partial file was already removed), so running the scan again simply
-        # continues from where this one stopped.
-        print(f"\n🛑 Stopped by user (kernel interrupt) — {extracted} subtitle file(s) extracted ({probed} video(s) probed). Run again to continue.")
-    finally:
-        btn_extract_library.disabled = False
-
 def move_with_progress(src: str, dest: str):
-    """Move a file to Drive, tracking the transfer for the disk-space guard —
-    paused downloads keep waiting while any move is in flight, since each
-    completed move frees that file's local space all at once."""
-    global _moves_in_flight
-    with _disk_guard_lock:
-        _moves_in_flight += 1
-    try:
-        _move_with_progress_impl(src, dest)
-    finally:
-        with _disk_guard_lock:
-            _moves_in_flight -= 1
-
-def _move_with_progress_impl(src: str, dest: str):
     """Move a file, with progress output for large cross-filesystem transfers.
     
     When moving across filesystems (e.g. local disk → Google Drive FUSE),
@@ -3930,39 +3482,12 @@ def handle_file_processing(file_path, source="generic"):
 
         if not os.path.exists(os.path.dirname(final_dest)): os.makedirs(os.path.dirname(final_dest))
         size_mb = os.path.getsize(file_path) / (1024 * 1024)
-
-        # Auto-extract embedded subs while the video is still on fast local disk —
-        # the library scan tool has to read videos back over the Drive FUSE mount,
-        # which costs a full download's worth of I/O per file. Sidecars are named
-        # off final_dest directly (no re-routing: they belong to this video).
-        extracted_subs = []
-        if auto_extract_subs_checkbox.value and not cancel_requested() and ext.lower() in SUB_EXTRACT_VIDEO_EXTS:
-            extracted_subs = extract_embedded_subs(file_path, list(extract_sub_langs.value),
-                                                   any_fallback=extract_any_track_checkbox.value, quiet=True)
-        local_base = os.path.splitext(file_path)[0]
-
         move_with_progress(file_path, final_dest)
         print(f"   ✨ Moved to {cat}: {os.path.basename(final_dest)}")
         log_download(os.path.basename(final_dest), source, size_mb, final_dest)
-
-        dest_base = os.path.splitext(final_dest)[0]
-        for sub_path in extracted_subs:
-            sub_dest = dest_base + sub_path[len(local_base):]  # carries the '.en.srt' tail
-            try:
-                sub_size_mb = os.path.getsize(sub_path) / (1024 * 1024)
-                if os.path.exists(sub_dest): os.remove(sub_dest)  # refresh, like downloaded subs
-                move_with_progress(sub_path, sub_dest)
-                print(f"   📑 Extracted sub: {os.path.basename(sub_dest)}")
-                log_download(os.path.basename(sub_dest), source, sub_size_mb, sub_dest)
-            except Exception as e:
-                print(f"   ⚠️ Could not move extracted sub {os.path.basename(sub_path)}: {str(e)[:80]}")
         return
 
     print(f"   📦 Archive Detected: {filename}")
-    # Extraction needs roughly the archive's size again on local disk
-    archive_gb = os.path.getsize(file_path) / (1024 ** 3)
-    if not _wait_for_disk_space(archive_gb + DISK_FLOOR_GB, label=f"extracting {filename[:40]}"):
-        raise OSError(f"Not enough local disk space to extract {filename} (archive kept for Retry)")
     extract_temp = f"{COLAB_ROOT}temp_extract"
     if os.path.exists(extract_temp): shutil.rmtree(extract_temp)
     os.makedirs(extract_temp)
@@ -4510,65 +4035,6 @@ _TB_ENDPOINT_BY_TYPE = {'torrents': 'torrents', 'torrent': 'torrents',
 # requestdl names its item-id parameter differently per endpoint
 _TB_REQUESTDL_ID_PARAM = {'torrents': 'torrent_id', 'usenet': 'usenet_id', 'webdl': 'web_id'}
 
-def _tb_err_is_throttle(err: str) -> bool:
-    """True when a _tb_requestdl error smells like rate limiting or an overloaded
-    edge rather than a per-file refusal — used to stop batch link prefetching
-    early instead of burning more of the rate budget."""
-    e = err.lower()
-    return 'http' in e or 'rate' in e or 'limit' in e or 'many requests' in e
-
-def _tb_requestdl(endpoint: str, id_param: str, item_id, file_id, tb_key: str,
-                  attempts: int = 4) -> Tuple[str, str]:
-    """Request one file's download URL from TorBox: (url, '') or ('', error).
-
-    requestdl is TorBox's most rate-limited endpoint, and throttled or overloaded
-    calls come back as 429/5xx with empty or HTML bodies — parsing those with a
-    bare .json() raised 'Expecting value: line 1 column 1 (char 0)' and failed
-    the file outright. Treat them (and rate-limit refusals inside valid JSON) as
-    transient: back off — honouring Retry-After when TorBox sends it — and retry;
-    only a clean JSON refusal (bad id, expired token) fails immediately."""
-    try:
-        item_id, file_id = int(item_id), int(file_id)
-    except (TypeError, ValueError):
-        pass  # non-numeric ids go through as-is
-    dl_params = {"token": tb_key, id_param: item_id, "file_id": file_id}
-    if id_param == 'web_id':
-        dl_params["web_download_id"] = item_id  # older param name, harmless
-    err = 'Could not get download URL'
-    retry_after = 0.0
-    for attempt in range(attempts):
-        if attempt:
-            delay = max(retry_after, 5 * (2 ** (attempt - 1)))  # 5s, 10s, 20s
-            print(f"      ⏳ TorBox throttled — retrying in {delay:.0f}s ({err[:60]})")
-            for _ in range(int(delay)):
-                if cancel_requested():
-                    return '', 'Cancelled by user'
-                time.sleep(1)
-        try:
-            dl_r = requests.get(f"{TORBOX_API_BASE}/{endpoint}/requestdl",
-                                params=dl_params, headers=_get_tb_headers(tb_key), timeout=30)
-        except Exception as e:
-            err = str(e)[:100]
-            retry_after = 0.0
-            continue
-        try:
-            retry_after = min(float(dl_r.headers.get('Retry-After', 0)), 60.0)
-        except (TypeError, ValueError):
-            retry_after = 0.0
-        try:
-            dl_data = dl_r.json()
-        except ValueError:
-            body = (dl_r.text or '').strip()
-            err = f"TorBox HTTP {dl_r.status_code}: {'non-JSON response' if body else 'empty response'}"
-            continue  # throttle or edge hiccup — worth retrying
-        download_url = _tb_extract_download_url(dl_data)
-        if download_url:
-            return download_url, ''
-        err = str(dl_data.get('detail') or dl_data.get('error') or err)[:120]
-        if dl_r.status_code < 429 and not _tb_err_is_throttle(err):
-            return '', err  # genuine refusal — retrying won't change the answer
-    return '', err
-
 def resolve_tb_folder_files(url: str, tb_key: str) -> List[DownloadTask]:
     """Resolve a torbox.app/download?id=X&type=Y share link (the site's
     'Copy JDownloader Folder Links' button) into per-file queue tasks.
@@ -4697,14 +4163,18 @@ def resolve_tb_link(url: str, tb_key: str) -> List[Tuple[str, str]]:
                 files = item.get('files', [])
                 file_id = files[0].get('id', 0) if files else 0
 
-                download_url, dl_err = _tb_requestdl('webdl', 'web_id', webdl_id, file_id, tb_key)
+                dl_r = requests.get(f"{TORBOX_API_BASE}/webdl/requestdl",
+                                   params={"token": tb_key, "web_download_id": webdl_id,
+                                          "file_id": file_id},
+                                   headers=h, timeout=30)
+                download_url = _tb_extract_download_url(dl_r.json())
                 if download_url:
                     with progress_lock:
                         progress_bar.value = 100
                         progress_bar.description = "TB: Ready ✓"
                     return [(download_url, sanitize_filename(filename))]
 
-                print(f"   ❌ TorBox: {dl_err}")
+                print(f"   ❌ TorBox: Could not get download URL")
                 return []
             
             elif status in ['error', 'failed']:
@@ -4834,16 +4304,14 @@ def convert_tb_tasks_to_parallel(tasks: List[DownloadTask], tb_key: str) -> Tupl
             if idx:
                 time.sleep(0.3)  # stay under the TorBox API rate limit
             try:
-                # One attempt only: on a throttle, stop prefetching instead of
-                # burning more of the rate budget — whatever lands in the
-                # sequential flow gets _tb_requestdl's backoff retries there.
-                download_url, dl_err = _tb_requestdl(endpoint, id_param, item_id, file_id, tb_key, attempts=1)
-            except Exception as e:
-                download_url, dl_err = '', str(e)[:80]
-            if not download_url and _tb_err_is_throttle(dl_err):
-                print(f"   ⏳ TorBox is throttling link requests — {len(file_list) - idx} file(s) moved to the sequential flow ({dl_err[:60]})")
-                sequential.extend(t for _fid, t in file_list[idx:])
-                break
+                dl_params = {"token": tb_key, id_param: int(item_id), "file_id": int(file_id)}
+                if endpoint == 'webdl':
+                    dl_params["web_download_id"] = int(item_id)  # older param name, harmless
+                dl_r = requests.get(f"{TORBOX_API_BASE}/{endpoint}/requestdl",
+                                    params=dl_params, headers=_get_tb_headers(tb_key), timeout=30)
+                download_url = _tb_extract_download_url(dl_r.json())
+            except Exception:
+                download_url = ''
             if download_url:
                 task.url = download_url
                 task.filename = _strip_size_suffix(task.filename)
@@ -4910,9 +4378,16 @@ def process_tb_magnet_file_tasks(tasks: List[DownloadTask], tb_key: str) -> int:
                         if idx > 1:
                             time.sleep(1)  # Rate limiting
                         try:
-                            # Request the file's download link — _tb_requestdl retries
-                            # with backoff when TorBox throttles the endpoint
-                            download_url, dl_err = _tb_requestdl(endpoint, id_param, item_id, file_id, tb_key)
+                            # Request download link for this specific file
+                            dl_params = {"token": tb_key, id_param: int(item_id),
+                                         "file_id": int(file_id)}
+                            if endpoint == 'webdl':
+                                dl_params["web_download_id"] = int(item_id)  # older param name, harmless
+                            dl_r = requests.get(f"{TORBOX_API_BASE}/{endpoint}/requestdl",
+                                               params=dl_params,
+                                               headers=_get_tb_headers(tb_key), timeout=30)
+                            dl_data = dl_r.json()
+                            download_url = _tb_extract_download_url(dl_data)
                             if download_url:
                                 # Clean filename (remove size suffix for actual download)
                                 clean_name = _strip_size_suffix(task.filename)
@@ -4928,8 +4403,9 @@ def process_tb_magnet_file_tasks(tasks: List[DownloadTask], tb_key: str) -> int:
                                 else:
                                     task.error = "Download failed"
                             else:
-                                print(f"   ❌ TorBox DL error: {dl_err}")
-                                task.error = dl_err[:100]
+                                err = dl_data.get('detail', 'Could not get download URL')
+                                print(f"   ❌ TorBox DL error: {err}")
+                                task.error = str(err)[:100]
                         except Exception as e:
                             print(f"   ❌ Failed to download: {str(e)[:60]}")
                             task.error = str(e)[:100]
@@ -5566,30 +5042,6 @@ def resolve_fshare(url: str, email: str, password: str) -> List[Tuple[str, str]]
             print(f"   ❌ FShare: Could not extract download link — VIP account may be required")
             return []
 
-def _tb_url_refresher(task: DownloadTask) -> Optional[Callable[[], str]]:
-    """Build a fresh-link minter for a TorBox file task, or None for other types.
-
-    convert_tb_tasks_to_parallel pre-requests every direct link before the first
-    download starts, so on a long batch the later files' links expire before a
-    worker reaches them. original_url keeps the '{endpoint}/{item_id}:{file_id}'
-    handle those links were minted from, which is all _tb_requestdl needs to mint
-    another one on demand."""
-    if task.link_type != 'tb_magnet_file' or not task.original_url or ':' not in task.original_url:
-        return None
-    # split(':', 1) — same convention _group_tasks_by_torrent uses to read this field
-    item_ref, file_id = task.original_url.split(':', 1)
-    endpoint, _, item_id = item_ref.rpartition('/')
-    endpoint = endpoint or 'torrents'
-    id_param = _TB_REQUESTDL_ID_PARAM.get(endpoint, 'torrent_id')
-
-    def _refresh() -> str:
-        tb_key = token_tb.value.strip()
-        if not tb_key:
-            return ''
-        url, _err = _tb_requestdl(endpoint, id_param, item_id, file_id, tb_key, attempts=2)
-        return url
-    return _refresh
-
 # --- PARALLEL DOWNLOAD WORKER ---
 def download_worker(task: DownloadTask, gofile_token: str, move_queue: Optional[queue.Queue] = None) -> DownloadTask:
     """Worker function for parallel downloads. Returns updated task.
@@ -5602,8 +5054,7 @@ def download_worker(task: DownloadTask, gofile_token: str, move_queue: Optional[
     task.status = "downloading"
     try:
         # update_bar=False: the batch monitor thread owns the shared progress bar
-        f = download_with_aria2(task.url, task.filename, COLAB_ROOT, task.cookie, task_id=task.id,
-                                update_bar=False, url_refresh=_tb_url_refresher(task))
+        f = download_with_aria2(task.url, task.filename, COLAB_ROOT, task.cookie, task_id=task.id, update_bar=False)
         if f is DUPLICATE_SKIP:
             task.status = "skipped"  # Already in Drive — not a failure, don't retry on resume
         elif f and move_queue is not None:
@@ -5618,10 +5069,6 @@ def download_worker(task: DownloadTask, gofile_token: str, move_queue: Optional[
                         task.error = "Interrupted before Drive move (file kept locally)"
                         break
         elif f:
-            # Same "moving" state the overlapped path uses. Without it the task stays
-            # "downloading" for the whole (blocking) Drive transfer and keeps rendering
-            # at its last aria2 percentage — which reads as a download stuck at 99%.
-            task.status = "moving"
             handle_file_processing(f, source=task.source)
             task.status = "done"
         elif _cancel_requested:
@@ -5629,10 +5076,7 @@ def download_worker(task: DownloadTask, gofile_token: str, move_queue: Optional[
             task.error = "Cancelled by user"
         else:
             task.status = "failed"
-            if download_stats.get(task.id, {}).get('disk_gave_up'):
-                task.error = "Local disk full — Drive moves couldn't free space in time"
-            else:
-                task.error = "Download returned None"
+            task.error = "Download returned None"
     except Exception as e:
         task.status = "failed"
         task.error = str(e)[:100]
@@ -5907,15 +5351,6 @@ def update_progress_display(tasks: List[DownloadTask]):
         last_display_speed = total_speed_mbs
     display_speed = last_display_speed if last_display_speed > 0 else total_speed_mbs
     
-    # Disk-space guard readout (Colab local disk; inf when unmeasurable locally)
-    disk_free = _disk_free_gb()
-    if disk_free == float('inf'):
-        disk_part = ""
-    elif disk_free < DISK_START_GB:
-        disk_part = f" | <b style='color:orange'>💾 {disk_free:.1f} GB free</b>"
-    else:
-        disk_part = f" | 💾 {disk_free:.0f} GB free"
-
     # --- OVERALL PROGRESS BAR ---
     # Fractional progress: completed tasks + fractional progress of active tasks.
     # Gives smooth continuous movement instead of staircase jumps.
@@ -5943,10 +5378,10 @@ def update_progress_display(tasks: List[DownloadTask]):
         eta_part = f" | ⏱️ {eta_str}" if eta_str else ""
         moving_part = f" | 📤 {moving} moving" if moving else ""
         progress_bar.description = f"⚡ {done}/{total}"
-        status_label.value = f"<small>📊 <b>{len(active)} downloading</b>{moving_part} | ⬇️ {speed_str}{eta_part}{disk_part}</small>"
+        status_label.value = f"<small>📊 <b>{len(active)} downloading</b>{moving_part} | ⬇️ {speed_str}{eta_part}</small>"
     elif moving:
         progress_bar.description = f"📤 {done}/{total}"
-        status_label.value = f"<small>📤 <b>{moving} file{'s' if moving != 1 else ''} moving to Drive...</b>{disk_part}</small>"
+        status_label.value = f"<small>📤 <b>{moving} file{'s' if moving != 1 else ''} moving to Drive...</b></small>"
     elif done == total:
         progress_bar.description = f"✅ {done}/{total}"
         status_label.value = ""
@@ -5983,14 +5418,10 @@ def update_progress_display(tasks: List[DownloadTask]):
             pct = stats['pct']
             speed = stats['speed_mbs']
             bar.value = pct
+            bar.bar_style = 'warning'
             name = t.filename[:30] if t.filename else 'download'
-            if stats.get('disk_wait'):
-                bar.bar_style = 'info'
-                bar.description = f"⏸️ {name}  {int(pct)}% (low disk)"
-            else:
-                bar.bar_style = 'warning'
-                task_speed = f"{speed:.1f} MB/s" if speed > 0 else "starting..."
-                bar.description = f"{name}  {int(pct)}% ({task_speed})"
+            task_speed = f"{speed:.1f} MB/s" if speed > 0 else "starting..."
+            bar.description = f"{name}  {int(pct)}% ({task_speed})"
 
     # Bars for tasks handed to the mover thread (download done, Drive move pending)
     for t in tasks:
@@ -6818,9 +6249,6 @@ btn_clear_ytarchive.on_click(request_clear_ytarchive)
 btn_clear_session.on_click(request_clear_session)
 btn_confirm_yes.on_click(confirm_action)
 btn_confirm_cancel.on_click(cancel_confirmation)
-
-# Embedded subtitle extraction bindings
-btn_extract_library.on_click(run_library_extract)
 
 # --- INITIAL SETUP ---
 def early_mount_drive():

@@ -21,8 +21,10 @@ A powerful Google Colab-based tool for downloading media from multiple sources d
 - **TMDB Metadata Matching**: Canonical names, years, and anime absolute-episode → season mapping via the free TMDB API (optional); correct or clear any auto-match per item in the queue, and corrections persist across resume
 - **Archive Extraction**: Handles RAR, ZIP, 7Z with sequential extraction to save Colab disk space
 - **Subtitle Preservation**: Keeps `.srt`, `.ass`, `.sub`, `.vtt` files regardless of size
+- **Embedded Subtitle Extraction**: Pulls text subtitle tracks out of MKV/MP4 files as Plex-ready `.srt` sidecars — automatically after every download, or retroactively across your Drive library from Settings
 - **Duplicate Prevention**: Skips already-downloaded files across sessions
 - **Progress Tracking**: Real-time progress bar with speed display
+- **Disk-Space Session Guard**: Downloads pause automatically before Colab's local disk fills (which would kill the runtime) and resume as Drive moves free up space
 
 ---
 
@@ -171,6 +173,7 @@ Select rows in the Queue Preview, then apply any of these. Each shows its effect
 | v6.4 | Season match/Absolute numbering toggle, Force Season queue override, sticky Auto Retry & Overlap-moves settings |
 | v6.5 | Live destination previews, per-file queue overrides (Route / Force Name / Renumber), SxxEyy detection priority, sticky-settings & history fixes |
 | v6.6 | Multi-episode file spans (S01E01-E03) with range renumbering, part-suffix queue control, smarter TMDB matching, marker-first name detection, TorBox link routing fix |
+| v6.7 | Embedded subtitle extraction (auto after download + retroactive library scan), Colab disk-space session guard |
 
 ## 🎬 Episode Detection Patterns
 
@@ -285,6 +288,8 @@ When YouTube videos are detected in the Queue Preview, you can select which subt
 
 **Playlist Range:** Also appears in Queue Preview when a YouTube playlist is detected. Use `1,3,5-10` syntax to select specific videos.
 
+**Embedded subtitle extraction** (⚙️ Settings → 📑 Embedded Subtitles): the same languages apply when extracting text subtitle tracks already embedded in MKV/MP4 files — automatically after each download, or retroactively across any Drive folder with **📑 Extract from Library**. Tracks are saved as Plex-ready sidecars (`Show - S01E01.en.srt`); image-based tracks (PGS/VobSub) can't be converted to `.srt` and are skipped with a note.
+
 ---
 
 ## 📋 Buttons
@@ -298,7 +303,7 @@ When YouTube videos are detected in the Queue Preview, you can select which subt
 | **Resume Previous Session** | Resume interrupted session (appears when session exists) |
 | **🔄 Restart Runtime** | Restart Colab runtime (appears after failures for easy resume) |
 | **📜 (History)** | View last 10 downloads from history log |
-| **⚙️ (Settings)** | Configure download directories, manage cookies, Quick Download subtitle options, clear data files |
+| **⚙️ (Settings)** | Configure download directories, manage cookies, Quick Download subtitle options, embedded subtitle extraction, clear data files |
 
 ---
 
