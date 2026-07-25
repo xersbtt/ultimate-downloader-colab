@@ -2,6 +2,22 @@
 
 A powerful Google Colab-based tool for downloading media from multiple sources directly to Google Drive with automatic Plex-friendly organization.
 
+## Contents
+
+- [Features](#-features)
+- [Quick Start](#-quick-start) — [Requirements](#requirements)
+- [Configuration Options](#️-configuration-options) — [UI Fields](#ui-fields) · [Queue Overrides](#queue-overrides-per-selection) · [Drive Folders](#drive-folders) · [Performance](#performance)
+- [Supported Sources](#-supported-sources)
+- [Changelog](#-changelog)
+- [Episode Detection Patterns](#-episode-detection-patterns)
+- [YouTube Cookies](#-youtube-cookies-experimental)
+- [FShare Support](#-fshare-support-experimental)
+- [Subtitle Languages](#-subtitle-languages)
+- [Buttons](#-buttons)
+- [Troubleshooting](#-troubleshooting)
+- [FAQ](#-faq)
+- [File Structure](#-file-structure)
+
 ## ✨ Features
 
 - **Multi-Source Downloads**: Gofile, Pixeldrain, Mega.nz, FShare, YouTube, OK.ru, Twitch, Vimeo, and more
@@ -25,10 +41,21 @@ A powerful Google Colab-based tool for downloading media from multiple sources d
 - **Duplicate Prevention**: Skips already-downloaded files across sessions
 - **Progress Tracking**: Real-time progress bar with speed display
 - **Disk-Space Session Guard**: Downloads pause automatically before Colab's local disk fills (which would kill the runtime) and resume as Drive moves free up space
+- **Fast, Verified Drive Transfers**: Optionally upload over the Drive API instead of the Drive mount — roughly 3–4× faster on large batches, and a file is only reported complete once Drive genuinely has it
 
 ---
 
 ## 🚀 Quick Start
+
+### Requirements
+
+- A free Google account (Colab and Drive both use it)
+- Enough free space in Google Drive for what you are downloading
+- Optional: a Real-Debrid or TorBox subscription for premium hosts and magnet links,
+  and a free TMDB API key for metadata matching
+
+Nothing is installed locally — everything runs in Colab. Free Colab runtimes have
+usage limits and can be reclaimed; the session resume feature exists for exactly that.
 
 ### 1. Open in Google Colab
 
@@ -44,7 +71,21 @@ import requests; exec(requests.get("https://raw.githubusercontent.com/xersbtt/ul
 
 Run the cell and the UI will appear automatically.
 
-> **Want to review the code first?** Open [`ultimate_downloader.py`](https://github.com/xersbtt/ultimate-downloader-colab/blob/main/ultimate_downloader.py), copy the entire contents, and paste directly into a Colab cell.
+> **Security note**: that one-liner executes code fetched from a URL. Review
+> [`ultimate_downloader.py`](https://github.com/xersbtt/ultimate-downloader-colab/blob/main/ultimate_downloader.py)
+> before running it — or skip the one-liner entirely, copy the file contents, and paste
+> them straight into a Colab cell. Same result, nothing fetched at runtime.
+
+**Alternatives:**
+
+- Download the file into the runtime first, then run it:
+  ```python
+  !wget -q https://raw.githubusercontent.com/xersbtt/ultimate-downloader-colab/main/ultimate_downloader.py
+  exec(open("ultimate_downloader.py").read())
+  ```
+- Pin to a specific release instead of tracking the latest by swapping `main` for a tag
+  (e.g. `v6.7`) in the URL. Tracking `main` is recommended — fixes here have included
+  data-integrity ones — but pinning is there if you want a fixed version.
 
 ### 2. Configure API Keys (Optional)
 
@@ -124,7 +165,8 @@ Select rows in the Queue Preview, then apply any of these. Each shows its effect
 
 > **Quick Download Subtitles**: Enable "Include subtitles in quick downloads" in ⚙️ Settings to automatically fetch subtitles when using the Quick Download button.
 
-> **Overlap Drive moves** (⚙️ Settings → Performance): finished files move to Drive on a background thread while the next download starts immediately, instead of each worker pausing to move its own file. Opt-in — it queues up to 3 finished files on Colab's local disk and keeps more debrid connections busy, so leave it off if disk space or your provider's concurrent-download slots are tight.
+> **Transfer performance**: how finished files reach Drive is configurable and makes a
+> large difference to batch times — see [Performance](#performance) below.
 
 **Customizing Download Directories:**
 1. Click ⚙️ Settings in the main UI
@@ -134,6 +176,61 @@ Select rows in the Queue Preview, then apply any of these. Each shows its effect
    - Create new folders with ➕ Create
    - Select with ✓ Select
 4. Settings auto-save and persist across sessions
+
+### Performance
+
+Finished downloads still have to get from Colab's local disk into Drive, and that
+transfer — not the download — is usually what limits a large batch. Three settings
+control it, all under ⚙️ Settings → Performance.
+
+| Setting | Description |
+|---------|-------------|
+| **Upload to Drive via API** | Send finished files to Drive over the Drive REST API instead of writing them through the mounted `My Drive` folder. Off by default; falls back to the mount automatically if the API is unavailable |
+| **Overlap Drive moves with downloads** | Finished files transfer on background threads while the next download starts immediately, instead of each worker pausing to transfer its own file |
+| **Drive movers** | How many transfers run at once while overlap is on (1–8, default 3). Only meaningful with the API enabled — see below |
+
+**Why the API option exists.** The mounted Drive folder is a write-back cache: a write
+to it returns as soon as the bytes are staged on local disk, and Google's own background
+uploader sends them to Drive afterwards. Two consequences, both bad. A file can be
+reported as moved minutes before it actually arrives — and is lost outright if the Colab
+runtime ends while uploads are still queued, even though the local copy has already been
+deleted. And throughput is capped by that single background uploader, so transferring
+more files at once does not help at all. Uploading over the API instead means a transfer
+finishes when Drive really has the file, so the local copy is only deleted once it is safe.
+
+**Measured on a Colab CPU runtime**, transferring while 3 downloads run concurrently:
+
+| Configuration | Aggregate throughput |
+|---------------|----------------------|
+| Through the Drive mount (any number of movers) | ~24 MB/s |
+| API, 2 movers | ~71 MB/s |
+| **API, 3 movers** | **~82 MB/s** |
+| API, 4 movers | ~83 MB/s |
+
+Three movers is the knee — a fourth splits the same bandwidth into smaller shares rather
+than adding any. In practice a 66 GB batch that would spend ~47 minutes transferring
+through the mount finishes in ~14.
+
+Each in-flight transfer holds one finished file on local disk (plus a short queue), so
+higher mover counts need more free space. The disk-space guard pauses downloads rather
+than letting the runtime die, but with very large files you may see it trip — lower
+**Parallel DLs** or **Drive movers** if that happens.
+
+Every batch prints its own figures when it finishes, so you can tune against your own
+runtime rather than these numbers:
+
+```
+📤 Drive transfers: 36 file(s), 66.61 GB in 13.9 min — 81.9 MB/s aggregate, 28.0 MB/s per stream (2.9x from parallelism)
+```
+
+Raise **Drive movers** until the aggregate figure stops improving. Once per-stream
+throughput starts falling in proportion to the movers you add, you have hit your
+runtime's ceiling and further movers only cost disk space.
+
+> **First run with the API enabled** shows a Google consent prompt for Drive access. If it
+> fails, the log says `⚠️ Drive API unavailable` and transfers fall back to the mount —
+> nothing breaks, it just runs at mount speed.
+
 
 ---
 
@@ -174,6 +271,7 @@ Select rows in the Queue Preview, then apply any of these. Each shows its effect
 | v6.5 | Live destination previews, per-file queue overrides (Route / Force Name / Renumber), SxxEyy detection priority, sticky-settings & history fixes |
 | v6.6 | Multi-episode file spans (S01E01-E03) with range renumbering, part-suffix queue control, smarter TMDB matching, marker-first name detection, TorBox link routing fix |
 | v6.7 | Embedded subtitle extraction (auto after download + retroactive library scan), Colab disk-space session guard |
+| v6.8 | Drive API uploads (~3-4x faster transfers, verified completion), configurable Drive movers, per-batch throughput summary, duplicate library folder fix |
 
 ## 🎬 Episode Detection Patterns
 

@@ -11,7 +11,7 @@ from typing import Optional, Tuple, List, Dict, Any, Callable
 from dataclasses import dataclass, field, fields, asdict
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock, RLock, local
+from threading import Lock
 from uuid import uuid4
 import ipywidgets as widgets
 from IPython.display import display, clear_output
@@ -247,64 +247,6 @@ _disk_guard_lock = Lock()
 _moves_in_flight = 0        # Drive transfers currently copying — each frees local space when done
 _disk_stall_abort = False   # A wait already timed out this batch; fail fast instead of re-stalling
 
-# --- DRIVE TRANSFER THROUGHPUT ---
-# Measured on the Drive API path: 3 concurrent uploads sustained ~45 MB/s each, so
-# per-stream throughput holds as streams are added and aggregate scales with the
-# mover count. Where it stops scaling is empirical, hence the slider and this
-# summary: raise movers until the aggregate figure stops moving. (Through the FUSE
-# mount none of this applies — that path caps out around 24 MB/s in total.)
-DRIVE_MOVERS_DEFAULT = 3    # Concurrent Drive uploads in overlap mode
-MOVE_QUEUE_DEPTH = 2        # Finished files allowed to queue on top of the in-flight ones
-
-_drive_xfer_lock = Lock()
-_drive_xfer_bytes = 0          # Bytes pushed to Drive this batch
-_drive_xfer_secs = 0.0         # Summed per-file transfer time (> wall clock when parallel)
-_drive_xfer_files = 0
-_drive_xfer_first = None       # Earliest transfer start / latest end, for wall-clock rate
-_drive_xfer_last = None
-
-def _reset_drive_xfer_stats():
-    """Clear the per-batch Drive throughput counters."""
-    global _drive_xfer_bytes, _drive_xfer_secs, _drive_xfer_files
-    global _drive_xfer_first, _drive_xfer_last
-    with _drive_xfer_lock:
-        _drive_xfer_bytes = 0
-        _drive_xfer_secs = 0.0
-        _drive_xfer_files = 0
-        _drive_xfer_first = None
-        _drive_xfer_last = None
-
-def _record_drive_transfer(nbytes: int, started: float, ended: float):
-    """Record one completed Drive transfer (called from every mover thread)."""
-    global _drive_xfer_bytes, _drive_xfer_secs, _drive_xfer_files
-    global _drive_xfer_first, _drive_xfer_last
-    with _drive_xfer_lock:
-        _drive_xfer_bytes += nbytes
-        _drive_xfer_secs += max(ended - started, 0.0)
-        _drive_xfer_files += 1
-        if _drive_xfer_first is None or started < _drive_xfer_first:
-            _drive_xfer_first = started
-        if _drive_xfer_last is None or ended > _drive_xfer_last:
-            _drive_xfer_last = ended
-
-def _drive_xfer_summary() -> Optional[str]:
-    """One-line Drive throughput report, or None if nothing was transferred.
-
-    Aggregate = bytes / wall clock spent transferring — the number that actually
-    got faster. Per-stream = bytes / summed per-file time, which more movers do
-    not change. Their ratio is the parallel speed-up the mover count bought, so
-    comparing two batches at different mover counts is a direct A/B."""
-    with _drive_xfer_lock:
-        if not _drive_xfer_files or _drive_xfer_first is None:
-            return None
-        total_mb = _drive_xfer_bytes / (1024 * 1024)
-        wall = max(_drive_xfer_last - _drive_xfer_first, 0.001)
-        stream_secs = max(_drive_xfer_secs, 0.001)
-        files = _drive_xfer_files
-    agg = total_mb / wall
-    per = total_mb / stream_secs
-    return (f"📤 Drive transfers: {files} file(s), {total_mb / 1024:.2f} GB in {wall / 60:.1f} min "
-            f"— {agg:.1f} MB/s aggregate, {per:.1f} MB/s per stream ({agg / per:.1f}x from parallelism)")
 def _disk_free_gb() -> float:
     """Free space on the Colab local disk in GB (inf when unmeasurable, e.g. locally)."""
     try:
@@ -466,14 +408,6 @@ auto_retry_input = widgets.Text(description='Auto Retry:', placeholder='e.g. 3 (
 # the next download immediately. Off = each worker moves its own file before taking
 # another, which doubles as backpressure when Colab disk or debrid slots are tight.
 async_moves_checkbox = widgets.Checkbox(value=False, description='Overlap Drive moves with downloads', tooltip='Finished files move to Drive in the background while the next download starts immediately. Uses more local disk (up to 3 finished files can queue) and keeps more debrid slots busy — leave off if Colab disk space or your provider\'s concurrent slots are tight.', indent=False, layout=widgets.Layout(width='320px'))
-# Opt-in: send finished files to Drive over the REST API instead of writing them
-# through the mount. The mount is a write-back cache, so a write there returns
-# before Drive actually has the file; the API returns only when the upload is done.
-drive_api_checkbox = widgets.Checkbox(value=False, description='Upload to Drive via API (bypass the mount)', tooltip='Writes through the Drive mount are staged locally and uploaded in the background, so a file can be reported complete minutes before it reaches Drive — and is lost outright if the runtime ends first. This uploads over the Drive API instead: slower to report, but "complete" means complete. Falls back to the mount automatically if the API is unavailable.', indent=False, layout=widgets.Layout(width='360px'))
-# How many Drive uploads run at once in overlap mode. Separate from Parallel DLs:
-# that slider is bounded by the debrid plan's concurrent slots, this one by how many
-# uploads Drive will take and how much local disk the pending backlog needs.
-drive_movers_slider = widgets.IntSlider(value=DRIVE_MOVERS_DEFAULT, min=1, max=8, description='Drive movers:', tooltip='Concurrent Drive uploads when overlap is on. Only meaningful with the Drive API enabled — writes to the mount are drained by a single background uploader no matter how many movers run. Each in-flight upload holds one finished file on local disk, so higher values need more free space. Raise it until the aggregate MB/s printed at the end of a batch stops improving.', style={'description_width': '95px'}, layout=widgets.Layout(width='300px'))
 # Auto-organisation checkbox for main UI. Width matches the Parallel DLs slider
 # (280px) so the Debrid and Auto Retry label+field pairs align across both rows.
 auto_organize_checkbox = widgets.Checkbox(value=True, description='Auto-organise', tooltip='Auto-rename and organise files. Uncheck to save with original filenames to Downloads.', indent=False, layout=widgets.Layout(width='280px'))
@@ -762,8 +696,6 @@ settings_ui = widgets.VBox([
     cookie_row,
     widgets.HTML("<div style='margin-top:10px'><small><b>🚀 Performance:</b></small></div>"),
     widgets.HBox([async_moves_checkbox]),
-    widgets.HBox([drive_api_checkbox]),
-    widgets.HBox([drive_movers_slider]),
     widgets.HTML("<div style='margin-top:10px'><small><b>⚡ Quick Download Options:</b></small></div>"),
     widgets.HBox([quick_dl_subs_checkbox, quick_dl_subtitle_langs]),
     widgets.HTML("<div style='margin-top:10px'><small><b>📑 Embedded Subtitles:</b></small></div>"),
@@ -782,7 +714,7 @@ about_ui = widgets.VBox([
     widgets.HTML("""
         <div style='padding: 10px;'>
             <h3>ℹ️ About Ultimate Downloader</h3>
-            <p><strong>Version:</strong> 6.8</p>
+            <p><strong>Version:</strong> 6.7</p>
             <p><strong>Author:</strong> xersbtt</p>
             <p><strong>Repository:</strong> <a href='https://github.com/xersbtt/ultimate-downloader-colab' target='_blank'>github.com/xersbtt/ultimate-downloader-colab</a></p>
             <hr>
@@ -866,8 +798,6 @@ def save_dir_settings():
             'quick_dl_langs': list(quick_dl_subtitle_langs.value),
             'auto_retry': auto_retry_input.value.strip(),
             'async_moves': async_moves_checkbox.value,
-            'drive_api': drive_api_checkbox.value,
-            'drive_movers': drive_movers_slider.value,
             'episode_numbering': episode_numbering_toggle.value,
             # FShare password is intentionally NOT saved — plaintext credentials
             # don't belong on Drive. Use Colab Secrets (FSHARE_PASSWORD) instead.
@@ -942,13 +872,6 @@ def load_dir_settings():
                 auto_retry_input.value = str(settings['auto_retry'])
             if 'async_moves' in settings and not keep(async_moves_checkbox):
                 async_moves_checkbox.value = bool(settings['async_moves'])
-            if 'drive_api' in settings and not keep(drive_api_checkbox):
-                drive_api_checkbox.value = bool(settings['drive_api'])
-            if 'drive_movers' in settings and not keep(drive_movers_slider):
-                # Clamped: a settings.json from a build with a wider range must not
-                # push the slider outside its own min/max (ipywidgets raises).
-                drive_movers_slider.value = max(drive_movers_slider.min,
-                                                min(drive_movers_slider.max, int(settings['drive_movers'])))
             if settings.get('episode_numbering') in ('Season match', 'Absolute') and not keep(episode_numbering_toggle):
                 episode_numbering_toggle.value = settings['episode_numbering']
         finally:
@@ -1002,8 +925,6 @@ token_fshare_password.observe(on_dir_change, names='value')
 debrid_service_toggle.observe(on_dir_change, names='value')
 auto_retry_input.observe(on_dir_change, names='value')
 async_moves_checkbox.observe(on_dir_change, names='value')
-drive_api_checkbox.observe(on_dir_change, names='value')
-drive_movers_slider.observe(on_dir_change, names='value')
 episode_numbering_toggle.observe(on_dir_change, names='value')
 auto_extract_subs_checkbox.observe(on_dir_change, names='value')
 extract_sub_langs.observe(on_dir_change, names='value')
@@ -1119,7 +1040,7 @@ queue_ui = widgets.VBox([
 
 
 input_ui = widgets.VBox([
-    widgets.HTML("<h3>🚀 Ultimate Downloader v6.8</h3>"),
+    widgets.HTML("<h3>🚀 Ultimate Downloader v6.7</h3>"),
     widgets.HBox([auto_organize_checkbox, debrid_service_toggle]),
     widgets.HBox([concurrent_slider, auto_retry_input]),
     text_area,
@@ -1177,7 +1098,7 @@ def save_session(
         return
     try:
         session = {
-            "version": "6.8",
+            "version": "6.7",
             "started_at": datetime.now().isoformat(),
             "playlist_range": playlist_range,
             "yt_success": yt_success,
@@ -2707,11 +2628,6 @@ def check_duplicate_in_drive(filename: str, source: str = "generic", playlist_in
         file_size = os.path.getsize(dest_path) / (1024 * 1024)
         print(f"   ⏭️  SKIPPED (Already exists): {os.path.basename(dest_path)} ({file_size:.1f} MB)")
         return True
-    # Uploaded by the API earlier this session: really in Drive, but the mount has
-    # not polled for remote changes yet, so os.path.exists above cannot see it.
-    if _drive_path_exists(dest_path):
-        print(f"   ⏭️  SKIPPED (uploaded earlier this session): {os.path.basename(dest_path)}")
-        return True
     return False
 
 # Multi-episode continuation glued directly to a strict/NxN match: '-E03',
@@ -2959,7 +2875,8 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
     # If auto-organise is disabled, just return Downloads folder with original filename
     if not is_auto_organize_enabled():
         downloads_dir = os.path.join(DRIVE_BASE, get_downloads_path())
-        if not dry_run: _ensure_dest_dir(downloads_dir)  # API path owns folder creation
+        if not dry_run and not os.path.exists(downloads_dir):
+            os.makedirs(downloads_dir, exist_ok=True)
         return os.path.join(downloads_dir, filename), "Downloads"
 
     # 🎯 Route as 'Downloads (as-is)': keep the original name, skip organising —
@@ -2967,7 +2884,8 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
     route_ov = get_route_override(filename)
     if route_ov == 'downloads':
         downloads_dir = os.path.join(DRIVE_BASE, get_downloads_path())
-        if not dry_run: _ensure_dest_dir(downloads_dir)  # API path owns folder creation
+        if not dry_run and not os.path.exists(downloads_dir):
+            os.makedirs(downloads_dir, exist_ok=True)
         return os.path.join(downloads_dir, filename), "Downloads"
     # Anime routes pick the anime library folders in the branches below
     is_anime = route_ov in ('anime_series', 'anime_movie')
@@ -3047,11 +2965,11 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
             new_filename = f"{manual_show_name}{ext}"
             if is_anime:
                 full_dir = os.path.join(f"{DRIVE_BASE}{get_anime_movies_path()}", folder_name)
-                if not dry_run: _ensure_dest_dir(full_dir)  # API path owns folder creation
+                if not dry_run and not os.path.exists(full_dir): os.makedirs(full_dir, exist_ok=True)
                 return os.path.join(full_dir, new_filename), "Anime Movies"
             else:
                 full_dir = os.path.join(f"{DRIVE_BASE}{get_movie_path()}", folder_name)
-                if not dry_run: _ensure_dest_dir(full_dir)  # API path owns folder creation
+                if not dry_run and not os.path.exists(full_dir): os.makedirs(full_dir, exist_ok=True)
                 return os.path.join(full_dir, new_filename), "Movies"
     elif is_tv:
         pass  # Continue to TV show path generation below
@@ -3077,11 +2995,11 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
         # Use anime folder if anime mode is enabled
         if is_anime:
             full_dir = os.path.join(f"{DRIVE_BASE}{get_anime_movies_path()}", folder_name)
-            if not dry_run: _ensure_dest_dir(full_dir)  # API path owns folder creation
+            if not dry_run and not os.path.exists(full_dir): os.makedirs(full_dir, exist_ok=True)
             return os.path.join(full_dir, new_filename), "Anime Movies"
         else:
             full_dir = os.path.join(f"{DRIVE_BASE}{get_movie_path()}", folder_name)
-            if not dry_run: _ensure_dest_dir(full_dir)  # API path owns folder creation
+            if not dry_run and not os.path.exists(full_dir): os.makedirs(full_dir, exist_ok=True)
             return os.path.join(full_dir, new_filename), "Movies"
 
     _, ext = os.path.splitext(filename)
@@ -3106,12 +3024,12 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
     if is_anime:
         base_path = f"{DRIVE_BASE}{get_anime_series_path()}"
         full_dir = os.path.join(base_path, show_folder, season_folder)
-        if not dry_run: _ensure_dest_dir(full_dir)  # API path owns folder creation
+        if not dry_run and not os.path.exists(full_dir): os.makedirs(full_dir, exist_ok=True)
         return os.path.join(full_dir, new_filename), "Anime Series"
     else:
         base_path = f"{DRIVE_BASE}{get_tv_path()}"
         full_dir = os.path.join(base_path, show_folder, season_folder)
-        if not dry_run: _ensure_dest_dir(full_dir)  # API path owns folder creation
+        if not dry_run and not os.path.exists(full_dir): os.makedirs(full_dir, exist_ok=True)
         return os.path.join(full_dir, new_filename), "TV"
 
 # --- CORE LOGIC ---
@@ -3128,17 +3046,11 @@ def setup_environment(needs_mega, needs_ytdlp, needs_aria):
     # mount (unsaveable at the time — no Drive) are persisted too.
     load_dir_settings()
     save_dir_settings()
-
-    # Drive API auth happens here, on the main thread: Colab renders a consent
-    # prompt, and settings (which decide whether the API is wanted at all) have
-    # only just been restored above.
-    if drive_api_checkbox.value:
-        _init_drive_api()
     
     # Create media folders and config folder
     for p in [get_tv_path(), get_movie_path(), get_youtube_path()]:
         full_p = f"{DRIVE_BASE}{p}"
-        _ensure_dest_dir(full_p)
+        if not os.path.exists(full_p): os.makedirs(full_p)
     if not os.path.exists(UD_CONFIG_PATH): os.makedirs(UD_CONFIG_PATH)
     
     if needs_ytdlp:
@@ -3910,263 +3822,18 @@ def run_library_extract(b=None):
     finally:
         btn_extract_library.disabled = False
 
-# --- DRIVE API UPLOAD ---
-# Writing through the drivefs FUSE mount is a write-back cache: the copy returns as
-# soon as the bytes are staged locally and drivefs's own background uploader pushes
-# them to Google afterwards. Two consequences, both bad. "Transfer complete" is a
-# lie — files keep uploading after a batch ends, and a terminated runtime loses
-# whatever is still queued even though the local copy was already deleted and the
-# history says it landed. And throughput is capped by that one background uploader,
-# so no amount of writer concurrency changes it (measured: 6 concurrent writers gave
-# no improvement at all). Uploading through the Drive REST API instead makes
-# completion mean completion and puts the transfer under our own control.
-DRIVE_API_CHUNK_MB = 64      # Resumable upload chunk; must be a multiple of 256 KB
-DRIVE_API_MAX_ATTEMPTS = 4   # Per-file retries on transient (429/5xx) errors
-DRIVE_FOLDER_RECHECK_SECS = 3  # Re-look-up before creating a folder (search index lag)
-
-_drive_api_ready = False               # Auth succeeded and the client imports cleanly
-_drive_api_warned = False              # One-shot notice when a file falls back to the mount
-_drive_api_local = local()             # googleapiclient is NOT thread-safe; one client per thread
-_drive_folder_ids = {}                 # Drive-relative dir -> folder ID (resolved once)
-_drive_folder_lock = RLock()           # Reentrant: _drive_folder_id recurses under it
-_drive_uploaded_paths = set()          # Landed via API, not yet visible through the mount
-_drive_uploaded_lock = Lock()
-
-def _init_drive_api() -> bool:
-    """Authenticate for the Drive REST API. Main thread only — Colab renders a
-    consent prompt, which does not work reliably from a worker thread. Never fatal:
-    on failure uploads keep using the mount exactly as before."""
-    global _drive_api_ready
-    if _drive_api_ready:
-        return True
-    try:
-        from google.colab import auth
-        from googleapiclient.discovery import build
-        import logging
-        # google_auth_httplib2 warns that httplib2 has no per-request timeout on every
-        # single request — several lines per uploaded file, which buries the real output.
-        logging.getLogger('google_auth_httplib2').setLevel(logging.ERROR)
-        auth.authenticate_user()
-        build('drive', 'v3', cache_discovery=False)  # Fail here, not mid-batch
-        _drive_api_ready = True
-        print("🔐 Drive API ready — uploads bypass the Drive mount")
-    except Exception as e:
-        _drive_api_ready = False
-        print(f"⚠️ Drive API unavailable ({str(e)[:70]}) — uploads will use the Drive mount")
-    return _drive_api_ready
-
-def _use_drive_api() -> bool:
-    return bool(drive_api_checkbox.value) and _drive_api_ready
-
-def _ensure_dest_dir(path: str):
-    """Create a Drive destination directory — unless the API owns folder creation.
-
-    Two creators is one too many. A mkdir through the mount makes a real Drive
-    folder, but Drive's search index lags behind it, so _drive_folder_id's own
-    lookup can miss it and create a second folder with the same name. That is what
-    produced the duplicate 'Rome (2005)' and 'Deadwood (2004)' folders, and it needs
-    no thread race at all — one file on one thread is enough.
-
-    With the API on, _drive_folder_id is the single creator and builds the whole path
-    itself. The mount fallback in _move_with_progress_impl creates what it needs at
-    copy time instead."""
-    if _use_drive_api():
-        return
-    os.makedirs(path, exist_ok=True)
-
-def _warn_api_fallback(err: Exception):
-    """Announce the first API failure of the session, then stay quiet."""
-    global _drive_api_warned
-    with print_lock:
-        if not _drive_api_warned:
-            _drive_api_warned = True
-            print(f"   ⚠️ Drive API upload failed ({str(err)[:80]}) — falling back to the Drive mount")
-
-def _drive_service():
-    """Per-thread Drive client. googleapiclient sits on httplib2, which is not
-    thread-safe — one shared service across parallel workers corrupts responses."""
-    svc = getattr(_drive_api_local, 'svc', None)
-    if svc is None:
-        from googleapiclient.discovery import build
-        svc = build('drive', 'v3', cache_discovery=False)
-        _drive_api_local.svc = svc
-    return svc
-
-def _drive_escape(name: str) -> str:
-    """Escape a name for use inside a Drive API query string literal."""
-    return name.replace('\\', '\\\\').replace("'", "\\'")
-
-def _drive_folder_id(rel_dir: str) -> str:
-    """Resolve a Drive-relative directory to a folder ID, creating what is missing.
-
-    Memoised, so a folder costs one lookup per session.
-
-    The whole lookup-then-create runs under the lock, and that is load-bearing:
-    Drive allows duplicate sibling names, so when several uploads raced to resolve a
-    brand-new show folder they each saw "not found" and each created it — three
-    identical 'Rome (2005)' folders with the episodes scattered across them. Checking
-    and creating has to be one atomic step. The lock is an RLock because this
-    recurses up the path, and resolution is memoised, so serialising it costs a
-    couple of API calls per new folder and nothing per file."""
-    rel_dir = rel_dir.strip('/')
-    if not rel_dir:
-        return 'root'
-    with _drive_folder_lock:
-        cached = _drive_folder_ids.get(rel_dir)
-        if cached:
-            return cached
-        parent_rel, _, leaf = rel_dir.rpartition('/')
-        parent_id = _drive_folder_id(parent_rel) if parent_rel else 'root'
-        svc = _drive_service()
-        q = ("'%s' in parents and name='%s' and mimeType='application/vnd.google-apps.folder'"
-             " and trashed=false" % (parent_id, _drive_escape(leaf)))
-        found = svc.files().list(q=q, fields='files(id)', pageSize=1,
-                                 supportsAllDrives=True, includeItemsFromAllDrives=True
-                                 ).execute().get('files', [])
-        if not found:
-            # Drive's search index lags creates by a few seconds. Re-check once before
-            # adding a folder, so one that exists but is not yet indexed (created by an
-            # earlier session, or through the mount) is found instead of duplicated.
-            time.sleep(DRIVE_FOLDER_RECHECK_SECS)
-            found = svc.files().list(q=q, fields='files(id)', pageSize=1,
-                                     supportsAllDrives=True, includeItemsFromAllDrives=True
-                                     ).execute().get('files', [])
-        if found:
-            fid = found[0]['id']
-        else:
-            meta = {'name': leaf, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [parent_id]}
-            fid = svc.files().create(body=meta, fields='id', supportsAllDrives=True).execute()['id']
-        _drive_folder_ids[rel_dir] = fid
-        return fid
-
-def _drive_clear_existing(folder_id: str, name: str):
-    """Trash any same-named file already in the target folder.
-
-    The caller's duplicate check reads the mount, which lags behind API uploads, so
-    it can miss a file that really is there — and Drive would happily keep both
-    copies under one name."""
-    svc = _drive_service()
-    q = "'%s' in parents and name='%s' and trashed=false" % (folder_id, _drive_escape(name))
-    for f in svc.files().list(q=q, fields='files(id)', pageSize=10,
-                              supportsAllDrives=True, includeItemsFromAllDrives=True
-                              ).execute().get('files', []):
-        try:
-            svc.files().delete(fileId=f['id'], supportsAllDrives=True).execute()
-        except Exception:
-            pass  # A file we cannot replace is not worth failing the download over
-
-def _mark_drive_uploaded(dest: str):
-    with _drive_uploaded_lock:
-        _drive_uploaded_paths.add(os.path.normpath(dest))
-
-def _drive_path_exists(dest: str) -> bool:
-    """True if the path is in Drive — through the mount, or uploaded by the API this
-    session. API uploads are invisible to the mount until drivefs next polls for
-    remote changes, so the mount alone would report a file we just wrote as absent."""
-    if os.path.exists(dest):
-        return True
-    with _drive_uploaded_lock:
-        return os.path.normpath(dest) in _drive_uploaded_paths
-
-def _drive_api_upload(src: str, dest: str):
-    """Upload src to the Drive path dest over the REST API.
-
-    Returns only once Drive holds the whole file, so the caller can safely delete
-    the local copy and log the download as complete."""
-    from googleapiclient.http import MediaFileUpload
-    rel = os.path.relpath(dest, DRIVE_BASE).replace(os.sep, '/')
-    rel_dir, _, name = rel.rpartition('/')
-    folder_id = _drive_folder_id(rel_dir)
-    file_size = os.path.getsize(src)
-    size_mb = file_size / (1024 * 1024)
-    _drive_clear_existing(folder_id, name)
-
-    chunk = DRIVE_API_CHUNK_MB * 1024 * 1024
-    report_interval = 500 * 1024 * 1024
-    last_error = None
-    for attempt in range(1, DRIVE_API_MAX_ATTEMPTS + 1):
-        media = MediaFileUpload(src, chunksize=chunk, resumable=True)
-        request = _drive_service().files().create(
-            body={'name': name, 'parents': [folder_id]},
-            media_body=media, fields='id,size', supportsAllDrives=True)
-        start_time = time.time()
-        last_report = 0
-        if size_mb >= 100:
-            with print_lock:
-                print(f"      📤 Uploading to Drive: {size_mb:.0f} MB..."
-                      + (f" (attempt {attempt})" if attempt > 1 else ""))
-        try:
-            response = None
-            while response is None:
-                if cancel_requested():
-                    raise KeyboardInterrupt("cancelled during Drive upload")
-                status, response = request.next_chunk()
-                if status is None or size_mb < 100:
-                    continue
-                sent = status.resumable_progress
-                if sent - last_report >= report_interval:
-                    elapsed = time.time() - start_time
-                    speed = (sent / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                    with print_lock:
-                        print(f"         {(sent / file_size) * 100:.0f}% "
-                              f"({sent / (1024*1024):.0f}/{size_mb:.0f} MB) @ {speed:.1f} MB/s")
-                    last_report = sent
-            uploaded = int(response.get('size') or 0)
-            if uploaded and uploaded != file_size:
-                # Drive disagreeing on size means a truncated upload — never accept it,
-                # the caller is about to delete the only complete copy.
-                raise IOError(f"Drive reported {uploaded} bytes, expected {file_size}")
-            if size_mb >= 100:
-                elapsed = time.time() - start_time
-                speed = size_mb / elapsed if elapsed > 0 else 0
-                with print_lock:
-                    print(f"      ✅ Upload complete: {size_mb:.0f} MB in {elapsed:.0f}s ({speed:.1f} MB/s)")
-            return
-        except KeyboardInterrupt:
-            raise
-        except Exception as e:
-            last_error = e
-            if attempt >= DRIVE_API_MAX_ATTEMPTS:
-                break
-            # Clear the partial before retrying so a failed attempt cannot leave a
-            # half-uploaded file sitting under the final name.
-            try:
-                _drive_clear_existing(folder_id, name)
-            except Exception:
-                pass
-            wait = min(60, 5 * (2 ** (attempt - 1)))
-            for _ in range(wait):
-                if cancel_requested():
-                    raise KeyboardInterrupt("cancelled during Drive upload backoff")
-                time.sleep(1)
-        finally:
-            try:
-                media.stream().close()
-            except Exception:
-                pass
-    raise last_error if last_error else IOError("Drive upload failed")
-
 def move_with_progress(src: str, dest: str):
     """Move a file to Drive, tracking the transfer for the disk-space guard —
     paused downloads keep waiting while any move is in flight, since each
-    completed move frees that file's local space all at once.
-
-    Completed transfers also feed the end-of-batch throughput summary, which is
-    what says whether the current mover count is buying anything. Both are only
-    truthful on the API path: a write to the mount returns before Drive has the
-    bytes, so it neither frees the space nor measures the upload."""
+    completed move frees that file's local space all at once."""
     global _moves_in_flight
     with _disk_guard_lock:
         _moves_in_flight += 1
-    started = time.time()
     try:
-        copied = _move_with_progress_impl(src, dest)
+        _move_with_progress_impl(src, dest)
     finally:
         with _disk_guard_lock:
             _moves_in_flight -= 1
-    # Only reached on success — a raising move records nothing.
-    if copied:
-        _record_drive_transfer(copied, started, time.time())
 
 def _move_with_progress_impl(src: str, dest: str):
     """Move a file, with progress output for large cross-filesystem transfers.
@@ -4175,33 +3842,11 @@ def _move_with_progress_impl(src: str, dest: str):
     shutil.move does a full copy+delete. This wrapper uses buffered copy
     with periodic progress prints so the user can see the transfer happening.
     For same-filesystem moves, falls back to os.rename (instant).
-
-    Returns the bytes actually pushed to Drive — 0 for a rename or a small-file
-    shutil.move, so the batch throughput summary only counts real transfers.
     """
-    # Prefer the Drive API. A write through the mount only reaches a local
-    # write-back cache — see the DRIVE API UPLOAD notes above — so it returns long
-    # before Drive has the bytes. The API upload returns when the file is really
-    # there, which is what makes the os.remove(src) below safe.
-    if _use_drive_api() and dest.startswith(DRIVE_BASE):
-        try:
-            api_bytes = os.path.getsize(src)
-            _drive_api_upload(src, dest)
-            _mark_drive_uploaded(dest)
-            os.remove(src)
-            return api_bytes
-        except KeyboardInterrupt:
-            raise
-        except Exception as e:
-            _warn_api_fallback(e)  # Fall through to the mount rather than fail the file
-    # Reached only when the API is off or its upload failed, so the destination
-    # directory may not exist yet — _ensure_dest_dir deliberately skips creating it
-    # while the API owns folder creation.
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
     try:
         # Try rename first (instant for same filesystem)
         os.rename(src, dest)
-        return 0
+        return
     except OSError:
         pass  # Different filesystems — need to copy+delete
     
@@ -4211,7 +3856,7 @@ def _move_with_progress_impl(src: str, dest: str):
     # For small files (<100MB), just use shutil.move silently
     if size_mb < 100:
         shutil.move(src, dest)
-        return 0
+        return
     
     # Large file: buffered copy with progress
     chunk_size = 8 * 1024 * 1024  # 8MB chunks
@@ -4246,7 +3891,6 @@ def _move_with_progress_impl(src: str, dest: str):
             print(f"      ✅ Transfer complete: {size_mb:.0f} MB in {elapsed:.0f}s ({speed:.1f} MB/s)")
         
         os.remove(src)
-        return file_size
     except Exception as e:
         # If copy failed, clean up partial destination and re-raise
         if os.path.exists(dest):
@@ -4272,13 +3916,11 @@ def handle_file_processing(file_path, source="generic"):
             base, sub_ext = os.path.splitext(final_dest)
             final_dest = f"{base}.{_normalize_sub_lang(lang)}{sub_ext}"
 
-        if _drive_path_exists(final_dest):
+        if os.path.exists(final_dest):
             # Subtitles are cheap and re-downloading them is an explicit user action - refresh.
             # Anything else: keep the existing Drive copy, consistent with duplicate skipping.
             if ext in KEEP_EXTENSIONS:
-                # Guarded: an API-uploaded file counts as present before the mount can see
-                # it, and the uploader clears same-named files server-side anyway.
-                if os.path.exists(final_dest): os.remove(final_dest)
+                os.remove(final_dest)
             else:
                 size_mb = os.path.getsize(file_path) / (1024 * 1024)
                 print(f"   ⏭️  Already in Drive (kept existing): {os.path.basename(final_dest)}")
@@ -4286,7 +3928,7 @@ def handle_file_processing(file_path, source="generic"):
                 log_download(os.path.basename(final_dest), source, size_mb, final_dest, status="skipped")
                 return
 
-        _ensure_dest_dir(os.path.dirname(final_dest))
+        if not os.path.exists(os.path.dirname(final_dest)): os.makedirs(os.path.dirname(final_dest))
         size_mb = os.path.getsize(file_path) / (1024 * 1024)
 
         # Auto-extract embedded subs while the video is still on fast local disk —
@@ -4321,10 +3963,7 @@ def handle_file_processing(file_path, source="generic"):
     archive_gb = os.path.getsize(file_path) / (1024 ** 3)
     if not _wait_for_disk_space(archive_gb + DISK_FLOOR_GB, label=f"extracting {filename[:40]}"):
         raise OSError(f"Not enough local disk space to extract {filename} (archive kept for Retry)")
-    # Per-archive temp dir. This used to be one shared path that was rmtree'd on entry,
-    # so two archives extracting at once (the download pool runs several workers) deleted
-    # each other's files mid-extraction and silently lost one of them.
-    extract_temp = os.path.join(COLAB_ROOT, f"temp_extract_{uuid4().hex[:8]}")
+    extract_temp = f"{COLAB_ROOT}temp_extract"
     if os.path.exists(extract_temp): shutil.rmtree(extract_temp)
     os.makedirs(extract_temp)
 
@@ -4396,12 +4035,12 @@ def handle_file_processing(file_path, source="generic"):
             base, sub_ext = os.path.splitext(final_dest)
             final_dest = f"{base}.{_normalize_sub_lang(lang)}{sub_ext}"
 
-        if _drive_path_exists(final_dest):
+        if os.path.exists(final_dest):
             print(f"      -> ⚠️ Duplicate in Drive (kept existing): {os.path.basename(final_dest)}")
             os.remove(extracted_full)
             continue
 
-        _ensure_dest_dir(os.path.dirname(final_dest))
+        if not os.path.exists(os.path.dirname(final_dest)): os.makedirs(os.path.dirname(final_dest))
         size_mb = os.path.getsize(extracted_full) / (1024 * 1024)
         move_with_progress(extracted_full, final_dest)
         print(f"      [{idx}/{total_files}] -> {os.path.basename(final_dest)}")
@@ -6002,15 +5641,9 @@ def download_worker(task: DownloadTask, gofile_token: str, move_queue: Optional[
 def _drive_mover(move_queue: queue.Queue, save_progress):
     """Consume (task, file_path) items from the download pool and move each file to Drive.
 
-    Several of these run at once (drive_movers_slider). With the Drive API path these
-    threads do the uploading themselves, so their count sets real upload concurrency —
-    unlike a write to the FUSE mount, which only fills a local cache that drivefs's
-    own single background uploader then drains (adding writers there measurably bought
-    nothing). The download pool's size is dictated by debrid concurrency limits, so
-    mover count has to scale separately from it.
-
-    Each thread consumes exactly one None sentinel and exits; the shutdown path
-    puts one per thread."""
+    Runs as a single thread by design: Drive FUSE writes never compete with each
+    other, while the pool keeps every slot on actual downloads. A None item is
+    the shutdown sentinel."""
     while True:
         item = move_queue.get()
         if item is None:
@@ -6482,26 +6115,16 @@ def _run_download_pipeline(
     # --- PARALLEL DOWNLOADS ---
     if parallel_tasks:
         total_parallel = len(parallel_tasks)
-        _reset_drive_xfer_stats()  # Per-batch, so the summary compares like with like
         move_queue = None
-        mover_threads = []
+        mover_thread = None
         if async_moves_checkbox.value:
-            # Overlap mode: workers hand finished files to the mover pool and immediately
-            # start the next download. Mover count is deliberately independent of
-            # max_workers: the download pool is sized by the debrid plan's concurrent
-            # slots (3 on the TorBox entry tier), which has nothing to do with how many
-            # uploads Drive will take. Measured at 3 concurrent API uploads: ~45 MB/s
-            # each, i.e. per-stream throughput holds as streams are added, so this is
-            # where the batch time actually comes from.
-            # Local-disk cost is (movers + MOVE_QUEUE_DEPTH) finished files waiting in
-            # /content; the disk guard still pauses downloads if that runs the disk down.
-            mover_count = max(1, int(drive_movers_slider.value))
-            move_queue = queue.Queue(maxsize=MOVE_QUEUE_DEPTH)
-            for _ in range(mover_count):
-                _mt = threading.Thread(target=_drive_mover, args=(move_queue, save_progress), daemon=True)
-                _mt.start()
-                mover_threads.append(_mt)
-            print(f"⚡ Starting {total_parallel} parallel downloads (max {max_workers} concurrent, {mover_count} Drive mover(s) overlapped)...")
+            # Overlap mode: workers hand finished files to a dedicated mover thread and
+            # start the next download immediately. maxsize caps how many finished files
+            # can pile up on Colab's local disk while the (slower) Drive moves catch up.
+            move_queue = queue.Queue(maxsize=3)
+            mover_thread = threading.Thread(target=_drive_mover, args=(move_queue, save_progress), daemon=True)
+            mover_thread.start()
+            print(f"⚡ Starting {total_parallel} parallel downloads (max {max_workers} concurrent, Drive moves overlapped)...")
         else:
             print(f"⚡ Starting {total_parallel} parallel downloads (max {max_workers} concurrent)...")
 
@@ -6537,7 +6160,7 @@ def _run_download_pipeline(
                     # Workers see the dead process + cancel flag and return promptly.
                     print("\n🛑 Interrupt received — stopping active downloads (progress is saved)...")
                     stop_active_downloads()
-            if mover_threads:
+            if mover_thread is not None:
                 if _cancel_requested:
                     # Don't sit through queued multi-GB moves after an interrupt. The local
                     # files survive in /content, so Retry re-moves them without re-downloading.
@@ -6554,19 +6177,15 @@ def _run_download_pipeline(
                     if skipped_moves:
                         print(f"   📤 {skipped_moves} queued move(s) skipped — Retry re-moves them without re-downloading")
                     if move_queue.unfinished_tasks:
-                        print("   ⏳ Waiting for in-flight Drive upload(s) to finish...")
+                        print("   ⏳ Waiting for the in-flight Drive move to finish...")
                 elif move_queue.unfinished_tasks:
-                    print("📤 Downloads finished — waiting for remaining Drive uploads...")
-                # One sentinel per mover: each thread consumes exactly one and exits, so a
-                # single None would strand every other mover blocked on get() forever.
-                for _ in mover_threads:
-                    move_queue.put(None)
+                    print("📤 Downloads finished — waiting for remaining Drive moves...")
+                move_queue.put(None)  # Shutdown sentinel — mover exits once the queue drains
                 try:
-                    for _mt in mover_threads:
-                        _mt.join()
+                    mover_thread.join()
                 except KeyboardInterrupt:
-                    # Second interrupt: stop waiting. The daemon movers finish their current
-                    # file; anything they never reach stays "moving", which resume retries.
+                    # Second interrupt: stop waiting. The daemon mover finishes its current
+                    # file; anything it never reaches stays "moving", which resume retries.
                     print("\n🛑 Interrupt — not waiting for Drive moves; unfinished items can be retried")
         finally:
             stop_monitor = True
@@ -6575,8 +6194,6 @@ def _run_download_pipeline(
         update_progress_display(parallel_tasks)
         _clear_per_task_bars()  # Clean up before sequential phase
         print(f"✅ Parallel downloads complete!")
-        _xfer = _drive_xfer_summary()
-        if _xfer: print(_xfer)
     
     # --- SEQUENTIAL DOWNLOADS ---
     yt_success = 0
