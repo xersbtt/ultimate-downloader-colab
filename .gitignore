@@ -66,6 +66,8 @@ ui_designer.html
 
 # Test and debug files (local only)
 test_*.py
+!test_tmdb_anime_classification.py
+!test_queue_editing.py
 test_*.txt
 debug_*.py
 

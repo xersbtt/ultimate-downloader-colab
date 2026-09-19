@@ -4,7 +4,28 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 
 ---
 
-## v6.8 (Latest)
+## v6.9 (Latest)
+**Theme: Queue Editing, Automatic Anime Routing & Reliable TorBox Batches**
+
+### ✨ New Features
+- **Apply queue edits together**: fill in Match, Name/Year, Season, Episode and Part fields, then click **Apply Changes** once. Blank fields keep their current values, and validation failures leave the entire edit pending. A year requires a name; leaving the year blank preserves its existing override. Episode ranges and video/subtitle pairing work the same as the individual controls; selected files must have resolved filenames before episode or part changes can be applied. Routing and clearing overrides still use their separate buttons, and a hidden Match field is ignored when TMDB matching is disabled.
+- **TMDB automatically separates anime from live action**: matched titles now route to `Anime Series` or `Anime Movies` when TMDB lists the Animation genre plus Japanese language, origin/production country, or an exact `anime` / `japanese animation` keyword. Japanese live action and animation without those signals stay in the standard libraries; 🎯 Route as remains authoritative and ✏️ Force Name keeps the detected library. Older cached matches and saved manual matches refresh by TMDB ID to gain the classification while retaining their existing identity if the request fails. Failed or incomplete classification lookups remain eligible for a later retry; successful detail lookups are reused within the runtime.
+
+### 🔧 Improvements
+- **Cleaner TorBox folder queues**: TorBox share links (including JDownloader folder links) now omit audio files, images, and files with a standalone `sample` marker whose reported size is greater than zero and below 100 MiB. Subtitle files are exempt from this new filter.
+- **Regression coverage**: added 37 automated tests for queue editing and selection, TMDB anime classification, cache refresh, saved matches, and destination routing. These two test modules are explicitly allowed by `.gitignore` so they can be kept with the project.
+
+### 🐛 Bug Fixes
+- **Queue corrections keep the selected files selected**: applying or clearing a match, name, season, episode, part or route no longer selects the whole queue again. New queues still start with all files selected; removing files leaves the remaining rows unselected.
+- **Clean shutdown when interrupting rate-limited Drive uploads**: mover and inline download workers now handle upload cancellation, mark interrupted tasks as failed for Retry, and preserve local files. Movers skip queued uploads after Stop and consume their shutdown sentinels instead of exiting with uncaught `KeyboardInterrupt` tracebacks.
+- **Faster, progress-aware recovery from download throttling**: after an HTTP 429, aria2 resumes with one connection and one split, using 5/10/20/30-second cooldowns instead of 30/60/90/120 seconds. Advances in aria2's reported downloaded bytes reset the four-cooldown allowance, including progress hidden by a rounded 99% display. Throttling is detected anywhere in the attempt's output rather than only its last error line, so a later message cannot hide the 429 and trigger an unnecessary fresh-link request. During cooldown the reported speed resets to zero, and directly managed progress bars show the retry delay. This transfer cooldown is separate from TorBox's shared link-request cooldown below.
+- **Small subtitles with uppercase extensions are retained**: the under-1-MB filter for Real-Debrid and TorBox torrent-file tasks now checks subtitle extensions without regard to case, so files such as `Show.EN.SRT` are no longer discarded.
+- **More robust TMDB cache handling**: non-dictionary cache contents and invalid entry types are discarded safely. The 500-query limit now excludes and preserves the cache-version marker, preventing cache trimming from accidentally making the next session treat the cache as an older version and discard cached misses.
+- **TorBox folders over 100 files no longer lose parallel downloading after the first throttle**: cached TorBox files previously had every direct URL requested before any download began. Once `requestdl` returned 429 — observed at file 101 in a 153-file folder — that file and the entire remainder were moved to the one-by-one flow, which did not start until all already-resolved files had finished. Cached files now enter the normal parallel queue unresolved: each worker requests a fresh link only when its download slot opens, so later files keep parallel throughput and no large pile of time-limited URLs sits around expiring before use. Link requests from every worker and TorBox flow pass through one shared one-per-second gate, preventing just-in-time workers from replacing the old prefetch burst with simultaneous API calls; a 429 also opens a shared cooldown (60 seconds when TorBox sends no `Retry-After`) so waiting workers do not re-hammer the endpoint independently. Uncached torrents still use the existing sequential cache-wait path until TorBox reports them ready
+
+---
+
+## v6.8
 **Theme: Fast, Verified Drive Transfers**
 
 ### ✨ New Features

@@ -102,10 +102,7 @@ TORBOX_API_BASE = "https://api.torbox.app/v1/api"  # TorBox API base URL
 TMDB_API_BASE = "https://api.themoviedb.org/3"  # TMDB v3 API (metadata matching)
 TMDB_MATCH_THRESHOLD = 0.60  # Minimum title similarity to accept a search result
 TMDB_QUERY_CACHE_MAX = 500   # Persistent query cache cap (oldest dropped first)
-TMDB_CACHE_VERSION = 2       # Search-algorithm version; schema freshness is checked per match
-TMDB_METADATA_VERSION = 1    # Normalized-match schema (includes library classification)
-TMDB_ANIMATION_GENRE_ID = 16
-TMDB_ANIME_KEYWORDS = {'anime', 'japanese animation'}
+TMDB_CACHE_VERSION = 2       # Bump when matching gets smarter so cached misses are retried
 TMDB_CLEARED = {'cleared': True}  # DownloadTask.tmdb_override value meaning "force regex, no TMDB"
 
 # Known resolution values (for filename parsing)
@@ -243,19 +240,8 @@ DISK_WAIT_STALL_SECS = 600  # Give up when space stops improving and nothing can
 # so a "slot" meters transfers, not TCP connections. Don't tighten below this
 # without evidence; the old 16-connection default was the actual fault.
 RATE_LIMITED_HOSTS = ('torbox.app', 'tb-cdn.io')
-THROTTLE_BACKOFF_SECS = 5   # Start with a short probe after a transfer is throttled
-THROTTLE_MAX_BACKOFF_SECS = 30
-MAX_THROTTLE_WAITS = 4      # Consecutive 429 waits without download progress
-
-# requestdl pacing is shared by every TorBox flow and worker. Just-in-time link
-# resolution must not mean that all available workers hit the API simultaneously;
-# one request per second keeps the whole runtime at or below 60/minute. A 429
-# without Retry-After opens a shared cooldown so other workers wait too instead
-# of independently retrying and extending the throttle.
-TB_REQUESTDL_MIN_INTERVAL_SECS = 1.0
-TB_REQUESTDL_429_COOLDOWN_SECS = 60.0
-_tb_requestdl_rate_lock = Lock()
-_tb_requestdl_next_at = 0.0
+THROTTLE_BACKOFF_SECS = 30  # Cool-off after a 429 (multiplied by the wait count)
+MAX_THROTTLE_WAITS = 4      # 429 cool-offs allowed before a download really fails
 
 _disk_guard_lock = Lock()
 _moves_in_flight = 0        # Drive transfers currently copying — each frees local space when done
@@ -444,7 +430,7 @@ def stop_keep_alive():
 # --- UI ELEMENTS ---
 token_gf = widgets.Text(description='Gofile:', placeholder='Optional', value=get_colab_secret('GOFILE_TOKEN'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
 token_tmdb = widgets.Text(description='TMDB:', placeholder='API Key (optional)', value=get_colab_secret('TMDB_API_KEY'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
-tmdb_enabled_checkbox = widgets.Checkbox(value=True, description='TMDB matching', tooltip='Match filenames for canonical names, years, anime library routing, and season mapping', indent=False, layout=widgets.Layout(width='150px'))
+tmdb_enabled_checkbox = widgets.Checkbox(value=True, description='TMDB matching', tooltip='Match filenames against TMDB for canonical names, years, and season mapping', indent=False, layout=widgets.Layout(width='150px'))
 token_rd = widgets.Text(description='RD Token:', placeholder='Real-Debrid API Key', value=get_colab_secret('RD_TOKEN'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
 token_tb = widgets.Text(description='TB Token:', placeholder='TorBox API Key', value=get_colab_secret('TB_TOKEN'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
 # Debrid sits second in its row, after the 280px auto-organise checkbox — the same slot
@@ -796,7 +782,7 @@ about_ui = widgets.VBox([
     widgets.HTML("""
         <div style='padding: 10px;'>
             <h3>ℹ️ About Ultimate Downloader</h3>
-            <p><strong>Version:</strong> 6.9</p>
+            <p><strong>Version:</strong> 6.8</p>
             <p><strong>Author:</strong> xersbtt</p>
             <p><strong>Repository:</strong> <a href='https://github.com/xersbtt/ultimate-downloader-colab' target='_blank'>github.com/xersbtt/ultimate-downloader-colab</a></p>
             <hr>
@@ -1058,7 +1044,7 @@ queue_controls = widgets.HBox([
 queue_options = widgets.HBox([subtitle_langs])  # Uses description for alignment like queue_list
 
 # Manual identity correction: a TMDB match (automatic canonical name/year) or a
-# forced Name/Year (its manual counterpart, which wins for naming). The TMDB group
+# forced Name/Year (its manual counterpart, which wins over a match). The TMDB group
 # shows only when TMDB matching is enabled; the whole row only when auto-organise is
 # on — identity only matters when files are renamed and routed.
 tmdb_override_input = widgets.Text(placeholder='TMDB URL, tv:12345 / movie:12345, or a title to search', layout=widgets.Layout(width='300px'))
@@ -1068,7 +1054,7 @@ tmdb_group = widgets.HBox([
     widgets.HTML("<div style='text-align:right; padding-right:8px'><small><b>🎬 Fix Match:</b></small></div>", layout=widgets.Layout(width='115px')),
     tmdb_override_input, btn_tmdb_match, btn_tmdb_clear
 ])
-queue_name_input = widgets.Text(placeholder='Name (forces folder/file name)', tooltip='Manual show/movie name — wins over TMDB naming while retaining its automatic library classification', layout=widgets.Layout(width='220px'))
+queue_name_input = widgets.Text(placeholder='Name (forces folder/file name)', tooltip='Manual show/movie name for the selected queue item(s) — wins over the TMDB match', layout=widgets.Layout(width='220px'))
 queue_year_input = widgets.Text(placeholder='Year', tooltip='Optional year for the folder name (e.g. 2025)', layout=widgets.Layout(width='70px'))
 btn_name_apply = widgets.Button(description='Set Name', button_style='info', tooltip='Force this name/year for the selected queue item(s)', layout=widgets.Layout(width='100px'))
 btn_name_clear = widgets.Button(description='✖ Clear Name', button_style='', tooltip='Remove the forced name — use TMDB/filename detection again', layout=widgets.Layout(width='120px'))
@@ -1115,16 +1101,6 @@ season_override_row = widgets.HBox([
     part_override_input, btn_part_apply, btn_part_remove
 ], layout=widgets.Layout(flex_flow='row wrap'))
 
-btn_queue_apply_changes = widgets.Button(
-    description='Apply Changes', button_style='primary', icon='check',
-    tooltip='Apply all filled text fields to the selected files together; blank fields stay unchanged',
-    layout=widgets.Layout(width='150px'))
-queue_edit_actions = widgets.HBox([
-    btn_queue_apply_changes,
-    widgets.HTML('<small>Apply filled Match, Name/Year, Season, Episode and Part fields together. '
-                 'Blanks stay unchanged. Use Apply Route for routing.</small>'),
-], layout=widgets.Layout(flex_flow='row wrap', align_items='center'))
-
 # Playlist range selector (shown only for YouTube playlists)
 playlist_options = widgets.HBox([
     widgets.HTML("<div style='text-align:right; padding-right:8px'><small><b>🎯 Playlist Range:</b></small></div>", layout=widgets.Layout(width='115px')),
@@ -1136,7 +1112,6 @@ queue_ui = widgets.VBox([
     identity_row,
     route_row,
     season_override_row,
-    queue_edit_actions,
     playlist_options,
     queue_options,
     queue_controls
@@ -1144,7 +1119,7 @@ queue_ui = widgets.VBox([
 
 
 input_ui = widgets.VBox([
-    widgets.HTML("<h3>🚀 Ultimate Downloader v6.9</h3>"),
+    widgets.HTML("<h3>🚀 Ultimate Downloader v6.8</h3>"),
     widgets.HBox([auto_organize_checkbox, debrid_service_toggle]),
     widgets.HBox([concurrent_slider, auto_retry_input]),
     text_area,
@@ -1202,7 +1177,7 @@ def save_session(
         return
     try:
         session = {
-            "version": "6.9",
+            "version": "6.8",
             "started_at": datetime.now().isoformat(),
             "playlist_range": playlist_range,
             "yt_success": yt_success,
@@ -1486,12 +1461,12 @@ def _queue_dest_preview(task) -> Optional[str]:
         return None  # a preview glitch must never break the queue display
 
 
-def update_queue_display(preserve_selection: bool = True):
+def update_queue_display(preserve_selection: bool = False):
     """Update the queue list widget with current pending_queue. Each row carries a
     live destination preview (where the file will go and its final name), recomputed
     from the current settings, TMDB matches, and forced seasons. preserve_selection
-    keeps the current row selection across edits and live settings refreshes.
-    Only a newly loaded queue explicitly selects everything."""
+    keeps the current row selection across the refresh (used by the live settings
+    observers); the default reselects everything, as at queue creation."""
     selected = set(_selected_queue_indices()) if preserve_selection else None
     options = []
 
@@ -1553,7 +1528,6 @@ def _on_dest_setting_change(change):
         identity_row.layout.display = _org
         route_row.layout.display = _org
         season_override_row.layout.display = _org
-        queue_edit_actions.layout.display = _org
         update_queue_display(preserve_selection=True)
     except Exception:
         pass  # never let a preview refresh break a settings change
@@ -1583,7 +1557,7 @@ def show_queue_preview(tasks: List[DownloadTask], mode: str):
             print(f"   🎬 TMDB matched {tmdb_matched} of {len(filenames)} file(s)")
     _apply_queue_overrides(pending_queue)  # independent of TMDB — works either way
 
-    update_queue_display(preserve_selection=False)
+    update_queue_display()
 
     # Hide subtitle and playlist options initially to prevent flash of old content
     queue_options.layout.display = 'none'
@@ -1595,7 +1569,6 @@ def show_queue_preview(tasks: List[DownloadTask], mode: str):
     identity_row.layout.display = _org
     route_row.layout.display = _org
     season_override_row.layout.display = _org
-    queue_edit_actions.layout.display = _org
     queue_ui.layout.display = 'block'
     
     # Check for YouTube/streaming links
@@ -1730,7 +1703,6 @@ def queue_remove_selected(b=None):
         return
     indices_to_remove = {int(s.split('.')[0]) - 1 for s in selected}
     pending_queue = [t for i, t in enumerate(pending_queue) if i not in indices_to_remove]
-    queue_list.value = ()  # Removed rows must not select the files taking their places.
     update_queue_display()
     if not pending_queue:
         hide_queue()
@@ -2097,11 +2069,10 @@ def get_batch_episode(filename: str) -> Optional[int]:
 
 # --- TMDB METADATA MATCHING ---
 # Batch-time lookups against TMDB refine the regex-based filename detection:
-# canonical names, years, anime-library classification, and absolute-episode →
-# season mapping. Everything degrades to the regex behaviour when unavailable.
+# canonical show names, years, and absolute-episode → season mapping. Everything
+# here degrades silently to the regex behaviour when disabled or unreachable.
 _tmdb_match_cache: Dict[str, dict] = {}  # stripped filename -> match dict (per batch)
 _tmdb_query_cache: Dict[str, Optional[dict]] = {}  # "kind|query|year" -> match/None (persistent)
-_tmdb_details_cache: Dict[Tuple[str, str], dict] = {}  # (kind, id) -> full details (per runtime)
 _tmdb_query_cache_loaded = False
 
 def tmdb_is_enabled() -> bool:
@@ -2122,109 +2093,6 @@ def _tmdb_get(path: str, params: dict) -> Optional[dict]:
 def _tmdb_similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a.casefold().strip(), b.casefold().strip()).ratio()
 
-
-def _tmdb_genre_ids(result: dict) -> set:
-    """Genre IDs from either a search result (genre_ids) or details payload
-    (genres). Invalid community-entered values are ignored defensively."""
-    ids = set()
-    for value in result.get('genre_ids') or []:
-        try:
-            ids.add(int(value))
-        except (TypeError, ValueError):
-            pass
-    for genre in result.get('genres') or []:
-        value = genre.get('id') if isinstance(genre, dict) else genre
-        try:
-            ids.add(int(value))
-        except (TypeError, ValueError):
-            pass
-    return ids
-
-
-def _tmdb_country_codes(result: dict) -> set:
-    """ISO country codes from TV origin_country or movie production_countries."""
-    codes = set()
-    for value in result.get('origin_country') or []:
-        if isinstance(value, str) and value:
-            codes.add(value.upper())
-    for country in result.get('production_countries') or []:
-        value = country.get('iso_3166_1') if isinstance(country, dict) else country
-        if isinstance(value, str) and value:
-            codes.add(value.upper())
-    return codes
-
-
-def _tmdb_keyword_names(result: dict) -> set:
-    """Keyword names from an append_to_response=keywords movie/TV payload."""
-    payload = result.get('keywords')
-    if isinstance(payload, dict):
-        entries = payload.get('keywords') or payload.get('results') or []
-    elif isinstance(payload, list):
-        entries = payload
-    else:
-        entries = []
-    return {
-        str(entry.get('name', '')).casefold().strip()
-        for entry in entries if isinstance(entry, dict) and entry.get('name')
-    }
-
-
-def classify_tmdb_library(result: dict) -> dict:
-    """Classify a TMDB payload independently of its movie/TV type.
-
-    TMDB has no native anime media type. Use a conservative intersection instead:
-    Animation plus Japanese language/origin (or an explicit anime keyword). This
-    avoids treating Japanese live action or all Western animation as anime. Missing
-    genre metadata is unknown and routes through the existing standard fallback.
-    """
-    has_genres = 'genre_ids' in result or 'genres' in result
-    genre_ids = _tmdb_genre_ids(result)
-    if not has_genres:
-        return {'library_class': 'unknown', 'is_anime': False, 'anime_evidence': []}
-    if TMDB_ANIMATION_GENRE_ID not in genre_ids:
-        return {'library_class': 'standard', 'is_anime': False, 'anime_evidence': []}
-
-    evidence = ['genre:animation']
-    language = str(result.get('original_language') or '').casefold()
-    countries = _tmdb_country_codes(result)
-    anime_keywords = _tmdb_keyword_names(result) & TMDB_ANIME_KEYWORDS
-    if language == 'ja':
-        evidence.append('language:ja')
-    if 'JP' in countries:
-        evidence.append('country:JP')
-    if anime_keywords:
-        evidence.append(f"keyword:{sorted(anime_keywords)[0]}")
-
-    is_anime = len(evidence) > 1
-    return {
-        'library_class': 'anime' if is_anime else 'standard',
-        'is_anime': is_anime,
-        'anime_evidence': evidence,
-    }
-
-
-def resolve_library_is_anime(route_override: Optional[str], tmdb_match: Optional[dict],
-                             effective_kind: str) -> bool:
-    """Resolve library family with explicit per-file routes taking precedence."""
-    if route_override in ('anime_series', 'anime_movie'):
-        return True
-    if route_override in ('tv', 'movie', 'downloads'):
-        return False
-    if not tmdb_match or tmdb_match.get('type') != effective_kind:
-        return False
-    return tmdb_match.get('library_class') == 'anime'
-
-
-def _tmdb_match_is_current(match) -> bool:
-    """Whether a persisted normalized match has the current classifier schema."""
-    return (
-        isinstance(match, dict)
-        and match.get('metadata_version') == TMDB_METADATA_VERSION
-        and match.get('library_class') in ('anime', 'standard')
-        and isinstance(match.get('is_anime'), bool)
-    )
-
-
 def _load_tmdb_query_cache():
     global _tmdb_query_cache, _tmdb_query_cache_loaded
     if _tmdb_query_cache_loaded:
@@ -2236,33 +2104,18 @@ def _load_tmdb_query_cache():
                 _tmdb_query_cache = json.load(f)
     except Exception:
         _tmdb_query_cache = {}  # Corrupt/unreadable cache — start fresh
-    if not isinstance(_tmdb_query_cache, dict):
-        _tmdb_query_cache = {}
-
-    old_version = _tmdb_query_cache.get('__version__')
-    cleaned = {}
-    for key, value in _tmdb_query_cache.items():
-        if key == '__version__':
-            continue
-        if value is None:
-            # A matching-algorithm version change may turn an old miss into a hit.
-            if old_version == TMDB_CACHE_VERSION:
-                cleaned[key] = None
-        elif isinstance(value, dict):
-            cleaned[key] = value
-        # Keep legacy successes for their still-useful canonical identity. A cache
-        # hit lazily refreshes them by ID; if TMDB is temporarily unavailable the
-        # old naming still works and classification safely falls back to standard.
-    cleaned['__version__'] = TMDB_CACHE_VERSION
-    _tmdb_query_cache = cleaned
+    if _tmdb_query_cache.get('__version__') != TMDB_CACHE_VERSION:
+        # Search got smarter since this cache was written — cached misses (None)
+        # may match now, so drop them; successful matches stay valid.
+        _tmdb_query_cache = {k: v for k, v in _tmdb_query_cache.items()
+                             if v is not None and k != '__version__'}
+        _tmdb_query_cache['__version__'] = TMDB_CACHE_VERSION
 
 def _save_tmdb_query_cache():
     try:
-        query_keys = [k for k in _tmdb_query_cache if k != '__version__']
-        if len(query_keys) > TMDB_QUERY_CACHE_MAX:
-            for k in query_keys[:len(query_keys) - TMDB_QUERY_CACHE_MAX]:
+        if len(_tmdb_query_cache) > TMDB_QUERY_CACHE_MAX:
+            for k in list(_tmdb_query_cache)[:len(_tmdb_query_cache) - TMDB_QUERY_CACHE_MAX]:
                 del _tmdb_query_cache[k]
-        _tmdb_query_cache['__version__'] = TMDB_CACHE_VERSION
         with open(TMDB_CACHE_FILE, 'w') as f:
             json.dump(_tmdb_query_cache, f)
     except Exception:
@@ -2276,19 +2129,17 @@ def _tmdb_alt_titles(kind: str, tmdb_id: int) -> List[str]:
     entries = data.get('results') or data.get('titles') or []  # tv uses 'results', movie 'titles'
     return [e.get('title', '') for e in entries if e.get('title')]
 
-def _tmdb_fetch_details(kind: str, tmdb_id) -> Optional[dict]:
-    """Fetch full metadata plus keywords, memoizing successful responses.
-
-    Failures are deliberately not cached so fixing an API key or a transient TMDB
-    outage can recover without restarting the runtime.
-    """
-    key = (kind, str(tmdb_id))
-    if key in _tmdb_details_cache:
-        return _tmdb_details_cache[key]
-    data = _tmdb_get(f"/{kind}/{tmdb_id}", {'append_to_response': 'keywords'})
-    if data:
-        _tmdb_details_cache[key] = data
-    return data
+def _tmdb_fetch_tv_seasons(tv_id: int) -> Dict[str, int]:
+    """{season_number(str): episode_count}, specials (season 0) excluded.
+    Keys are strings because the dict round-trips through the JSON cache."""
+    data = _tmdb_get(f"/tv/{tv_id}", {})
+    seasons = {}
+    for s in (data or {}).get('seasons', []):
+        num = s.get('season_number', 0)
+        count = s.get('episode_count', 0)
+        if num > 0 and count > 0:
+            seasons[str(num)] = count
+    return seasons
 
 def _tmdb_search(kind: str, query: str, year: Optional[str]) -> Optional[dict]:
     """Search TMDB ('tv' or 'movie') with a similarity gate. Uses the persistent
@@ -2296,16 +2147,7 @@ def _tmdb_search(kind: str, query: str, year: Optional[str]) -> Optional[dict]:
     _load_tmdb_query_cache()
     cache_key = f"{kind}|{query.casefold()}|{year or ''}"
     if cache_key in _tmdb_query_cache:
-        cached = _tmdb_query_cache[cache_key]
-        if cached is not None and not _tmdb_match_is_current(cached):
-            cached_kind = cached.get('type') if isinstance(cached, dict) else None
-            cached_id = cached.get('id') if isinstance(cached, dict) else None
-            if cached_kind in ('tv', 'movie') and cached_id is not None:
-                refreshed = _tmdb_fetch_by_id(cached_kind, cached_id)
-                if refreshed:
-                    _tmdb_query_cache[cache_key] = refreshed
-                    cached = refreshed
-        return cached
+        return _tmdb_query_cache[cache_key]
 
     # Attempt tiers, most specific first. Filename years are often wrong (encode
     # year, not release year), and a year left inside the query text ("True
@@ -2351,60 +2193,31 @@ def _tmdb_search(kind: str, query: str, year: Optional[str]) -> Optional[dict]:
 
 def _tmdb_normalize(kind: str, result: dict) -> dict:
     """Normalize a TMDB tv/movie result (from search or a /{kind}/{id} fetch) to the
-    match dict used everywhere. Full TV details supply season counts; full movie
-    details are fetched only when an animated search result needs country/keyword
-    evidence that the compact search payload does not contain."""
-    payload = dict(result)
-    preliminary = classify_tmdb_library(payload)
-    genre_ids = _tmdb_genre_ids(payload)
-    classification_details_needed = not ('genre_ids' in payload or 'genres' in payload)
-    if (kind == 'movie' and TMDB_ANIMATION_GENRE_ID in genre_ids
-            and preliminary['library_class'] != 'anime'
-            and 'production_countries' not in payload and 'keywords' not in payload):
-        classification_details_needed = True
-    needs_details = classification_details_needed or (kind == 'tv' and 'seasons' not in payload)
-    details_loaded = False
-    if needs_details:
-        details = _tmdb_fetch_details(kind, result['id'])
-        if details:
-            payload.update(details)
-            details_loaded = True
-
-    name = payload.get('name') or payload.get('title') or ''
-    date = payload.get('first_air_date') or payload.get('release_date') or ''
-    genre_ids = _tmdb_genre_ids(payload)
-    countries = _tmdb_country_codes(payload)
-    classification = classify_tmdb_library(payload)
-    classification_complete = (
-        (not classification_details_needed or details_loaded)
-        and classification['library_class'] != 'unknown'
-    )
+    match dict used everywhere: {type, id, name, year[, seasons]}. A full /tv/{id}
+    response already carries 'seasons'; search results don't, so those are fetched."""
+    name = result.get('name') or result.get('title') or ''
+    date = result.get('first_air_date') or result.get('release_date') or ''
     normalized = {
         'type': kind,
-        'id': payload['id'],
+        'id': result['id'],
         'name': sanitize_filename(name) or 'Unknown',
         'year': date[:4] if date else '',
-        'genre_ids': sorted(genre_ids),
-        'original_language': str(payload.get('original_language') or '').casefold(),
-        'origin_countries': sorted(countries),
-        # An incomplete classifier result remains stale so a later cache hit retries
-        # the details request instead of persisting a transient failure forever.
-        'metadata_version': TMDB_METADATA_VERSION if classification_complete else 0,
-        **classification,
     }
     if kind == 'tv':
-        seasons = {}
-        for season in payload.get('seasons', []):
-            num = season.get('season_number', 0)
-            count = season.get('episode_count', 0)
-            if num > 0 and count > 0:
-                seasons[str(num)] = count
-        normalized['seasons'] = seasons
+        if 'seasons' in result:
+            seasons = {}
+            for s in result.get('seasons', []):
+                num, count = s.get('season_number', 0), s.get('episode_count', 0)
+                if num > 0 and count > 0:
+                    seasons[str(num)] = count
+            normalized['seasons'] = seasons
+        else:
+            normalized['seasons'] = _tmdb_fetch_tv_seasons(result['id'])
     return normalized
 
 def _tmdb_fetch_by_id(kind: str, tmdb_id) -> Optional[dict]:
     """Fetch a specific tv/movie by TMDB id and normalize it (None if not found)."""
-    data = _tmdb_fetch_details(kind, tmdb_id)
+    data = _tmdb_get(f"/{kind}/{tmdb_id}", {})
     if not data or 'id' not in data:
         return None
     return _tmdb_normalize(kind, data)
@@ -2432,9 +2245,7 @@ def _resolve_tmdb_override(text: str) -> Optional[dict]:
 def _apply_tmdb_overrides(tasks: List[DownloadTask]):
     """Write each task's manual TMDB override into the match cache, overriding any
     auto-match. Called after analyze_batch_metadata at every entry point so manual
-    corrections survive Quick Download and resume. Legacy saved overrides are
-    rehydrated once per TMDB ID so they gain the current library classification."""
-    upgraded = {}
+    corrections survive Quick Download and resume."""
     for t in tasks:
         ov = getattr(t, 'tmdb_override', None)
         if ov is None or not t.filename:
@@ -2443,14 +2254,6 @@ def _apply_tmdb_overrides(tasks: List[DownloadTask]):
         if ov == TMDB_CLEARED:
             _tmdb_match_cache.pop(key, None)  # force regex fallback
         else:
-            if not _tmdb_match_is_current(ov):
-                ref = (ov.get('type'), ov.get('id')) if isinstance(ov, dict) else (None, None)
-                if ref[0] in ('tv', 'movie') and ref[1] is not None:
-                    if ref not in upgraded:
-                        upgraded[ref] = _tmdb_fetch_by_id(*ref)
-                    if upgraded[ref]:
-                        ov = upgraded[ref]
-                        t.tmdb_override = ov
             _tmdb_match_cache[key] = ov
 
 def _selected_queue_indices() -> List[int]:
@@ -2643,35 +2446,6 @@ def _number_rows_sequentially(rows: List[DownloadTask], start: int) -> Dict[str,
         numbers[task.id] = assigned[pair]
     return numbers
 
-def _parse_episode_range(text):
-    """Validate an episode number or span before changing any selected tasks."""
-    match = re.fullmatch(r'(\d{1,4})(?:\s*[-~–—]\s*(\d{1,4}))?', text)
-    if not match:
-        raise ValueError('Enter an episode number (e.g. 7), or a range (e.g. 7-9)')
-    start = int(match.group(1))
-    end = int(match.group(2)) if match.group(2) else None
-    if end is not None and end <= start:
-        raise ValueError('The range end must be greater than the start (e.g. 7-9)')
-    return start, end
-
-
-def _set_episode_overrides(rows, start, span_end):
-    """Apply one numbering scheme, including subtitle pairing and range offsets."""
-    numbers = _number_rows_sequentially(rows, start)
-    offset = (span_end - start) if span_end is not None else 0
-    for task in rows:
-        key = _match_cache_key(task.filename)
-        if span_end is not None and numbers[task.id] == start:
-            task.episode_override, task.episode_end_override = start, span_end
-            _episode_override_cache[key], _episode_end_override_cache[key] = start, span_end
-        else:
-            task.episode_override = numbers[task.id] + offset
-            task.episode_end_override = None
-            _episode_override_cache[key] = task.episode_override
-            _episode_end_override_cache.pop(key, None)
-    return numbers
-
-
 def apply_renumber(b=None):
     """Renumber: rewrite the selected rows' episode numbers sequentially, in queue
     order, starting from the 🔢 field (default 1). A video and its subtitle share
@@ -2679,10 +2453,14 @@ def apply_renumber(b=None):
     file a multi-episode span (S01E07-E09); the rest continue as single episodes
     from the end of the range (E10, E11, …)."""
     text = renumber_start_input.value.strip() or '1'
-    try:
-        start, span_end = _parse_episode_range(text)
-    except ValueError as exc:
-        print(f"⚠️ {exc}")
+    range_m = re.fullmatch(r'(\d{1,4})(?:\s*[-~–—]\s*(\d{1,4}))?', text)
+    if not range_m:
+        print("⚠️ Enter the episode number to start from (e.g. 7), or a range for a multi-episode file (e.g. 7-9)")
+        return
+    start = int(range_m.group(1))
+    span_end = int(range_m.group(2)) if range_m.group(2) else None
+    if span_end is not None and span_end <= start:
+        print("⚠️ The range end must be greater than the start (e.g. 7-9)")
         return
     indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
     if not indices:
@@ -2690,8 +2468,20 @@ def apply_renumber(b=None):
         return
     rows = [pending_queue[i] for i in sorted(indices) if pending_queue[i].filename]
     skipped = len(indices) - len(rows)
-    numbers = _set_episode_overrides(rows, start, span_end)
+    numbers = _number_rows_sequentially(rows, start)
+    # Range mode: the first file (number == start) absorbs the whole span; later
+    # files shift past it so numbering continues from the end of the range
     offset = (span_end - start) if span_end else 0
+    for task in rows:
+        key = _match_cache_key(task.filename)
+        if span_end and numbers[task.id] == start:
+            task.episode_override, task.episode_end_override = start, span_end
+            _episode_override_cache[key], _episode_end_override_cache[key] = start, span_end
+        else:
+            task.episode_override = numbers[task.id] + offset
+            task.episode_end_override = None
+            _episode_override_cache[key] = task.episode_override
+            _episode_end_override_cache.pop(key, None)
 
     renumber_start_input.value = ""
     update_queue_display()
@@ -2846,82 +2636,6 @@ def clear_route_override(b=None):
     update_queue_display()
     print(f"✖ Cleared forced route for {len(indices)} item(s) — will detect the category again")
 
-
-
-def apply_queue_changes(b=None):
-    """Validate every filled text field, then commit one edit to the selection.
-
-    Blank fields leave existing overrides untouched. Routing and clearing retain
-    their explicit buttons, so default values never silently remove overrides.
-    """
-    rows = [pending_queue[i] for i in sorted(_selected_queue_indices())
-            if 0 <= i < len(pending_queue)]
-    if not rows:
-        print('⚠️ Select the queue item(s) to edit first')
-        return
-    inputs = {
-        'match': tmdb_override_input, 'name': queue_name_input,
-        'year': queue_year_input, 'season': season_override_input,
-        'episode': renumber_start_input, 'part': part_override_input,
-    }
-    values = {key: widget.value.strip() for key, widget in inputs.items()}
-    # A hidden TMDB input must not apply a stale draft after matching is disabled.
-    if not tmdb_enabled_checkbox.value:
-        values['match'] = ''
-    if not any(values.values()):
-        print('⚠️ Fill in the fields you want to change first')
-        return
-    updates = {}
-    try:
-        if values['name'] or values['year']:
-            name = sanitize_filename(values['name'])
-            if not name:
-                raise ValueError('Enter a name with the year')
-            if values['year'] and not re.fullmatch(r'(19|20)\d{2}', values['year']):
-                raise ValueError('Year should look like 2025 (leave it empty to keep the current year)')
-            updates['name_override'] = name
-            if values['year']:
-                updates['year_override'] = values['year']
-        if values['season']:
-            if not re.fullmatch(r'\d+', values['season']):
-                raise ValueError('Enter a season number (0 = Specials)')
-            updates['season_override'] = int(values['season'])
-        episode_range = _parse_episode_range(values['episode']) if values['episode'] else None
-        if values['part'] and not re.fullmatch(r'[0-9]+', values['part']):
-            raise ValueError('Enter a part number starting from 1')
-        part = int(values['part']) if values['part'] else None
-        if part is not None and part < 1:
-            raise ValueError('Enter a part number starting from 1')
-        if (episode_range is not None or part is not None) and any(not t.filename for t in rows):
-            raise ValueError('Resolve all selected filenames before changing episode or part numbers')
-        if values['match']:
-            if not tmdb_is_enabled():
-                raise ValueError('Enable TMDB matching (Settings) and set an API key first')
-            match = _resolve_tmdb_override(values['match'])
-            if not match:
-                raise ValueError(f"No TMDB result for '{values['match']}'")
-            updates['tmdb_override'] = match
-    except ValueError as exc:
-        print(f'⚠️ {exc} — no changes applied')
-        return
-
-    # Prepare numbering before touching any tasks, then refresh the preview once.
-    parts = _number_rows_sequentially(rows, part) if part is not None else {}
-    if episode_range is not None:
-        _set_episode_overrides(rows, *episode_range)
-    for task in rows:
-        for attr, value in updates.items():
-            setattr(task, attr, value)
-        if part is not None:
-            task.part_override = parts[task.id]
-        if 'tmdb_override' in updates and task.filename:
-            _tmdb_match_cache[_match_cache_key(task.filename)] = updates['tmdb_override']
-    _apply_queue_overrides(pending_queue)
-    for key, widget in inputs.items():
-        if values[key]:
-            widget.value = ''
-    update_queue_display()
-    print(f'✅ Applied changes to {len(rows)} item(s) — selection kept')
 
 
 def _map_absolute_episode(episode: int, seasons: Dict[str, int]) -> Tuple[int, int]:
@@ -3255,6 +2969,9 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
         downloads_dir = os.path.join(DRIVE_BASE, get_downloads_path())
         if not dry_run: _ensure_dest_dir(downloads_dir)  # API path owns folder creation
         return os.path.join(downloads_dir, filename), "Downloads"
+    # Anime routes pick the anime library folders in the branches below
+    is_anime = route_ov in ('anime_series', 'anime_movie')
+    
     # Parse episode/show info from the filename (pure logic, unit-testable)
     info = detect_episode_info(filename)
     part_suffix = info['part_suffix']
@@ -3302,13 +3019,8 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
                 show_name = clean_show_name(os.path.splitext(filename)[0]) or show_name
 
     # TMDB metadata (populated by analyze_batch_metadata at queue/quick/resume time).
-    # Library family is a separate axis from naming: Force Name replaces the display
-    # identity but keeps a confident anime classification. An explicit Route always
-    # wins, including TV/Movie routes that deliberately force the standard libraries.
-    metadata_match = get_tmdb_match(filename)
-    effective_kind = 'tv' if (is_tv or episode_detected) else 'movie'
-    is_anime = resolve_library_is_anime(route_ov, metadata_match, effective_kind)
-    tmdb_match = None if manual_show_name else metadata_match
+    # Force Name always wins; a match refines names/years, never user input.
+    tmdb_match = None if manual_show_name else get_tmdb_match(filename)
     tmdb_tv_year = ''
     if tmdb_match and tmdb_match['type'] == 'tv' and (is_tv or episode_detected):
         show_name = tmdb_match['name']
@@ -3362,7 +3074,7 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
         _, ext = os.path.splitext(filename)
         # Year goes on the folder only — the file keeps just the movie name
         new_filename = f"{movie_name}{ext}"
-        # Pick the library family resolved from TMDB metadata or the manual route
+        # Use anime folder if anime mode is enabled
         if is_anime:
             full_dir = os.path.join(f"{DRIVE_BASE}{get_anime_movies_path()}", folder_name)
             if not dry_run: _ensure_dest_dir(full_dir)  # API path owns folder creation
@@ -3390,7 +3102,7 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
     folder_year = manual_year or tmdb_tv_year
     show_folder = f"{show_name} ({folder_year})" if folder_year else show_name
     
-    # Pick the library family resolved from TMDB metadata or the manual route
+    # Use anime folder if anime mode is enabled
     if is_anime:
         base_path = f"{DRIVE_BASE}{get_anime_series_path()}"
         full_dir = os.path.join(base_path, show_folder, season_folder)
@@ -3816,9 +3528,12 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
     update_bar=False leaves the shared progress bar to the batch monitor thread
     (parallel downloads); sequential callers keep direct bar updates.
 
-    url_refresh re-mints time-limited debrid URLs between attempts. Retrying the
-    same expired URL can never succeed, so callers that retain a stable item/file
-    reference pass this and each retry gets a live link.
+    url_refresh re-mints the download URL between attempts. Debrid direct links
+    are time-limited, and a batch pre-requests every link before the first
+    download starts — so on a long batch the later files' URLs have expired by
+    the time a worker reaches them, and aria2 gets an error page instead of a
+    file (exit 22). Retrying the same dead URL can never succeed, so callers
+    that can mint a fresh one pass this and each retry gets a live link.
     """
     filename = sanitize_filename(filename)
 
@@ -3872,8 +3587,7 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
 
     proc_key = task_id or str(uuid4())
     attempt = 0
-    throttle_waits = 0  # Reset when downloaded bytes advance, including within 99%
-    downloaded_high_water = None
+    throttle_waits = 0  # 429 cool-offs taken so far (they don't consume an attempt)
     while attempt < 3:
         attempt += 1
         if _cancel_requested:
@@ -3882,8 +3596,6 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
             dl_start = time.time()
             completed_path = None  # Path reported by aria2's "Download complete:" line
             last_error_line = ""  # aria2's own error text, surfaced when the attempt fails
-            saw_throttle = False
-            made_progress = False
             disk_paused = False  # Set by the watchdog when it terminates aria2 on low disk
             last_disk_check = time.time()
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
@@ -3891,17 +3603,6 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
             last_speed = ""
             last_speed_mbs = 0.0
             for line in process.stdout:
-                if 'status=429' in line:
-                    saw_throttle = True
-                # Use aria2's completed byte count, not file size (sparse files can
-                # already have their final size) or rounded integer percentages.
-                downloaded = re.search(r'\[#[\da-f]+\s+([\d.]+)([KMGT]?i?B)/', line, re.I)
-                if downloaded:
-                    unit = downloaded.group(2).upper().replace('I', '')
-                    count = float(downloaded.group(1)) * (1024 ** ('B', 'KB', 'MB', 'GB', 'TB').index(unit))
-                    if downloaded_high_water is not None and count > downloaded_high_water:
-                        made_progress = True
-                    downloaded_high_water = max(downloaded_high_water or 0, count)
                 complete_match = re.search(r'Download complete:\s*(\S.*)', line)
                 if complete_match:
                     completed_path = complete_match.group(1).strip()
@@ -3988,10 +3689,10 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
             # the URL is still good and aria2 -c has a resumable partial on disk.
             # Re-minting would only spend more of the rate budget on requestdl
             # (TorBox's most rate-limited endpoint) and make the throttle worse.
-            throttled = saw_throttle
+            throttled = 'status=429' in last_error_line
             if url_refresh and attempt < 3 and not throttled:
-                # The debrid link may simply have expired — re-mint it so the
-                # retry has a live URL to use.
+                # The prefetched debrid link may simply have expired while this file
+                # waited its turn — re-mint it so the retry has a live URL to use.
                 # aria2 -c still resumes whatever partial is already on disk.
                 try:
                     fresh_url = url_refresh()
@@ -4001,25 +3702,13 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
                     cmd[1] = fresh_url
                     with print_lock:
                         print(f"      🔄 Re-requested a fresh download link")
-            if made_progress:
-                throttle_waits = 0
             if throttled and throttle_waits < MAX_THROTTLE_WAITS:
                 # Same treatment as a disk pause: the file is fine and -c resumes it,
                 # so a throttle must not burn a retry — otherwise a 99%-complete file
                 # exhausts its 3 attempts on the last few MB and can never land.
                 throttle_waits += 1
                 attempt -= 1
-                cool_off = min(THROTTLE_BACKOFF_SECS * (2 ** (throttle_waits - 1)),
-                               THROTTLE_MAX_BACKOFF_SECS)
-                # Resume with one stream after throttling instead of repeating
-                # the same burst of range requests on every retry.
-                cmd[cmd.index('-x') + 1] = '1'
-                cmd[cmd.index('-s') + 1] = '1'
-                with progress_lock:
-                    if task_id:
-                        download_stats[task_id]['speed_mbs'] = 0.0
-                    if update_bar:
-                        progress_bar.description = f"Rate limited: retry in {cool_off}s"
+                cool_off = THROTTLE_BACKOFF_SECS * throttle_waits
                 with print_lock:
                     print(f"      ⏳ Rate limited (429) — cooling off {cool_off}s, then resuming from where it stopped")
                 for _ in range(cool_off):
@@ -5109,7 +4798,7 @@ def _make_torrent_file_task(magnet_url: str, link_type: str, torrent_id, file_id
     """Build a queue task for one file inside a debrid torrent.
     Returns None for tiny files (samples/NFOs) unless they are subtitles."""
     size_mb = size_bytes / (1024 * 1024)
-    if size_mb < 1 and not file_name.lower().endswith(tuple(KEEP_EXTENSIONS)):
+    if size_mb < 1 and not file_name.endswith(tuple(KEEP_EXTENSIONS)):
         return None
     return DownloadTask(
         url=magnet_url,
@@ -5184,30 +4873,10 @@ _TB_REQUESTDL_ID_PARAM = {'torrents': 'torrent_id', 'usenet': 'usenet_id', 'webd
 
 def _tb_err_is_throttle(err: str) -> bool:
     """True when a _tb_requestdl error smells like rate limiting or an overloaded
-    edge rather than a per-file refusal, so transient responses are retried."""
+    edge rather than a per-file refusal — used to stop batch link prefetching
+    early instead of burning more of the rate budget."""
     e = err.lower()
     return 'http' in e or 'rate' in e or 'limit' in e or 'many requests' in e
-
-def _tb_defer_requestdl(delay: float):
-    """Extend the shared requestdl cooldown without shortening an existing one."""
-    global _tb_requestdl_next_at
-    if delay <= 0:
-        return
-    with _tb_requestdl_rate_lock:
-        _tb_requestdl_next_at = max(_tb_requestdl_next_at, time.monotonic() + delay)
-
-def _tb_wait_requestdl_slot() -> bool:
-    """Wait cancelably for the next globally paced requestdl slot."""
-    global _tb_requestdl_next_at
-    while not cancel_requested():
-        with _tb_requestdl_rate_lock:
-            now = time.monotonic()
-            wait_for = _tb_requestdl_next_at - now
-            if wait_for <= 0:
-                _tb_requestdl_next_at = now + TB_REQUESTDL_MIN_INTERVAL_SECS
-                return True
-        time.sleep(min(wait_for, 1.0))
-    return False
 
 def _tb_requestdl(endpoint: str, id_param: str, item_id, file_id, tb_key: str,
                   attempts: int = 4) -> Tuple[str, str]:
@@ -5230,11 +4899,12 @@ def _tb_requestdl(endpoint: str, id_param: str, item_id, file_id, tb_key: str,
     retry_after = 0.0
     for attempt in range(attempts):
         if attempt:
-            delay = max(retry_after, 5 * (2 ** (attempt - 1)))  # 5s, 10s, 20s, 40s
+            delay = max(retry_after, 5 * (2 ** (attempt - 1)))  # 5s, 10s, 20s
             print(f"      ⏳ TorBox throttled — retrying in {delay:.0f}s ({err[:60]})")
-            _tb_defer_requestdl(delay)
-        if not _tb_wait_requestdl_slot():
-            return '', 'Cancelled by user'
+            for _ in range(int(delay)):
+                if cancel_requested():
+                    return '', 'Cancelled by user'
+                time.sleep(1)
         try:
             dl_r = requests.get(f"{TORBOX_API_BASE}/{endpoint}/requestdl",
                                 params=dl_params, headers=_get_tb_headers(tb_key), timeout=30)
@@ -5251,8 +4921,6 @@ def _tb_requestdl(endpoint: str, id_param: str, item_id, file_id, tb_key: str,
         except ValueError:
             body = (dl_r.text or '').strip()
             err = f"TorBox HTTP {dl_r.status_code}: {'non-JSON response' if body else 'empty response'}"
-            if dl_r.status_code == 429 and retry_after <= 0:
-                retry_after = TB_REQUESTDL_429_COOLDOWN_SECS
             continue  # throttle or edge hiccup — worth retrying
         download_url = _tb_extract_download_url(dl_data)
         if download_url:
@@ -5260,30 +4928,7 @@ def _tb_requestdl(endpoint: str, id_param: str, item_id, file_id, tb_key: str,
         err = str(dl_data.get('detail') or dl_data.get('error') or err)[:120]
         if dl_r.status_code < 429 and not _tb_err_is_throttle(err):
             return '', err  # genuine refusal — retrying won't change the answer
-        if (dl_r.status_code == 429 or _tb_err_is_throttle(err)) and retry_after <= 0:
-            retry_after = TB_REQUESTDL_429_COOLDOWN_SECS
     return '', err
-
-_TB_FOLDER_IGNORED_EXTENSIONS = {
-    '.aac', '.ac3', '.aiff', '.aif', '.alac', '.amr', '.ape', '.au', '.dts',
-    '.eac3', '.flac', '.m4a', '.m4b', '.mid', '.midi', '.mka', '.mp3',
-    '.oga', '.ogg', '.opus', '.pcm', '.wav', '.wma', '.wv',
-    '.avif', '.bmp', '.gif', '.heic', '.heif', '.ico', '.jpeg', '.jpg',
-    '.jxl', '.png', '.psd', '.raw', '.svg', '.tif', '.tiff', '.webp',
-}
-_TB_FOLDER_SAMPLE_MAX_BYTES = 100 * 1024 * 1024
-
-
-def _tb_folder_file_is_irrelevant(file_name: str, size_bytes: int) -> bool:
-    """Ignore audio, images, and named samples under 100 MiB; keep subtitles."""
-    stem, extension = os.path.splitext(file_name.lower())
-    if extension in KEEP_EXTENSIONS:
-        return False
-    if extension in _TB_FOLDER_IGNORED_EXTENSIONS:
-        return True
-    return (0 < size_bytes < _TB_FOLDER_SAMPLE_MAX_BYTES
-            and re.search(r'(?<![a-z0-9])sample(?![a-z0-9])', stem) is not None)
-
 
 def resolve_tb_folder_files(url: str, tb_key: str) -> List[DownloadTask]:
     """Resolve a torbox.app/download?id=X&type=Y share link (the site's
@@ -5331,8 +4976,6 @@ def resolve_tb_folder_files(url: str, tb_key: str) -> List[DownloadTask]:
         # (often a release/quality string) so it can't pollute show-name detection.
         raw_name = f.get('name') or f.get('short_name') or f'file_{file_id}'
         file_name = os.path.basename(raw_name.replace('\\', '/')) or raw_name
-        if _tb_folder_file_is_irrelevant(file_name, f.get('size', 0)):
-            continue
         task = _make_torrent_file_task(url, "tb_magnet_file", group_id,
                                        file_id, file_name, f.get('size', 0))
         if task:
@@ -5525,13 +5168,8 @@ def resolve_tb_magnet_files(magnet_url: str, tb_key: str) -> List[DownloadTask]:
         return []
 
 def convert_tb_tasks_to_parallel(tasks: List[DownloadTask], tb_key: str) -> Tuple[List[DownloadTask], List[DownloadTask]]:
-    """Move cached TorBox files into the parallel aria2 pool without minting URLs.
-
-    Each download worker requests its own direct URL immediately before starting.
-    This keeps link generation bounded by the worker count instead of pre-requesting
-    an entire large torrent, which can trip requestdl throttling and leaves later
-    files holding links that may expire before a worker reaches them.
-
+    """Pre-request direct URLs for TorBox files whose item is already cached, so
+    they join the parallel aria2 pool instead of downloading one-by-one.
     Returns (parallel_ready, still_sequential). Uncached items (fresh magnets)
     stay sequential — process_tb_magnet_file_tasks polls the caching there.
     link_type stays 'tb_magnet_file' so a resumed session re-requests fresh URLs.
@@ -5543,15 +5181,36 @@ def convert_tb_tasks_to_parallel(tasks: List[DownloadTask], tb_key: str) -> Tupl
     for group_id, file_list in _group_tasks_by_torrent(tasks).items():
         endpoint, _, item_id = group_id.rpartition('/')
         endpoint = endpoint or 'torrents'
+        id_param = _TB_REQUESTDL_ID_PARAM.get(endpoint, 'torrent_id')
         item = _tb_fetch_item(endpoint, int(item_id), tb_key)
         status = (item or {}).get('download_state', (item or {}).get('status', ''))
         if not item or status not in ('completed', 'cached', 'done'):
             sequential.extend(t for _fid, t in file_list)
             continue
-        print(f"   🔗 Queueing {len(file_list)} cached TorBox file(s) for just-in-time link resolution...")
-        for _file_id, task in file_list:
-            task.filename = _strip_size_suffix(task.filename)
-            ready.append(task)
+        print(f"   🔗 Fetching {len(file_list)} TorBox direct link(s) for parallel download...")
+        for idx, (file_id, task) in enumerate(file_list):
+            if _cancel_requested:
+                sequential.extend(t for _fid, t in file_list[idx:])
+                break
+            if idx:
+                time.sleep(0.3)  # stay under the TorBox API rate limit
+            try:
+                # One attempt only: on a throttle, stop prefetching instead of
+                # burning more of the rate budget — whatever lands in the
+                # sequential flow gets _tb_requestdl's backoff retries there.
+                download_url, dl_err = _tb_requestdl(endpoint, id_param, item_id, file_id, tb_key, attempts=1)
+            except Exception as e:
+                download_url, dl_err = '', str(e)[:80]
+            if not download_url and _tb_err_is_throttle(dl_err):
+                print(f"   ⏳ TorBox is throttling link requests — {len(file_list) - idx} file(s) moved to the sequential flow ({dl_err[:60]})")
+                sequential.extend(t for _fid, t in file_list[idx:])
+                break
+            if download_url:
+                task.url = download_url
+                task.filename = _strip_size_suffix(task.filename)
+                ready.append(task)
+            else:
+                sequential.append(task)  # falls back to the sequential flow's retry
     return ready, sequential
 
 def process_tb_magnet_file_tasks(tasks: List[DownloadTask], tb_key: str) -> int:
@@ -6268,8 +5927,14 @@ def resolve_fshare(url: str, email: str, password: str) -> List[Tuple[str, str]]
             print(f"   ❌ FShare: Could not extract download link — VIP account may be required")
             return []
 
-def _tb_task_requestdl_parts(task: DownloadTask) -> Optional[Tuple[str, str, str, str]]:
-    """Return requestdl routing fields for a TorBox file task."""
+def _tb_url_refresher(task: DownloadTask) -> Optional[Callable[[], str]]:
+    """Build a fresh-link minter for a TorBox file task, or None for other types.
+
+    convert_tb_tasks_to_parallel pre-requests every direct link before the first
+    download starts, so on a long batch the later files' links expire before a
+    worker reaches them. original_url keeps the '{endpoint}/{item_id}:{file_id}'
+    handle those links were minted from, which is all _tb_requestdl needs to mint
+    another one on demand."""
     if task.link_type != 'tb_magnet_file' or not task.original_url or ':' not in task.original_url:
         return None
     # split(':', 1) — same convention _group_tasks_by_torrent uses to read this field
@@ -6277,35 +5942,17 @@ def _tb_task_requestdl_parts(task: DownloadTask) -> Optional[Tuple[str, str, str
     endpoint, _, item_id = item_ref.rpartition('/')
     endpoint = endpoint or 'torrents'
     id_param = _TB_REQUESTDL_ID_PARAM.get(endpoint, 'torrent_id')
-    return endpoint, id_param, item_id, file_id
-
-def _tb_task_download_url(task: DownloadTask, tb_key: str = "", attempts: int = 5) -> Tuple[str, str]:
-    """Mint a direct URL for one TorBox file task just before it downloads."""
-    request_parts = _tb_task_requestdl_parts(task)
-    if not request_parts:
-        return '', 'Invalid TorBox file reference'
-    effective_key = tb_key or token_tb.value.strip()
-    if not effective_key:
-        return '', 'TorBox token required'
-    return _tb_requestdl(*request_parts, effective_key, attempts=attempts)
-
-def _tb_url_refresher(task: DownloadTask, tb_key: str = "") -> Optional[Callable[[], str]]:
-    """Build a fresh-link minter for a TorBox file task, or None for other types.
-
-    The parallel worker uses this both to mint the initial URL just in time and to
-    replace an expired URL between aria2 attempts. original_url keeps the stable
-    '{endpoint}/{item_id}:{file_id}' handle needed for either request."""
-    if not _tb_task_requestdl_parts(task):
-        return None
 
     def _refresh() -> str:
-        url, _err = _tb_task_download_url(task, tb_key, attempts=2)
+        tb_key = token_tb.value.strip()
+        if not tb_key:
+            return ''
+        url, _err = _tb_requestdl(endpoint, id_param, item_id, file_id, tb_key, attempts=2)
         return url
     return _refresh
 
 # --- PARALLEL DOWNLOAD WORKER ---
-def download_worker(task: DownloadTask, gofile_token: str, move_queue: Optional[queue.Queue] = None,
-                    tb_key: str = "") -> DownloadTask:
+def download_worker(task: DownloadTask, gofile_token: str, move_queue: Optional[queue.Queue] = None) -> DownloadTask:
     """Worker function for parallel downloads. Returns updated task.
 
     With move_queue (the "Overlap Drive moves" setting), a finished download is
@@ -6315,23 +5962,9 @@ def download_worker(task: DownloadTask, gofile_token: str, move_queue: Optional[
         return task  # Never started — stays "pending" so resume picks it up untouched
     task.status = "downloading"
     try:
-        download_url = task.url
-        url_refresh = _tb_url_refresher(task, tb_key)
-        if task.link_type == 'tb_magnet_file':
-            # Resolve only when this worker has a real download slot. A 153-file
-            # torrent with three workers therefore holds at most three newly-minted
-            # links rather than requesting all 153 before the first transfer starts.
-            download_url, dl_err = _tb_task_download_url(task, tb_key)
-            if not download_url:
-                task.status = "failed"
-                task.error = f"TorBox link resolution failed: {dl_err}"[:100]
-                with print_lock:
-                    print(f"   ❌ {task.filename[:50]}: {task.error}")
-                return task
-            task.filename = _strip_size_suffix(task.filename)
         # update_bar=False: the batch monitor thread owns the shared progress bar
-        f = download_with_aria2(download_url, task.filename, COLAB_ROOT, task.cookie, task_id=task.id,
-                                update_bar=False, url_refresh=url_refresh)
+        f = download_with_aria2(task.url, task.filename, COLAB_ROOT, task.cookie, task_id=task.id,
+                                update_bar=False, url_refresh=_tb_url_refresher(task))
         if f is DUPLICATE_SKIP:
             task.status = "skipped"  # Already in Drive — not a failure, don't retry on resume
         elif f and move_queue is not None:
@@ -6361,11 +5994,6 @@ def download_worker(task: DownloadTask, gofile_token: str, move_queue: Optional[
                 task.error = "Local disk full — Drive moves couldn't free space in time"
             else:
                 task.error = "Download returned None"
-    except KeyboardInterrupt:
-        if not cancel_requested():
-            raise
-        task.status = "failed"
-        task.error = "Cancelled by user"
     except Exception as e:
         task.status = "failed"
         task.error = str(e)[:100]
@@ -6390,18 +6018,8 @@ def _drive_mover(move_queue: queue.Queue, save_progress):
             return
         task, path = item
         try:
-            if cancel_requested():
-                raise KeyboardInterrupt("cancelled before Drive move")
             handle_file_processing(path, source=task.source)
             task.status = "done"
-        except KeyboardInterrupt:
-            if not cancel_requested():
-                raise
-            # Upload cancellation uses KeyboardInterrupt to bypass the API-to-mount
-            # fallback. Consume it at the worker boundary, save the retryable task,
-            # and keep draining the queue until this mover receives its sentinel.
-            task.status = "failed"
-            task.error = "Cancelled by user"
         except Exception as e:
             task.status = "failed"
             task.error = str(e)[:100]
@@ -6858,7 +6476,7 @@ def _run_download_pipeline(
     if tb_magnet_file_tasks and tb_file_key:
         tb_ready, tb_magnet_file_tasks = convert_tb_tasks_to_parallel(tb_magnet_file_tasks, tb_file_key)
         if tb_ready:
-            print(f"🔗 TorBox: {len(tb_ready)} cached file(s) will resolve as parallel slots open")
+            print(f"🔗 TorBox: {len(tb_ready)} cached file(s) moved to the parallel queue")
             parallel_tasks = list(parallel_tasks) + tb_ready
 
     # --- PARALLEL DOWNLOADS ---
@@ -6896,7 +6514,7 @@ def _run_download_pipeline(
         try:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_task = {
-                    executor.submit(download_worker, task, gofile_token, move_queue, tb_file_key): task
+                    executor.submit(download_worker, task, gofile_token, move_queue): task
                     for task in parallel_tasks
                 }
                 try:
@@ -7560,7 +7178,6 @@ btn_queue_cancel.on_click(queue_cancel)
 btn_queue_sort.on_click(queue_sort_alpha)
 btn_tmdb_match.on_click(apply_tmdb_override)
 btn_tmdb_clear.on_click(clear_tmdb_override)
-btn_queue_apply_changes.on_click(apply_queue_changes)
 btn_season_apply.on_click(apply_season_override)
 btn_season_clear.on_click(clear_season_override)
 btn_renumber.on_click(apply_renumber)

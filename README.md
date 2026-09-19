@@ -2,6 +2,8 @@
 
 A powerful Google Colab-based tool for downloading media from multiple sources directly to Google Drive with automatic Plex-friendly organization.
 
+**Latest release: v6.9** — combined queue edits, automatic anime routing, and more reliable TorBox batches. See the [full changelog](CHANGELOG.md).
+
 ## Contents
 
 - [Features](#-features)
@@ -33,8 +35,8 @@ A powerful Google Colab-based tool for downloading media from multiple sources d
 - **Smart Media Sorting**: Automatically organises into Plex-compatible folder structures
   - TV Shows: `Show Name (Year)/Season XX/Show Name - S01E01.mkv`
   - Movies: `Movie Name (Year)/Movie Name.mkv`
-- **Per-File Queue Overrides**: fix the TMDB match, force a name/year, route to any library folder (mix anime and live-action, series and movies in one batch), force a season, or renumber episodes — all per selection, all persisted across resume
-- **TMDB Metadata Matching**: Canonical names, years, and anime absolute-episode → season mapping via the free TMDB API (optional); correct or clear any auto-match per item in the queue, and corrections persist across resume
+- **Per-File Queue Overrides**: fix the TMDB match, force a name/year, route to any library folder, force a season, renumber episodes, or set part suffixes — apply several fields together while keeping your selection, with overrides persisted across resume
+- **TMDB Metadata Matching**: Canonical names, years, automatic Anime Series/Anime Movies routing, and absolute-episode → season mapping via the free TMDB API (optional); correct or clear any auto-match per item in the queue, and corrections persist across resume
 - **Archive Extraction**: Handles RAR, ZIP, 7Z with sequential extraction to save Colab disk space
 - **Subtitle Preservation**: Keeps `.srt`, `.ass`, `.sub`, `.vtt` files regardless of size
 - **Embedded Subtitle Extraction**: Pulls text subtitle tracks out of MKV/MP4 files as Plex-ready `.srt` sidecars — automatically after every download, or retroactively across your Drive library from Settings
@@ -84,7 +86,7 @@ Run the cell and the UI will appear automatically.
   exec(open("ultimate_downloader.py").read())
   ```
 - Pin to a specific release instead of tracking the latest by swapping `main` for a tag
-  (e.g. `v6.7`) in the URL. Tracking `main` is recommended — fixes here have included
+  (e.g. `v6.9`) in the URL. Tracking `main` is recommended — fixes here have included
   data-integrity ones — but pinning is there if you want a fixed version.
 
 ### 2. Configure API Keys (Optional)
@@ -135,20 +137,26 @@ Files are automatically organised and saved to your Google Drive.
 |-------|-------------|
 | **Auto-organise** | Toggle automatic file renaming and organisation (uncheck to save with original filenames to Downloads) |
 | **Debrid** | Select Real-Debrid, TorBox, or None — the active service for premium hosts and magnets |
-| **Parallel DLs** | Number of concurrent downloads (1-5, applies to Gofile/Pixeldrain/RD/HTTP) |
+| **Parallel DLs** | Number of concurrent downloads (1-5, applies to Gofile/Pixeldrain/RD/cached TorBox/HTTP) |
 | **Auto Retry** | Optional: when a batch ends with failures, automatically re-run 🔁 Retry Failed up to this many times (stops early once everything succeeds). Empty = off. A kernel interrupt cancels the chain |
 
 ### Queue Overrides (per selection)
 
 Select rows in the Queue Preview, then apply any of these. Each shows its effect instantly in the rows' destination previews, and all of them persist with the session across Stop/Resume/Retry:
 
+Your selection stays in place after applying or clearing an edit. To change several fields together, fill in **Name/Year**, **Force Season**, and **Renumber from** (or **Fix Match** and **Part**), then click **Apply Changes** once. Blank fields keep their existing values; all filled fields are validated before anything is applied. Use the individual buttons for a single change, **Apply Route** for routing, and the clear buttons to remove overrides.
+
+With **Apply Changes**, a year requires a name; a blank year keeps its existing override. Episode and part changes require resolved filenames for every selected row. If validation fails, the selection and draft fields stay ready for correction. Removing rows leaves the remaining files unselected; a newly loaded queue starts with everything selected.
+
 | Control | Description |
 |---------|-------------|
 | **🎬 Fix Match** | Apply a specific TMDB match (a themoviedb.org URL, `tv:12345` / `movie:12345`, or a title to search) — or clear it to use filename parsing |
-| **✏️ Force Name / Year** | Manually set the show/movie name and optional year — wins over the TMDB match |
-| **🎯 Route as** | Send the selection to a library folder: TV Series, Anime Series, Movie, Anime Movie, or Downloads (as-is). Mix anime and live-action, series and movies, in one batch |
+| **✏️ Force Name / Year** | Manually set the show/movie name and optional year — wins over TMDB naming while keeping its automatic library classification (unless 🎯 Route as is set) |
+| **🎯 Route as** | Send the selection to a library folder: TV Series, Anime Series, Movie, Anime Movie, or Downloads (as-is). Mix anime and live-action, series and movies, in one batch; a manual route always wins over TMDB auto-routing |
 | **🗂️ Force Season** | Force a season number regardless of filename parsing or TMDB mapping (0 = Specials) |
-| **🔢 Renumber** | Rewrite episode numbers sequentially from a chosen start, in queue order — a video and its subtitles share one number |
+| **🔢 Renumber** | Rewrite episode numbers sequentially from a chosen start, in queue order — a video and its subtitles share one number. A range such as `7-9` assigns the first pair `E07-E09`, then continues from `E10` |
+| **📎 Set Part / ✖ No Part** | Assign sequential `-ptN` suffixes, pairing videos with their subtitles, or suppress detected/forced part suffixes |
+| **Apply Changes** | Apply all filled Match, Name/Year, Season, Episode and Part fields to the selection together; blank fields leave existing values unchanged |
 
 ### Drive Folders
 
@@ -156,10 +164,12 @@ Select rows in the Queue Preview, then apply any of these. Each shows its effect
 - `My Drive/TV Shows/` - Files with detected episode patterns (S01E01, Ep 1, 第5集, etc.)
 - `My Drive/Movies/` - Files without episode patterns
 - `My Drive/YouTube/` - YouTube downloads without episode patterns
-- `My Drive/Anime Series/` - Series routed as Anime (queue 🎯 Route as)
-- `My Drive/Anime Movies/` - Movies routed as Anime (queue 🎯 Route as)
+- `My Drive/Anime Series/` - TMDB-detected or manually routed anime series
+- `My Drive/Anime Movies/` - TMDB-detected or manually routed anime movies
 - `My Drive/Downloads/` - All files when Auto-organise is disabled (original filenames)
 - `My Drive/Ultimate Downloader/` - Config files (session.json, history.json, settings.json)
+
+> **Anime detection:** With TMDB matching enabled, a title is auto-routed as anime when TMDB lists Animation plus Japanese original language, origin/production country, or an exact `anime` / `japanese animation` keyword. Japanese live action and animation without those signals remain in TV Shows/Movies. Use 🎯 Route as for exceptions; it always wins. Older cached and saved manual matches refresh automatically; failed classification requests can retry later while retaining the previous match identity.
 
 > **API Keys**: Gofile, Real-Debrid, and TorBox tokens are configured in ⚙️ Settings (select the active debrid service with the **Debrid** toggle). For security, use Colab Secrets (see Quick Start) — credentials are never written to Drive.
 
@@ -254,6 +264,10 @@ runtime's ceiling and further movers only cost disk space.
 | **Dailymotion** | Video downloads | Sequential |
 | **SoundCloud** | Audio downloads | Sequential |
 
+**TorBox batches:** Cached files request a fresh download link when their parallel download slot opens. All TorBox link requests share one request-per-second pacing and a shared cooldown after throttling (60 seconds when no `Retry-After` is supplied). Uncached items wait for caching through the sequential flow. Folder/share-link queues omit audio, images, and files with a standalone `sample` marker smaller than 100 MiB and larger than zero bytes; subtitles are retained, including small files with uppercase extensions.
+
+**Throttle recovery and stopping:** A throttled file resumes with one connection after 5/10/20/30-second waits; further downloaded bytes reset that cooldown allowance. This is separate from the TorBox link-request cooldown. Interrupting Drive uploads preserves local files and marks interrupted or queued moves as failed for **Retry Failed**, without worker shutdown tracebacks.
+
 ---
 
 ## 📜 Changelog
@@ -272,6 +286,9 @@ runtime's ceiling and further movers only cost disk space.
 | v6.6 | Multi-episode file spans (S01E01-E03) with range renumbering, part-suffix queue control, smarter TMDB matching, marker-first name detection, TorBox link routing fix |
 | v6.7 | Embedded subtitle extraction (auto after download + retroactive library scan), Colab disk-space session guard |
 | v6.8 | Drive API uploads (~3-4x faster transfers, verified completion), configurable Drive movers, per-batch throughput summary, duplicate library folder fix |
+| **v6.9 (Latest)** | Combined queue edits with selection preserved, automatic TMDB anime routing and cache refresh, TorBox links resolved as download slots open, folder filtering, faster throttle recovery, uppercase subtitle retention, clean Drive cancellation, and regression tests |
+
+See [CHANGELOG.md](CHANGELOG.md) for complete release notes, including cache reliability fixes. The exact v6.8 script is preserved in [archive/ultimate_downloader_v6.8.py](archive/ultimate_downloader_v6.8.py).
 
 ## 🎬 Episode Detection Patterns
 
@@ -493,7 +510,10 @@ Ultimate Downloader/
 ├── LICENSE                         # MIT Licence
 ├── banner_2x1.png                  # GitHub banner image
 ├── .gitignore                      # Git ignore rules
+├── test_queue_editing.py           # Queue editing regression tests
+├── test_tmdb_anime_classification.py # TMDB classification/cache/routing tests
 └── archive/                        # Previous version snapshots
+    └── ultimate_downloader_v6.8.py # Exact v6.8 release (alongside older versions)
 ```
 
 ---
