@@ -4,7 +4,7 @@
 
 Download videos and files in Google Colab, save them to Google Drive, and organise shows and movies for Plex. It supports Gofile, Pixeldrain, Mega, YouTube, TorBox, Real-Debrid, and many other sources.
 
-**v7.0 is in preparation.** The last tagged release is v6.9. The next release adds links during a download, a clearer queue table, and better show and season names from TorBox folders. See the [v7.0 release notes](CHANGELOG.md#v70-unreleased).
+**Latest release: v7.0.** Add links during a download, use a clearer queue table, and get better show and season names from TorBox folders. See the [v7.0 release notes](CHANGELOG.md#v70-latest).
 
 ## Get started
 
@@ -22,7 +22,7 @@ import requests; exec(requests.get("https://raw.githubusercontent.com/xersbtt/ul
 
 The code runs in Colab; you do not need to install anything on your computer. Colab sessions can end unexpectedly, so use **Resume Previous Session** when you return.
 
-> The command above runs code from this repository. You can [read the script](ultimate_downloader.py) first, or paste its contents directly into a Colab cell. To run a fixed release, replace `main` in the URL with a tag such as `v6.9`.
+> The command above runs code from this repository. You can [read the script](ultimate_downloader.py) first, or paste its contents directly into a Colab cell. To run a fixed release, replace `main` in the URL with a tag such as `v7.0`.
 
 ### Add your keys
 

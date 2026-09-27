@@ -4,7 +4,7 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 
 ---
 
-## v7.0 (Unreleased)
+## v7.0 (Latest)
 **Theme: Live Queues, Resizable Preview & TorBox Folder Context**
 
 ### ✨ New Features
@@ -25,7 +25,7 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 
 ---
 
-## v6.9 (Latest)
+## v6.9
 **Theme: Queue Editing, Automatic Anime Routing & Reliable TorBox Batches**
 
 ### ✨ New Features
