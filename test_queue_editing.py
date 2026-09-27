@@ -62,7 +62,7 @@ class QueueEditingTests(unittest.TestCase):
                        get_tmdb_match=lambda name: None, tmdb_is_enabled=lambda: True,
                        tmdb_enabled_checkbox=SimpleNamespace(value=True), print=Mock(),
                        queue_sort_ascending=True, btn_queue_sort=SimpleNamespace(),
-                       hide_queue=Mock())
+                       hide_queue=Mock(), _running_live_batch=lambda: None)
         for name in ('tmdb_match', 'season_override', 'episode_override',
                      'episode_end_override', 'name_override', 'part_override', 'route_override'):
             self.ns[f'_{name}_cache'] = {}

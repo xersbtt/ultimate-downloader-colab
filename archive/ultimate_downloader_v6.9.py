@@ -7,17 +7,14 @@ import shutil
 import time
 import difflib
 import queue
-import builtins
-import html
-from collections import deque
 from typing import Optional, Tuple, List, Dict, Any, Callable
 from dataclasses import dataclass, field, fields, asdict
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
-from threading import Lock, RLock, local, Thread, current_thread, main_thread
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock, RLock, local
 from uuid import uuid4
 import ipywidgets as widgets
-from IPython.display import display, clear_output, HTML, JSON
+from IPython.display import display, clear_output
 from urllib.parse import urlparse, unquote, parse_qs
 try:
     from google.colab import drive
@@ -147,7 +144,6 @@ class DownloadTask:
     year_override: Optional[str] = None  # Manual year accompanying name_override (persisted)
     route_override: Optional[str] = None  # Manual destination category (persisted); set by queue 🎯 Route as
     part_override: Optional[int] = None  # Manual part suffix (persisted); N = force -ptN, 0 = force none
-    selected_by_default: bool = True  # Resolver hint for the queue preview; users can still select the row
 
 _TASK_FIELDS = {f.name for f in fields(DownloadTask)}
 
@@ -175,9 +171,13 @@ batch_start_time: Optional[float] = None  # Track when batch started for overall
 last_display_speed: float = 0.0  # Persist last known speed to prevent flickering
 
 # --- BATCH CANCELLATION ---
-# Normal synchronous batches stop via the kernel interrupt. Opt-in live batches run
-# in the background and expose a Stop button. Both paths set this flag, terminate
-# active subprocesses, and leave not-yet-started tasks pending for Resume.
+# Stop works via the kernel interrupt (the ■ button next to the running cell / Runtime
+# → Interrupt), which raises KeyboardInterrupt on the main thread. The pipeline catches
+# it, terminates the active aria2/megadl subprocesses, and saves the session so
+# Resume/Retry can continue. Workers also poll _cancel_requested so anything not yet
+# started stays "pending" and in-flight items become "failed (Cancelled by user)".
+# (A widget Stop *button* can't work while a synchronous download blocks the kernel's
+# shell thread — the click would never be delivered until the batch already finished.)
 _cancel_requested = False
 _active_procs: Dict[str, Any] = {}  # key -> running subprocess.Popen
 _active_procs_lock = Lock()
@@ -492,84 +492,27 @@ drive_movers_slider = widgets.IntSlider(value=DRIVE_MOVERS_DEFAULT, min=1, max=8
 # (280px) so the Debrid and Auto Retry label+field pairs align across both rows.
 auto_organize_checkbox = widgets.Checkbox(value=True, description='Auto-organise', tooltip='Auto-rename and organise files. Uncheck to save with original filenames to Downloads.', indent=False, layout=widgets.Layout(width='280px'))
 
-def _aligned_links_row(content, label=''):
-    """Share the Links label gutter with the queue's heading and table."""
-    gutter = widgets.HTML(
-        f'<div style="text-align:right;padding-right:8px">{label}</div>',
-        layout=widgets.Layout(width='88px', flex='0 0 88px', margin='0'))
-    return widgets.HBox([gutter, content], layout=widgets.Layout(
-        width='98%', margin='2px', align_items='flex-start'))
-
-
-text_area = widgets.Textarea(placeholder='Paste Links Here (Transfer.it, Mega, YouTube, etc.)...',
-    layout=widgets.Layout(width='100%', min_width='0', flex='1 1 0%', height='150px', margin='0'))
-links_row = _aligned_links_row(text_area, 'Links:')
+text_area = widgets.Textarea(description='Links:', placeholder='Paste Links Here (Transfer.it, Mega, YouTube, etc.)...', layout=widgets.Layout(width='98%', height='150px'))
 btn = widgets.Button(description="Resolve Links", button_style='success', icon='search')
 btn_quick = widgets.Button(description="Quick Download", button_style='primary', icon='bolt', tooltip='Download immediately without queue preview', layout=widgets.Layout(width='140px'))
-btn_resume = widgets.Button(description="Resume Previous Session", button_style='warning', icon='play', layout=widgets.Layout(display='none', width='180px', align_items='center'))
+btn_resume = widgets.Button(description="Resume Previous Session", button_style='warning', icon='play', layout=widgets.Layout(display='none', width='180px'))
 btn_restart = widgets.Button(description="🔄 Restart Runtime", button_style='danger', tooltip='Restart runtime then Resume Previous Session', layout=widgets.Layout(display='none'))
-# Synchronous batches show the interrupt hint; background live batches show Stop.
+# Stop is done via the kernel interrupt (see BATCH CANCELLATION), so this is a hint,
+# not a button — a widget button can't be clicked while a synchronous download blocks
+# the kernel. Shown only during an active batch.
 stop_hint = widgets.HTML(value="", layout=widgets.Layout(display='none'))
-btn_stop = widgets.Button(description="⏹ Stop Download", button_style='danger',
-                          tooltip='Stop active downloads and save the queue for Resume',
-                          layout=widgets.Layout(display='none', width='150px'))
 btn_retry = widgets.Button(description="🔁 Retry Failed", button_style='warning', tooltip='Retry failed downloads from the saved session', layout=widgets.Layout(display='none', width='130px'))
 btn_history = widgets.Button(description="📜 History", button_style='', tooltip='View Download History', layout=widgets.Layout(width='100px'))
 btn_settings = widgets.Button(description="⚙️ Settings", button_style='', tooltip='Settings & Manage Files', layout=widgets.Layout(width='105px'))
 btn_about = widgets.Button(description="ℹ️ About", button_style='', tooltip='About', layout=widgets.Layout(width='90px'))
 progress_bar = widgets.FloatProgress(value=0.0, min=0.0, max=100.0, description='Idle', bar_style='info', layout=widgets.Layout(width='98%'))
 status_label = widgets.HTML(value="")
-live_log = widgets.HTML(layout=widgets.Layout(display='none', width='98%',
-                                               max_height='220px', overflow='auto'))
-_builtin_print = builtins.print
-_live_log_lock = Lock()
-_live_log_messages = deque(maxlen=100)
-_colab_live_status_active = False
-
-
-def print(*args, **kwargs):
-    """Send this module's background batch messages straight to the live log.
-
-    Keep log traffic to one bounded widget value instead of syncing an Output
-    widget's entire growing output history on every message.
-    """
-    if (globals().get('_live_batch') is not None and kwargs.get('file') is None
-            and (current_thread() is not main_thread() or _colab_live_status_active)):
-        separator = kwargs.get('sep') if kwargs.get('sep') is not None else ' '
-        ending = kwargs.get('end') if kwargs.get('end') is not None else '\n'
-        message = separator.join(str(arg) for arg in args) + ending
-        try:
-            with _live_log_lock:
-                _live_log_messages.append(message)
-                if not _colab_live_status_active:
-                    live_log.value = ("<pre style='white-space:pre-wrap;overflow-wrap:anywhere;"
-                                      "margin:0;font:12px monospace'>"
-                                      + html.escape(''.join(_live_log_messages)) + "</pre>")
-            return
-        except Exception:
-            pass  # A closed display must not abort a transfer.
-    _builtin_print(*args, **kwargs)
 
 # --- PER-DOWNLOAD PROGRESS BARS ---
-# Individual bars for each parallel download, shown in a collapsible panel.
-_per_task_bars: Dict[str, Any] = {}  # task_id -> widget or lightweight custom-panel row
+# Individual bars for each parallel download, shown in a collapsible accordion.
+_per_task_bars: Dict[str, widgets.FloatProgress] = {}  # task_id -> bar widget
 _per_task_done_at: Dict[str, float] = {}  # task_id -> completion timestamp (for linger)
 _PER_TASK_LINGER = 2.0  # seconds a completed bar stays visible before removal
-
-
-class _ProgressRow:
-    """Local state for the custom panel; only the panel syncs to the browser."""
-    __slots__ = ('model_id', 'description', 'value', 'bar_style')
-
-    def __init__(self, task_id: str, description: str):
-        self.model_id = task_id
-        self.description = description
-        self.value = 0.0
-        self.bar_style = 'info'
-
-    def close(self):
-        pass
-
 
 _per_task_box = widgets.VBox([], layout=widgets.Layout(width='100%'))
 _per_task_accordion = widgets.Accordion(children=[_per_task_box])
@@ -853,7 +796,7 @@ about_ui = widgets.VBox([
     widgets.HTML("""
         <div style='padding: 10px;'>
             <h3>ℹ️ About Ultimate Downloader</h3>
-            <p><strong>Version:</strong> 7.0</p>
+            <p><strong>Version:</strong> 6.9</p>
             <p><strong>Author:</strong> xersbtt</p>
             <p><strong>Repository:</strong> <a href='https://github.com/xersbtt/ultimate-downloader-colab' target='_blank'>github.com/xersbtt/ultimate-downloader-colab</a></p>
             <hr>
@@ -1086,367 +1029,7 @@ load_dir_settings()
 
 
 # --- QUEUE MANAGEMENT UI ---
-# Inline assets keep the single-cell / raw-GitHub Colab entry point self-contained.
-_QUEUE_TABLE_CSS = """
-.ud-queue { --ud-text: #202124; --ud-surface: #ffffff; --ud-alternate: #f8fafc;
-  --ud-header: #f1f3f5; --ud-border: #cbd5e1; --ud-hover: #edf5ff;
-  --ud-selected: #d9eaff; --ud-selected-text: #162d46; --ud-muted: #52606d;
-  font: 13px system-ui, sans-serif; color: var(--ud-text); background: var(--ud-surface);
-  color-scheme: light; }
-@media (prefers-color-scheme: dark) {
-  .ud-queue { --ud-text: #e8eaed; --ud-surface: #202124; --ud-alternate: #27292d;
-    --ud-header: #303238; --ud-border: #59616d; --ud-hover: #303e50;
-    --ud-selected: #244b76; --ud-selected-text: #ffffff; --ud-muted: #bac4d0;
-    color-scheme: dark; }
-}
-.ud-queue .ud-scroll { overflow: auto; height: 280px; border: 1px solid var(--ud-border);
-  border-radius: 4px; background: var(--ud-surface); }
-.ud-queue table { table-layout: fixed; border-collapse: separate; border-spacing: 0; margin: 0;
-  color: var(--ud-text); background: var(--ud-surface); }
-.ud-queue th, .ud-queue td { box-sizing: border-box; padding: 7px 10px; text-align: left;
-  border-right: 1px solid var(--ud-border); border-bottom: 1px solid var(--ud-border); height: 34px; }
-.ud-queue th { position: sticky; top: 0; z-index: 1; background: var(--ud-header); color: var(--ud-text);
-  font-weight: 600; user-select: none; }
-.ud-queue .ud-cell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: inherit; }
-.ud-queue tbody tr { cursor: pointer; }
-.ud-queue tbody td { background: var(--ud-surface); color: var(--ud-text); }
-.ud-queue tbody tr:nth-child(even) td { background: var(--ud-alternate); }
-.ud-queue tbody tr:hover td { background: var(--ud-hover); color: var(--ud-text); }
-.ud-queue tbody tr[aria-selected=true] td { background: var(--ud-selected); color: var(--ud-selected-text); }
-.ud-queue tbody tr:focus { outline: 2px solid #4285f4; outline-offset: -2px; }
-.ud-queue input[type=checkbox] { width: 20px; height: 20px; vertical-align: middle;
-  margin: 0 8px 0 0; accent-color: #1967d2; cursor: pointer; }
-.ud-queue .ud-resize { position: absolute; right: -1px; top: 0; width: 9px;
-  height: 100%; cursor: col-resize; touch-action: none; }
-.ud-queue .ud-resize:hover, .ud-queue .ud-resize:focus { background: #4285f480; outline: none; }
-.ud-queue .ud-help { color: var(--ud-muted); margin-top: 6px; font-size: 12px; }
-"""
-
-_QUEUE_TABLE_ESM = r"""
-export default {
-  render({model, el}) {
-    const columns = [
-      ['number', '#', 72], ['name', 'File', 120], ['source', 'Source', 80],
-      ['size', 'Size', 70], ['destination', 'Destination', 160], ['overrides', 'Overrides', 90]
-    ];
-    const defaults = [72, 330, 110, 90, 480, 180];
-    const root = document.createElement('div'); root.className = 'ud-queue';
-    const scroll = document.createElement('div'); scroll.className = 'ud-scroll';
-    const table = document.createElement('table');
-    table.setAttribute('aria-label', 'Download queue');
-    table.setAttribute('aria-multiselectable', 'true'); table.setAttribute('role', 'grid');
-    const colgroup = document.createElement('colgroup');
-    const head = table.createTHead().insertRow();
-    table.insertBefore(colgroup, table.firstChild);
-    const body = table.createTBody();
-    const help = document.createElement('div'); help.className = 'ud-help';
-    help.textContent = 'Click anywhere on a row to select or deselect that file. Shift-click adds a range. Arrow keys move focus; Space toggles selection. Use the header checkbox to select or clear all. Drag header dividers to resize; double-click to fit.';
-    scroll.append(table); root.append(scroll, help); el.append(root);
-    const abort = new AbortController();
-    const listen = (node, event, fn) => node.addEventListener(event, fn, {signal: abort.signal});
-    const clamp = (width, i) => Math.max(columns[i][2], Math.min(2000, Number(width) || defaults[i]));
-    let widths = defaults.slice(), anchor = null, active = null;
-    let rowNodes = new Map(), resizeState = null;
-    const selectAll = document.createElement('input'); selectAll.type = 'checkbox';
-    selectAll.setAttribute('aria-label', 'Select all files');
-    function applyWidths() {
-      [...colgroup.children].forEach((col, i) => { col.style.width = widths[i] + 'px'; });
-      table.style.width = widths.reduce((sum, width) => sum + width, 0) + 'px';
-      head.querySelectorAll('.ud-resize').forEach((handle, i) => handle.setAttribute('aria-valuenow', widths[i]));
-    }
-    function readWidths() {
-      const stored = model.get('column_widths') || [];
-      widths = defaults.map((width, i) => clamp(stored[i] ?? width, i)); applyWidths();
-    }
-    function saveWidths() { model.set('column_widths', widths.slice()); model.save_changes(); }
-    columns.forEach(([key, label, min], i) => {
-      colgroup.append(document.createElement('col'));
-      const th = document.createElement('th'); th.scope = 'col';
-      if (!i) th.append(selectAll);
-      const text = document.createElement('span'); text.textContent = label; th.append(text);
-      const handle = document.createElement('span'); handle.className = 'ud-resize'; handle.tabIndex = 0;
-      handle.setAttribute('role', 'separator'); handle.setAttribute('aria-orientation', 'vertical');
-      handle.setAttribute('aria-label', `Resize ${label} column`);
-      handle.setAttribute('aria-valuemin', min); handle.setAttribute('aria-valuemax', 2000);
-      listen(handle, 'pointerdown', event => {
-        if (event.button !== 0) return;
-        event.preventDefault(); event.stopPropagation();
-        resizeState = {i, x: event.clientX, width: widths[i]};
-        handle.setPointerCapture(event.pointerId);
-      });
-      listen(handle, 'pointermove', event => {
-        if (!resizeState || resizeState.i !== i) return;
-        widths[i] = clamp(resizeState.width + event.clientX - resizeState.x, i); applyWidths();
-      });
-      const finish = () => { if (resizeState?.i === i) { resizeState = null; saveWidths(); } };
-      listen(handle, 'pointerup', finish); listen(handle, 'lostpointercapture', finish);
-      listen(handle, 'pointercancel', finish);
-      listen(handle, 'keydown', event => {
-        if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
-        event.preventDefault(); widths[i] = clamp(widths[i] + (event.key === 'ArrowRight' ? 20 : -20), i);
-        applyWidths(); saveWidths();
-      });
-      listen(handle, 'dblclick', () => {
-        const context = document.createElement('canvas').getContext('2d');
-        context.font = getComputedStyle(root).font;
-        const values = [label, ...(model.get('rows') || []).map(row => String(row[key] || ''))];
-        widths[i] = clamp(Math.max(...values.map(value => context.measureText(value).width)) + (i ? 32 : 52), i);
-        applyWidths(); saveWidths();
-      });
-      th.append(handle); head.append(th);
-    });
-    function updateSelection() {
-      const selected = new Set(model.get('selected_ids') || []);
-      let count = 0;
-      rowNodes.forEach(({tr, checkbox}, id) => {
-        const chosen = selected.has(id); count += chosen ? 1 : 0;
-        tr.setAttribute('aria-selected', String(chosen)); checkbox.checked = chosen;
-      });
-      selectAll.checked = rowNodes.size > 0 && count === rowNodes.size;
-      selectAll.indeterminate = count > 0 && count < rowNodes.size;
-    }
-    function commitSelection(ids) {
-      const chosen = new Set(ids);
-      // IDs, rather than row numbers, keep delayed browser events safe after sorting/removal.
-      model.set('selected_ids', (model.get('rows') || []).filter(row => chosen.has(row.id)).map(row => row.id));
-      model.save_changes(); updateSelection();
-    }
-    function choose(id, event) {
-      const ids = (model.get('rows') || []).map(row => row.id);
-      let selected = new Set(model.get('selected_ids') || []);
-      if (event.shiftKey && anchor && ids.includes(anchor)) {
-        const a = ids.indexOf(anchor), b = ids.indexOf(id);
-        ids.slice(Math.min(a, b), Math.max(a, b) + 1).forEach(value => selected.add(value));
-      } else {
-        if (selected.has(id)) selected.delete(id); else selected.add(id);
-        anchor = id;
-      }
-      active = id; commitSelection(selected);
-    }
-    listen(selectAll, 'change', () => commitSelection(selectAll.checked ? [...rowNodes.keys()] : []));
-    // Delegate row events so replacing rows does not retain old nodes/listeners.
-    listen(body, 'click', event => {
-      const tr = event.target.closest('tr[data-id]'); if (!tr) return;
-      choose(tr.dataset.id, event); tr.focus({preventScroll: true});
-    });
-    listen(body, 'keydown', event => {
-      const tr = event.target.closest('tr[data-id]'); if (!tr) return;
-      const ids = [...rowNodes.keys()], index = ids.indexOf(tr.dataset.id);
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {
-        event.preventDefault(); commitSelection(ids);
-      } else if (event.key === ' ') {
-        event.preventDefault(); choose(tr.dataset.id, event);
-      } else if (['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) {
-        event.preventDefault();
-        const next = event.key === 'Home' ? 0 : event.key === 'End' ? ids.length - 1 :
-          Math.max(0, Math.min(ids.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1)));
-        if (event.shiftKey) {
-          if (!anchor || !rowNodes.has(anchor)) anchor = tr.dataset.id;
-          choose(ids[next], event);
-        } else anchor = ids[next];
-        active = ids[next]; rowNodes.get(active).tr.focus();
-      }
-    });
-    function renderRows() {
-      const focused = body.contains(document.activeElement), top = scroll.scrollTop, left = scroll.scrollLeft;
-      const fragment = document.createDocumentFragment(); rowNodes = new Map();
-      const rows = model.get('rows') || [];
-      rows.forEach((row, index) => {
-        const tr = document.createElement('tr'); tr.dataset.id = row.id;
-        tr.tabIndex = 0; tr.setAttribute('aria-rowindex', index + 2);
-        let checkbox;
-        columns.forEach(([key], i) => {
-          const td = tr.insertCell(); const cell = document.createElement('div'); cell.className = 'ud-cell';
-          const value = String(row[key] || ''); cell.title = value;
-          if (!i) {
-            checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.tabIndex = -1;
-            checkbox.setAttribute('aria-label', `Select ${row.name}`); cell.append(checkbox);
-          }
-          cell.append(document.createTextNode(value)); td.append(cell);
-        });
-        rowNodes.set(row.id, {tr, checkbox}); fragment.append(tr);
-      });
-      if (!rows.length) {
-        const tr = document.createElement('tr'), td = tr.insertCell(); td.colSpan = columns.length;
-        td.textContent = 'No files in the queue.'; fragment.append(tr);
-      }
-      body.replaceChildren(fragment); updateSelection();
-      if (focused && rowNodes.has(active)) rowNodes.get(active).tr.focus({preventScroll: true});
-      scroll.scrollTop = top; scroll.scrollLeft = left;
-    }
-    model.on('change:rows', renderRows); model.on('change:selected_ids', updateSelection);
-    model.on('change:column_widths', readWidths);
-    readWidths(); renderRows();
-    return () => {
-      abort.abort(); model.off('change:rows', renderRows);
-      model.off('change:selected_ids', updateSelection); model.off('change:column_widths', readWidths);
-      root.remove();
-    };
-  }
-};
-"""
-
-
-def _create_queue_widget():
-    """A resizable table with the old selection API used by queue actions."""
-    try:
-        try:
-            import anywidget
-        except ImportError:
-            if drive is None:
-                raise
-            import sys
-            print('🛠️ Installing queue table support...')
-            subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'anywidget>=0.9,<1'],
-                           check=True, timeout=120)
-            import anywidget
-        import traitlets
-        if drive is not None:
-            from google.colab import output
-            output.enable_custom_widget_manager()
-
-        class QueueTable(anywidget.AnyWidget):
-            _esm = _QUEUE_TABLE_ESM
-            _css = _QUEUE_TABLE_CSS
-            rows = traitlets.List(traitlets.Dict()).tag(sync=True)
-            selected_ids = traitlets.List(traitlets.Unicode()).tag(sync=True)
-            column_widths = traitlets.List(traitlets.Int(), [72, 330, 110, 90, 480, 180]).tag(sync=True)
-            _options = ()
-
-            @property
-            def options(self):
-                return self._options
-
-            @options.setter
-            def options(self, values):
-                self._options = tuple(values)
-                self.selected_ids = []
-                if not self._options:
-                    self.rows = []
-
-            def set_rows(self, rows):
-                self.rows = rows
-
-            @property
-            def value(self):
-                selected = set(self.selected_ids)
-                return tuple(option for option, row in zip(self.options, self.rows)
-                             if row['id'] in selected)
-
-            @value.setter
-            def value(self, values):
-                selected = set(values)
-                self.selected_ids = [row['id'] for option, row in zip(self.options, self.rows)
-                                     if option in selected]
-
-        return QueueTable(layout=widgets.Layout(width='100%', min_width='0', margin='0'))
-    except Exception as e:
-        print(f'⚠️ Resizable queue unavailable; using the standard list ({type(e).__name__}).')
-        return widgets.SelectMultiple(options=[],
-                                      layout=widgets.Layout(width='100%', min_width='0', height='280px', margin='0'))
-
-
-queue_list = _create_queue_widget()
-
-# The custom Colab widget manager also renders the standard controls. Use a
-# native disclosure for progress so expansion does not rely on Accordion's
-# child-view/layout machinery or on Python processing a click during a download.
-_DOWNLOAD_PROGRESS_CSS = """
-.ud-download-progress { color: var(--jp-ui-font-color1, #202124); font: 13px system-ui, sans-serif;
-  border: 1px solid #b8bec6; border-radius: 4px; }
-.ud-download-progress summary { cursor: pointer; padding: 8px 10px;
-  background: var(--jp-layout-color2, #f1f3f5); user-select: none; }
-.ud-download-progress summary:focus-visible { outline: 2px solid #4285f4; outline-offset: -2px; }
-.ud-download-progress .ud-progress-body { padding: 6px 10px; }
-.ud-download-progress .ud-progress-row { display: flex; align-items: center; gap: 12px; padding: 5px 0; }
-.ud-download-progress .ud-progress-name { flex: 0 1 45%; min-width: 0; overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap; }
-.ud-download-progress progress { flex: 1; min-width: 60px; height: 16px; accent-color: #4285f4; }
-.ud-download-progress progress[data-state=warning] { accent-color: #e5a100; }
-.ud-download-progress progress[data-state=success] { accent-color: #268a43; }
-.ud-download-progress progress[data-state=danger] { accent-color: #d93025; }
-"""
-
-_DOWNLOAD_PROGRESS_ESM = r"""
-export default {
-  render({model, el}) {
-    const details = document.createElement('details'); details.className = 'ud-download-progress';
-    const summary = document.createElement('summary');
-    summary.title = 'Show or hide individual download progress';
-    const body = document.createElement('div'); body.className = 'ud-progress-body';
-    details.append(summary, body); el.append(details);
-    details.open = Boolean(model.get('expanded'));
-    function rememberExpansion() {
-      // Native <details> opens immediately even while the kernel is busy. Only
-      // remember the choice for redisplay; streamed updates never set `open`.
-      model.set('expanded', details.open); model.save_changes();
-    }
-    details.addEventListener('toggle', rememberExpansion);
-    function updateTitle() { summary.textContent = model.get('title'); }
-    const rows = new Map();
-    function updateBars() {
-      const bars = model.get('bars') || [], keep = new Set(bars.map(bar => bar.id));
-      rows.forEach((row, id) => { if (!keep.has(id)) { row.node.remove(); rows.delete(id); } });
-      bars.forEach((bar, index) => {
-        let row = rows.get(bar.id);
-        if (!row) {
-          const node = document.createElement('div'); node.className = 'ud-progress-row';
-          const name = document.createElement('span'); name.className = 'ud-progress-name';
-          const progress = document.createElement('progress'); progress.max = 100;
-          node.append(name, progress); row = {node, name, progress}; rows.set(bar.id, row);
-        }
-        if (row.name.textContent !== bar.description) row.name.textContent = bar.description;
-        if (row.name.title !== bar.description) row.name.title = bar.description;
-        const value = Math.max(0, Math.min(100, Number(bar.value) || 0));
-        if (row.progress.value !== value) row.progress.value = value;
-        if (row.progress.dataset.state !== bar.state) row.progress.dataset.state = bar.state;
-        if (row.progress.getAttribute('aria-label') !== bar.description)
-          row.progress.setAttribute('aria-label', bar.description);
-        if (body.children[index] !== row.node) body.insertBefore(row.node, body.children[index] || null);
-      });
-    }
-    model.on('change:title', updateTitle); model.on('change:bars', updateBars);
-    updateTitle(); updateBars();
-    return () => {
-      details.removeEventListener('toggle', rememberExpansion);
-      model.off('change:title', updateTitle); model.off('change:bars', updateBars); details.remove();
-    };
-  }
-};
-"""
-
-
-def _create_download_progress_panel(fallback):
-    """Use native browser expansion alongside the custom queue renderer."""
-    if not hasattr(queue_list, 'set_rows'):
-        return fallback  # Keep the standard controls when custom widgets aren't available.
-    try:
-        import anywidget
-        import traitlets
-
-        class DownloadProgressPanel(anywidget.AnyWidget):
-            _esm = _DOWNLOAD_PROGRESS_ESM
-            _css = _DOWNLOAD_PROGRESS_CSS
-            title = traitlets.Unicode('📥 Individual downloads').tag(sync=True)
-            bars = traitlets.List(traitlets.Dict()).tag(sync=True)
-            expanded = traitlets.Bool(False).tag(sync=True)
-
-            def set_title(self, index, title):
-                self.title = title
-
-            def set_bars(self, bars):
-                self.bars = [dict(id=bar.model_id, description=bar.description,
-                                  value=bar.value, state=bar.bar_style) for bar in bars]
-
-        panel = DownloadProgressPanel(layout=widgets.Layout(width='98%', display='none'))
-        fallback.close()
-        return panel
-    except Exception:
-        return fallback
-
-
-_per_task_accordion = _create_download_progress_panel(_per_task_accordion)
-
+queue_list = widgets.SelectMultiple(options=[], description='Queue:', layout=widgets.Layout(width='98%', height='200px'))
 btn_queue_up = widgets.Button(description="▲ Up", button_style='', layout=widgets.Layout(width='80px'))
 btn_queue_down = widgets.Button(description="▼ Down", button_style='', layout=widgets.Layout(width='80px'))
 btn_queue_select_all = widgets.Button(description="Select All", button_style='', layout=widgets.Layout(width='80px'))
@@ -1548,11 +1131,8 @@ playlist_options = widgets.HBox([
     playlist_selection
 ], layout=widgets.Layout(display='none'))  # Hidden by default
 queue_ui = widgets.VBox([
-    _aligned_links_row(widgets.VBox([
-        widgets.HTML("<b>📋 Queue Preview</b> <small>(Select items to manage)</small>",
-                     layout=widgets.Layout(margin='0 0 6px 0')),
-        queue_list,
-    ], layout=widgets.Layout(width='100%', min_width='0', flex='1 1 0%', margin='0'))),
+    widgets.HTML("<b>📋 Queue Preview</b> <small>(Select items to manage)</small>"),
+    queue_list,
     identity_row,
     route_row,
     season_override_row,
@@ -1560,15 +1140,15 @@ queue_ui = widgets.VBox([
     playlist_options,
     queue_options,
     queue_controls
-], layout=widgets.Layout(display='none', width='100%', margin='0'))  # Hidden by default
+], layout=widgets.Layout(display='none'))  # Hidden by default
 
 
 input_ui = widgets.VBox([
-    widgets.HTML("<h3>🚀 Ultimate Downloader v7.0</h3>"),
+    widgets.HTML("<h3>🚀 Ultimate Downloader v6.9</h3>"),
     widgets.HBox([auto_organize_checkbox, debrid_service_toggle]),
     widgets.HBox([concurrent_slider, auto_retry_input]),
-    links_row,
-    widgets.HBox([btn, btn_quick, btn_stop, btn_retry, btn_resume, btn_restart, btn_history, btn_settings, btn_about]),
+    text_area,
+    widgets.HBox([btn, btn_quick, btn_retry, btn_resume, btn_restart, btn_history, btn_settings, btn_about]),
     stop_hint,
     settings_ui,
     about_ui,
@@ -1576,7 +1156,6 @@ input_ui = widgets.VBox([
     progress_bar,
     _per_task_accordion,
     status_label,
-    live_log,
     widgets.HTML("<hr>")
 ])
 
@@ -1622,28 +1201,26 @@ def save_session(
     if throttle and time.time() - _last_session_save < SESSION_SAVE_MIN_INTERVAL:
         return
     try:
-        with _session_save_lock:
-            session = {
-                "version": "7.0",
-                "started_at": datetime.now().isoformat(),
-                "playlist_range": playlist_range,
-                "yt_success": yt_success,
-                "yt_fail": yt_fail,
-                "subtitle_langs": list(subtitle_langs_value) if subtitle_langs_value else ['en', 'vi'],
-                "tasks": [asdict(t) for t in tasks]
-            }
-            with open(SESSION_FILE, 'w') as f:
-                json.dump(session, f, indent=2)
-            _last_session_save = time.time()
+        session = {
+            "version": "6.9",
+            "started_at": datetime.now().isoformat(),
+            "playlist_range": playlist_range,
+            "yt_success": yt_success,
+            "yt_fail": yt_fail,
+            "subtitle_langs": list(subtitle_langs_value) if subtitle_langs_value else ['en', 'vi'],
+            "tasks": [asdict(t) for t in tasks]
+        }
+        with _session_save_lock, open(SESSION_FILE, 'w') as f:
+            json.dump(session, f, indent=2)
+        _last_session_save = time.time()
     except Exception as e:
         print(f"⚠️ Could not save session: {e}")
 
 def clear_session():
     """Delete session file after successful completion."""
     try:
-        with _session_save_lock:
-            if os.path.exists(SESSION_FILE):
-                os.remove(SESSION_FILE)
+        if os.path.exists(SESSION_FILE):
+            os.remove(SESSION_FILE)
     except Exception:
         pass
 
@@ -1882,249 +1459,6 @@ def _do_clear_session():
 # --- QUEUE MANAGEMENT ---
 pending_queue: List[DownloadTask] = []  # Global queue state
 
-
-class LiveBatchManager:
-    """One running batch, including tasks committed after it started.
-
-    The lock makes the transition from an empty batch to a finished batch atomic
-    with adding work. Parallel additions join the current pool; additions during
-    sequential processing form another wave before the batch is declared done.
-    """
-    def __init__(self, tasks: List[DownloadTask], mode: str):
-        self.lock = Lock()
-        self.token = uuid4().hex
-        self.mode = mode
-        self.all_tasks = list(tasks)
-        self.pending_parallel: List[DownloadTask] = []
-        self.pending_wave: List[DownloadTask] = []
-        self.parallel_view: Optional[List[DownloadTask]] = None
-        self.parallel_open = False
-        self.running = True
-
-    def is_running(self) -> bool:
-        with self.lock:
-            return self.running
-
-    def add(self, tasks: List[DownloadTask]) -> bool:
-        with self.lock:
-            if not self.running:
-                return False
-            self.all_tasks.extend(tasks)
-            runnable = [t for t in tasks if t.status == 'pending']
-            if self.parallel_open:
-                parallel = [t for t in runnable if t.link_type not in SEQUENTIAL_LINK_TYPES]
-                self.pending_parallel.extend(parallel)
-                self.pending_wave.extend(t for t in runnable if t.link_type in SEQUENTIAL_LINK_TYPES)
-                if self.parallel_view is not None:
-                    self.parallel_view.extend(parallel)
-            else:
-                self.pending_wave.extend(runnable)
-            return True
-
-    def begin_parallel(self, view: List[DownloadTask]):
-        with self.lock:
-            self.parallel_view = view
-            self.parallel_open = True
-
-    def take_parallel(self) -> List[DownloadTask]:
-        with self.lock:
-            tasks, self.pending_parallel = self.pending_parallel, []
-            return tasks
-
-    def close_parallel_if_empty(self) -> bool:
-        """Return False when an addition raced the pool's final completion."""
-        with self.lock:
-            if self.pending_parallel:
-                return False
-            self.parallel_open = False
-            self.parallel_view = None
-            return True
-
-    def next_wave_or_finish(self) -> Optional[List[DownloadTask]]:
-        with self.lock:
-            if self.pending_wave:
-                tasks, self.pending_wave = self.pending_wave, []
-                return tasks
-            self.running = False
-            return None
-
-    def close(self):
-        with self.lock:
-            self.running = False
-            self.parallel_open = False
-            self.parallel_view = None
-
-
-_live_batch: Optional[LiveBatchManager] = None
-_last_live_status: Optional[dict] = None
-_live_status_tasks: Optional[List[DownloadTask]] = None
-
-
-def _colab_live_status_snapshot(token: str):
-    """Serve one browser-requested snapshot; no background widget push is needed."""
-    global _colab_live_status_active
-    manager = _live_batch
-    if manager is None or manager.token != token:
-        last = _last_live_status
-        if last is not None and last.get('token') == token:
-            return JSON(last)
-        return JSON({'token': token, 'running': False, 'progress': 0,
-                     'description': 'Download finished', 'summary': '',
-                     'bars': [], 'log': ''})
-
-    # The first successful browser poll can replace the stale Colab widget views.
-    if not _colab_live_status_active:
-        _colab_live_status_active = True
-        progress_bar.layout.display = 'none'
-        _per_task_accordion.layout.display = 'none'
-        status_label.layout.display = 'none'
-        live_log.layout.display = 'none'
-
-    with manager.lock:
-        current_tasks = globals().get('_live_status_tasks')
-        tasks = list(current_tasks if current_tasks is not None else manager.all_tasks)
-    with _live_log_lock:
-        log_text = ''.join(_live_log_messages)[-12000:]
-    bars_by_id = {task_id: dict(id=task_id, description=bar.description,
-                                value=float(bar.value), state=bar.bar_style)
-                  for task_id, bar in list(_per_task_bars.items())}
-    done = sum(t.status in ('done', 'skipped') for t in tasks)
-    moving = sum(t.status == 'moving' for t in tasks)
-    failed = sum(t.status == 'failed' for t in tasks)
-    active = [t for t in tasks if t.status == 'downloading']
-    # Sequential TorBox/RD transfers have no progress monitor. Read their aria2
-    # stats here, and keep parallel rows current even if widget sync is delayed.
-    for task in active:
-        stats = download_stats.get(task.id, {})
-        pct = max(0.0, min(100.0, float(stats.get('pct', 0))))
-        speed = float(stats.get('speed_mbs', 0))
-        name = (task.filename or 'download')[:30]
-        detail = 'low disk' if stats.get('disk_wait') else f'{speed:.1f} MB/s' if speed > 0 else 'starting...'
-        bars_by_id[task.id] = dict(id=task.id, description=f'{name}  {int(pct)}% ({detail})',
-                                   value=pct, state='info' if stats.get('disk_wait') else 'warning')
-    bars = list(bars_by_id.values())
-    active_fraction = sum(max(0.0, min(100.0, float(download_stats.get(t.id, {}).get('pct', 0)))) / 100.0
-                          for t in active)
-    total = len(tasks)
-    overall_progress = 100.0 * (done + moving + active_fraction) / total if total else 0.0
-    label = '⚡' if active else '📤' if moving else '✅' if done == total else '⚠️' if failed else 'DL'
-    description = f'{label} {done}/{total}'
-    summary = re.sub(r'<[^>]*>', '', html.unescape(status_label.value or ''))
-    current_stage = progress_bar.description
-    if current_stage and current_stage != description and not re.search(r'\d+/\d+', current_stage):
-        summary = f'{current_stage} · {summary}' if summary else current_stage
-    return JSON({
-        'token': token, 'running': True, 'updated_at': time.time(),
-        'progress': overall_progress,
-        'description': description, 'summary': summary,
-        'counts': {'done': done, 'total': total, 'failed': failed},
-        'bars': bars, 'log': log_text,
-    })
-
-
-def _colab_live_status_html(token: str):
-    """Render a status view that polls from Colab's browser, rather than Python pushing."""
-    markup = r"""
-<div id="__DOM_ID__" style="border:1px solid #888;border-radius:5px;padding:8px;margin:6px 0;color:inherit">
-  <div style="font-weight:600">Live download status <small data-connection style="font-weight:normal">Connecting...</small></div>
-  <div data-description style="margin:6px 0">Starting...</div>
-  <progress data-progress max="100" value="0" style="width:100%;height:16px"></progress>
-  <div data-summary style="margin:5px 0"></div>
-  <details data-files><summary>Individual downloads</summary><div data-rows></div></details>
-  <pre data-log style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:220px;overflow:auto;margin:8px 0 0"></pre>
-</div>
-<script>
-(function() {
-  const token = __TOKEN__;
-  const root = document.getElementById('__DOM_ID__');
-  if (!root) return;
-  const find = name => root.querySelector('[data-' + name + ']');
-  let waiting = false;
-  let timer;
-  async function poll() {
-    if (waiting) return;
-    waiting = true;
-    try {
-      if (!window.google?.colab?.kernel?.invokeFunction) throw new Error('Colab callback unavailable');
-      const response = await google.colab.kernel.invokeFunction('ultimate_downloader.live_status', [token], {});
-      const state = response?.data?.['application/json'];
-      if (!state || state.token !== token) throw new Error('Invalid status response');
-      const updated = state.updated_at ? new Date(state.updated_at * 1000).toLocaleTimeString() : '';
-      find('connection').textContent = state.running ? '· updated ' + updated : '· finished';
-      find('description').textContent = state.description || '';
-      find('progress').value = Math.max(0, Math.min(100, Number(state.progress) || 0));
-      find('summary').textContent = state.summary || '';
-      const log = find('log');
-      const followLog = log.scrollHeight - log.scrollTop - log.clientHeight < 24;
-      log.textContent = state.log || '';
-      if (followLog) log.scrollTop = log.scrollHeight;
-      const rows = find('rows');
-      rows.replaceChildren();
-      for (const bar of state.bars || []) {
-        const row = document.createElement('div');
-        row.style.cssText = 'display:flex;align-items:center;gap:8px;margin:4px 0';
-        const name = document.createElement('span');
-        name.textContent = bar.description;
-        name.style.cssText = 'flex:0 1 50%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
-        const progress = document.createElement('progress');
-        progress.max = 100;
-        progress.value = Math.max(0, Math.min(100, Number(bar.value) || 0));
-        progress.style.cssText = 'flex:1;min-width:60px';
-        row.append(name, progress);
-        rows.append(row);
-      }
-      if (!state.running) clearInterval(timer);
-    } catch (error) {
-      find('connection').textContent = '· reconnecting (' + String(error.message || error) + ')';
-    } finally {
-      waiting = false;
-    }
-  }
-  timer = setInterval(poll, 1000);
-  poll();
-})();
-</script>
-"""
-    return HTML(markup.replace('__DOM_ID__', 'ud-live-' + token)
-               .replace('__TOKEN__', json.dumps(token)))
-
-
-def _restore_standard_status_widgets():
-    """Show the normal progress widgets for synchronous runs."""
-    global _colab_live_status_active
-    _colab_live_status_active = False
-    progress_bar.layout.display = 'block'
-    status_label.layout.display = 'block'
-    _per_task_accordion.layout.display = 'block' if _per_task_bars else 'none'
-    live_log.layout.display = 'none'
-
-
-def _running_live_batch() -> Optional[LiveBatchManager]:
-    batch = _live_batch
-    return batch if batch is not None and batch.is_running() else None
-
-
-def _set_live_controls():
-    """Keep the link field usable without allowing a second concurrent batch."""
-    for control in (auto_organize_checkbox, debrid_service_toggle, concurrent_slider,
-                    auto_retry_input, btn_settings, btn_history,
-                    btn_restart):
-        control.disabled = True
-    btn.description = 'Add Links'
-    btn.icon = 'plus'
-    btn.disabled = False
-    btn_quick.disabled = True
-    btn_resume.disabled = True
-    btn_stop.layout.display = 'inline-block'
-
-
-def stop_live_batch(b=None):
-    if _live_batch is None:
-        return
-    btn_stop.disabled = True
-    stop_active_downloads()
-    print('🛑 Stopping active downloads. The remaining queue will be saved for Resume.')
-
 def _queue_dest_preview(task) -> Optional[str]:
     """Resolved destination for a queue row — the full Drive-relative path the file
     will take, library folder included (e.g. 'TV Shows/Detective Conan (1996)/
@@ -2160,29 +1494,23 @@ def update_queue_display(preserve_selection: bool = True):
     Only a newly loaded queue explicitly selects everything."""
     selected = set(_selected_queue_indices()) if preserve_selection else None
     options = []
-    rows = []
 
     for i, task in enumerate(pending_queue):
         source_icon = {"gofile": "📁", "pixeldrain": "💾", "rd": "⚡", "tb": "📦", "tb_host": "📦", "direct": "🔗", 
                        "youtube": "▶️", "mega": "☁️", "mediafire": "🔥", "1fichier": "📦",
                        "magnet": "🧲", "magnet_file": "🧲", "tb_magnet_file": "🧲", "archive": "📚",
                        "fshare": "🇻🇳", "okru": "🟠"}.get(task.link_type, "📄")
-        filename = _strip_size_suffix(task.filename) if task.filename else task.url
-        name = filename
-        overrides = []
+        name = task.filename[:50] if task.filename else task.url[:50]
         sov = getattr(task, 'season_override', None)
         if sov is not None:
-            overrides.append(f'S{sov:02d}')
             name += f"  [S{sov:02d}]"  # forced season marker
         eov = getattr(task, 'episode_override', None)
         if eov is not None:
             eev = getattr(task, 'episode_end_override', None)
             # forced episode marker; a range renumber shows its span (E07-E09)
             name += f"  [E{eov:02d}-E{eev:02d}]" if eev else f"  [E{eov:02d}]"
-            overrides.append(f'E{eov:02d}-E{eev:02d}' if eev else f'E{eov:02d}')
         pov = getattr(task, 'part_override', None)
         if pov is not None:
-            overrides.append(f'pt{pov}' if pov else 'No part')
             name += f"  [pt{pov}]" if pov else "  [no pt]"  # forced part suffix marker
         ov = getattr(task, 'tmdb_override', None)
         m = get_tmdb_match(task.filename) if task.filename else None
@@ -2200,31 +1528,7 @@ def update_queue_display(preserve_selection: bool = True):
         else:
             options.append(f"{i+1}. {source_icon} {name}")
 
-        if ov == TMDB_CLEARED:
-            overrides.append('No TMDB')
-        elif ov:
-            overrides.append('Match')
-        if getattr(task, 'name_override', None):
-            overrides.append('Name')
-        if getattr(task, 'route_override', None):
-            overrides.append(task.route_override.replace('_', ' '))
-        size = re.search(r'\(([^()]*[KMG]i?B)\)\s*$', task.filename or '')
-        source = {'tb_magnet_file': 'TorBox', 'tb': 'TorBox', 'tb_host': 'TorBox',
-                  'magnet_file': 'Real-Debrid', 'rd': 'Real-Debrid'}.get(
-                      task.link_type, task.link_type.replace('_', ' ').title())
-        destination = dest
-        if not destination and m:
-            destination = m['name'] + (f" ({m['year']})" if m.get('year') else '')
-        if not destination:
-            destination = ('After extraction' if os.path.splitext(filename)[1].lower()
-                           in ('.rar', '.zip', '.7z') else 'Not resolved')
-        rows.append(dict(id=task.id, number=str(i + 1), name=filename, source=source,
-                         size=size.group(1) if size else '—', destination=destination,
-                         overrides=', '.join(overrides) or '—'))
-
     queue_list.options = options
-    if hasattr(queue_list, 'set_rows'):
-        queue_list.set_rows(rows)
     if selected is not None:
         # Keep the user's selection across a live settings refresh (matched by row index)
         queue_list.value = tuple(opt for i, opt in enumerate(options) if i in selected)
@@ -2258,41 +1562,28 @@ for _w in (auto_organize_checkbox, episode_numbering_toggle, tmdb_enabled_checkb
     _w.observe(_on_dest_setting_change, names='value')
 
 
-def show_queue_preview(tasks: List[DownloadTask], mode: str, append: bool = False):
-    """Show resolved tasks, optionally appending while preserving queue choices."""
+def show_queue_preview(tasks: List[DownloadTask], mode: str):
+    """Show queue UI with resolved tasks."""
     global pending_queue
-    live = _running_live_batch() is not None
-    selected_ids = {pending_queue[i].id for i in _selected_queue_indices()
-                    if 0 <= i < len(pending_queue)} if append else set()
-    saved_subs = tuple(subtitle_langs.value) if append and any(
-        t.link_type == 'youtube' for t in pending_queue) else None
-    pending_queue = pending_queue + tasks if append else tasks.copy()
-    selected_ids.update(t.id for t in tasks if t.selected_by_default)
-    tasks = pending_queue
+    pending_queue = tasks.copy()
     
     # Run batch episode analysis to improve episode detection accuracy
     # This analyzes all filenames together to find the varying number (episode) vs constants
     filenames = [t.filename for t in tasks if t.filename]
-    batch_results = (analyze_batch_episodes(filenames, merge=True) if live
-                     else analyze_batch_episodes(filenames))
-    if batch_results:
-        print(f"   🎯 Batch analysis detected episode numbers in {len(batch_results)} files")
+    if len(filenames) >= 2:
+        batch_results = analyze_batch_episodes(filenames)
+        if batch_results:
+            print(f"   🎯 Batch analysis detected episode numbers in {len(batch_results)} files")
 
     # TMDB metadata matching (canonical names, years, season mapping)
     if tmdb_is_enabled():
-        tmdb_matched = (analyze_batch_metadata(filenames, merge=True) if live
-                        else analyze_batch_metadata(filenames))
+        tmdb_matched = analyze_batch_metadata(filenames)
         _apply_tmdb_overrides(pending_queue)  # reapply any prior manual corrections
         if tmdb_matched:
             print(f"   🎬 TMDB matched {tmdb_matched} of {len(filenames)} file(s)")
-    if live:
-        _apply_queue_overrides(pending_queue, merge=True)  # keep active-task overrides
-    else:
-        _apply_queue_overrides(pending_queue)
+    _apply_queue_overrides(pending_queue)  # independent of TMDB — works either way
 
     update_queue_display(preserve_selection=False)
-    queue_list.value = tuple(opt for opt, task in zip(queue_list.options, tasks)
-                             if task.id in selected_ids)
 
     # Hide subtitle and playlist options initially to prevent flash of old content
     queue_options.layout.display = 'none'
@@ -2306,19 +1597,6 @@ def show_queue_preview(tasks: List[DownloadTask], mode: str, append: bool = Fals
     season_override_row.layout.display = _org
     queue_edit_actions.layout.display = _org
     queue_ui.layout.display = 'block'
-    if live:
-        # A running YouTube task reads the batch's subtitle/playlist widgets.
-        # Keep those values fixed while previewing newly added links.
-        queue_options.layout.display = 'none'
-        playlist_options.layout.display = 'none'
-        btn_queue_start_subs.layout.display = 'none'
-        btn_queue_start.description = '➕ Add to Download'
-        btn.description = 'Add Links'
-        btn.icon = 'plus'
-        btn.disabled = False
-        btn_quick.disabled = True
-        print(f"📋 {len(tasks)} new item(s) ready. Review them and click 'Add to Download'.")
-        return
     
     # Check for YouTube/streaming links
     youtube_tasks = [t for t in tasks if t.link_type == 'youtube']
@@ -2380,118 +1658,13 @@ def show_queue_preview(tasks: List[DownloadTask], mode: str, append: bool = Fals
         queue_options.layout.display = 'none'
         btn_queue_start_subs.layout.display = 'none'
     
-    btn.description = 'Add Links'
-    btn.icon = 'plus'
-    btn.disabled = False
+    btn.disabled = True
     btn_quick.disabled = True
-    btn_queue_start.description = '▶ Start Download'
-    if saved_subs is not None:
-        available_codes = {code for _, code in subtitle_langs.options}
-        subtitle_langs.value = tuple(code for code in saved_subs if code in available_codes)
     print(f"📋 Queue loaded with {len(tasks)} items. Review and click 'Start Download' or 'Download Subtitles' to begin.")
-
-
-def _queue_task_key(task: DownloadTask) -> tuple:
-    """Stable resolved-file identity, independent of temporary download URLs."""
-    if task.link_type in ('magnet_file', 'tb_magnet_file'):
-        return task.link_type, task.original_url or task.url
-    if task.link_type == 'youtube':
-        return task.link_type, task.url
-    return task.link_type, task.original_url or task.url, _strip_size_suffix(task.filename)
-
-
-def queue_add_links(b=None):
-    """Resolve another batch without losing queue order, selection or edits."""
-    urls = list(dict.fromkeys(line.strip() for line in text_area.value.splitlines()
-                              if line.strip()))
-    if not urls:
-        print("⚠️ Paste more URLs in the Links field first.")
-        return
-    live = _running_live_batch()
-    controls = (btn, btn_queue_start, btn_queue_start_subs, btn_queue_cancel)
-    previous_states = [control.disabled for control in controls]
-    for control in controls:
-        control.disabled = True
-    start_keep_alive()
-    try:
-        tasks = _resolve_queue_links(urls)
-        if not tasks:
-            print("⚠️ No new files resolved. Your queue and links have been kept.")
-            return
-        seen = {_queue_task_key(task) for task in pending_queue}
-        active_names = {_match_cache_key(task.filename) for task in pending_queue if task.filename} if live else set()
-        if live:
-            with live.lock:
-                seen.update(_queue_task_key(task) for task in live.all_tasks)
-                active_names.update(_match_cache_key(task.filename) for task in live.all_tasks if task.filename)
-        additions = []
-        conflicts = 0
-        for task in tasks:
-            key = _queue_task_key(task)
-            if live and task.filename and _match_cache_key(task.filename) in active_names:
-                conflicts += 1  # filename-keyed naming caches cannot safely serve both tasks at once
-            elif key not in seen:
-                seen.add(key)
-                additions.append(task)
-        if additions:
-            show_queue_preview(additions, 'video', append=True)
-            if not _running_live_batch():
-                save_session(pending_queue, playlist_range=playlist_selection.value.strip())
-        print(f"📋 Added {len(additions)} item(s); skipped {len(tasks) - len(additions) - conflicts} already queued item(s).")
-        if conflicts:
-            print(f"⚠️ {conflicts} file(s) share a name with this active batch. Add those after it finishes to keep their naming separate.")
-        else:
-            text_area.value = ''
-    except KeyboardInterrupt:
-        print("🛑 Adding links interrupted. Your queue has been kept.")
-    except Exception as e:
-        print(f"❌ Could not add links: {e}. Your queue has been kept.")
-    finally:
-        if not live:
-            stop_keep_alive()
-            reset_progress()
-        for control, disabled in zip(controls, previous_states):
-            control.disabled = disabled
-        if _running_live_batch():
-            _set_live_controls()
-
-
-def on_resolve_links(b=None):
-    """Use the same Links field and button for new queues and additions."""
-    if _live_batch is not None and btn.disabled:
-        return
-    if _live_batch is not None and not _running_live_batch():
-        print('⏳ The previous download is finishing. Add the links in a moment.')
-        return
-    if queue_ui.layout.display != 'none' or _running_live_batch():
-        queue_add_links(b)
-    else:
-        execute_batch('video')
-
-
-def _forget_discarded_live_metadata(discarded: List[DownloadTask], retained: List[DownloadTask]):
-    """Remove preview-only naming data without touching active or retained files."""
-    keep = {_match_cache_key(t.filename) for t in retained if t.filename}
-    for task in discarded:
-        if not task.filename:
-            continue
-        key = _match_cache_key(task.filename)
-        if key in keep:
-            continue
-        _batch_episode_cache.pop(_strip_size_suffix(task.filename), None)
-        for cache in (_tmdb_match_cache, _season_override_cache, _episode_override_cache,
-                      _episode_end_override_cache, _name_override_cache, _route_override_cache,
-                      _part_override_cache):
-            cache.pop(key, None)
-
 
 def hide_queue():
     """Hide queue UI and reset state."""
     global pending_queue
-    live = _running_live_batch()
-    if live and pending_queue:
-        with live.lock:
-            _forget_discarded_live_metadata(pending_queue, live.all_tasks)
     pending_queue = []
     queue_ui.layout.display = 'none'
     queue_list.options = []
@@ -2506,13 +1679,8 @@ def hide_queue():
     renumber_start_input.value = ''
     part_override_input.value = ''
     btn_queue_start_subs.layout.display = 'none'
-    btn.description = 'Resolve Links'
-    btn.icon = 'search'
     btn.disabled = False
     btn_quick.disabled = False
-    btn_resume.disabled = False
-    if _running_live_batch():
-        _set_live_controls()
 
 def queue_move_up(b=None):
     """Move selected items up in the queue."""
@@ -2561,12 +1729,7 @@ def queue_remove_selected(b=None):
     if not selected:
         return
     indices_to_remove = {int(s.split('.')[0]) - 1 for s in selected}
-    removed = [t for i, t in enumerate(pending_queue) if i in indices_to_remove]
     pending_queue = [t for i, t in enumerate(pending_queue) if i not in indices_to_remove]
-    live = _running_live_batch()
-    if live:
-        with live.lock:
-            _forget_discarded_live_metadata(removed, live.all_tasks + pending_queue)
     queue_list.value = ()  # Removed rows must not select the files taking their places.
     update_queue_display()
     if not pending_queue:
@@ -2602,29 +1765,8 @@ def queue_sort_alpha(b=None):
 
 def queue_cancel(b=None):
     """Cancel queue and return to link input."""
-    live = _running_live_batch()
     hide_queue()
-    print("📋 New links discarded; downloads continue." if live else "❌ Queue cancelled.")
-
-
-def _prepare_live_additions(tasks: List[DownloadTask]):
-    """Resolve deferred FShare URLs before they enter the active aria2 pool."""
-    fshare = [t for t in tasks if t.link_type == 'fshare' and 'fshare.vn/file/' in t.url]
-    if not fshare:
-        return
-    email = token_fshare_email.value.strip()
-    password = token_fshare_password.value.strip()
-    session = _get_fshare_web_session(email, password) if email and password else None
-    for task in fshare:
-        link = _fshare_web_get_download_link(task.url, session) if session else None
-        if link and link != 'FSHARE_LIMIT_REACHED':
-            task.url = link
-        else:
-            task.status = 'failed'
-            task.error = ('FShare policy restriction' if link == 'FSHARE_LIMIT_REACHED'
-                          else 'FShare login or link resolution failed')
-        time.sleep(1)
-
+    print("❌ Queue cancelled.")
 
 def start_from_queue(b=None, mode="video"):
     """Start downloading selected items from queue."""
@@ -2641,32 +1783,6 @@ def start_from_queue(b=None, mode="video"):
         print("⚠️ No valid items selected!")
         return
     
-    # During a live run this preview contains only new files. Commit them to the
-    # one active batch instead of starting a second download pipeline.
-    live = _running_live_batch()
-    if _live_batch is not None and live is None:
-        print('⏳ The previous download is finishing. This queue is still available.')
-        return
-    if live:
-        fshare_before = {t.id: (t.url, t.status, t.error) for t in selected_tasks
-                         if t.link_type == 'fshare'}
-        _prepare_live_additions(selected_tasks)
-        if live.add(selected_tasks):
-            hide_queue()
-            save_session(live.all_tasks,
-                         playlist_range=playlist_selection.value.strip(),
-                         yt_success=yt_success_cumulative,
-                         yt_fail=yt_fail_cumulative,
-                         subtitle_langs_value=subtitle_langs.value)
-            print(f"➕ Added {len(selected_tasks)} file(s) to the active download.")
-            _set_live_controls()
-            return
-        for task in selected_tasks:
-            if task.id in fshare_before:
-                task.url, task.status, task.error = fshare_before[task.id]
-        print('⏳ The previous download finished while adding these links. The preview is still available; click Start Download again.')
-        return
-
     # Hide queue and start download
     hide_queue()
     if mode == "subs_only":
@@ -2674,91 +1790,8 @@ def start_from_queue(b=None, mode="video"):
     else:
         print(f"🚀 Starting download of {len(selected_tasks)} selected items...")
     
-    # Reviewed queues always use one active batch so links can be added mid-download.
-    _launch_live_batch(selected_tasks, mode)
-
-
-def _launch_live_batch(tasks: List[DownloadTask], mode: str):
-    """Return control to Colab so Add Links and Stop clicks can be handled."""
-    global _live_batch, _last_live_status, _live_status_tasks, _colab_live_status_active
-    if _live_batch is not None:
-        print('⚠️ The previous download is still finishing. Try again in a moment.')
-        return
-    _restore_standard_status_widgets()
-    manager = LiveBatchManager(tasks, mode)
-    _live_batch = manager
-    _last_live_status = None
-    _live_status_tasks = manager.all_tasks
-    _colab_live_status_active = False
-    colab_status_enabled = False
-    try:
-        from google.colab import output as colab_output
-        colab_output.register_callback('ultimate_downloader.live_status', _colab_live_status_snapshot)
-        colab_status_enabled = True
-    except Exception:
-        pass  # Standard widgets remain visible outside Colab.
-    _reset_cancel_state()
-    _set_live_controls()
-    btn.disabled = True
-    with _live_log_lock:
-        _live_log_messages.clear()
-        live_log.value = ''
-    live_log.layout.display = 'block'
-    clear_output(wait=True)
-    display(input_ui)
-    if colab_status_enabled:
-        display(_colab_live_status_html(manager.token))
-
-    def run():
-        global _live_batch, _last_live_status, _colab_live_status_active
-        try:
-            execute_selected_tasks(tasks, mode, live_manager=manager)
-            if _auto_retry_state['pending']:
-                manager.close()  # additions stop at the retry boundary
-                btn.disabled = True
-                btn_quick.disabled = True
-                btn_resume.disabled = True
-                _run_auto_retry_chain(mode)
-        except Exception as e:
-            print(f'❌ Live batch error: {e}')
-        finally:
-            manager.close()
-            try:
-                if queue_ui.layout.display != 'none' and pending_queue and not os.path.exists(SESSION_FILE):
-                    save_session(pending_queue, playlist_range=playlist_selection.value.strip(),
-                                 subtitle_langs_value=subtitle_langs.value)
-                btn_stop.disabled = False
-                btn_stop.layout.display = 'none'
-                for control in (auto_organize_checkbox, debrid_service_toggle, concurrent_slider,
-                                auto_retry_input, btn_settings, btn_history,
-                                btn_restart):
-                    control.disabled = False
-                btn_queue_start.description = '▶ Start Download'
-                if queue_ui.layout.display == 'none':
-                    btn.description = 'Resolve Links'
-                    btn.icon = 'search'
-                    btn_quick.disabled = False
-                    btn_resume.disabled = False
-                else:
-                    btn.description = 'Add Links'
-                    btn.icon = 'plus'
-                    btn.disabled = False
-                    btn_quick.disabled = True
-                    btn_resume.disabled = True
-                    if any(t.link_type == 'youtube' for t in pending_queue):
-                        btn_queue_start_subs.layout.display = 'inline-block'
-            finally:
-                if colab_status_enabled and _colab_live_status_active:
-                    try:
-                        _last_live_status = _colab_live_status_snapshot(manager.token).data
-                        _last_live_status['running'] = False
-                    except Exception:
-                        pass
-                if _live_batch is manager:
-                    _live_batch = None
-                _colab_live_status_active = False
-
-    Thread(target=run, name='ultimate-downloader-batch', daemon=True).start()
+    # Process the selected tasks with the specified mode
+    execute_selected_tasks(selected_tasks, mode)
 
 # --- HELPER FUNCTIONS ---
 def _clear_per_task_bars():
@@ -2768,8 +1801,6 @@ def _clear_per_task_bars():
     _per_task_bars.clear()
     _per_task_done_at.clear()
     _per_task_box.children = []
-    if hasattr(_per_task_accordion, 'set_bars'):
-        _per_task_accordion.set_bars([])
     _per_task_accordion.layout.display = 'none'
 
 def reset_progress():
@@ -2911,7 +1942,7 @@ def _match_cache_key(filename: str) -> str:
     messy filename parsing while their video gets the clean TMDB name."""
     return _split_subtitle_lang(_strip_size_suffix(sanitize_filename(filename)))[0]
 
-def analyze_batch_episodes(filenames: List[str], merge: bool = False) -> Dict[str, int]:
+def analyze_batch_episodes(filenames: List[str]) -> Dict[str, int]:
     """
     Analyze a batch of filenames to detect episode numbers by finding varying patterns.
     
@@ -2921,8 +1952,7 @@ def analyze_batch_episodes(filenames: List[str], merge: bool = False) -> Dict[st
     Returns dict mapping filename -> detected episode number (or None if not found).
     """
     global _batch_episode_cache
-    if not merge:
-        _batch_episode_cache = {}
+    _batch_episode_cache.clear()
     
     if len(filenames) < 2:
         return {}  # Need at least 2 files for batch analysis
@@ -3058,10 +2088,7 @@ def analyze_batch_episodes(filenames: List[str], merge: bool = False) -> Dict[st
             result.pop(key, None)
 
 
-    if merge:
-        _batch_episode_cache = {**result, **_batch_episode_cache}
-    else:
-        _batch_episode_cache = result
+    _batch_episode_cache = result
     return result
 
 def get_batch_episode(filename: str) -> Optional[int]:
@@ -3511,18 +2538,17 @@ def get_part_override(filename: str) -> Optional[int]:
     suffix, N >= 1 = force -ptN."""
     return _part_override_cache.get(_match_cache_key(filename))
 
-def _apply_queue_overrides(tasks: List[DownloadTask], merge: bool = False):
+def _apply_queue_overrides(tasks: List[DownloadTask]):
     """Rebuild the season/episode/name/route override caches from the tasks'
     persisted overrides. Called at every entry point (queue preview, start, quick,
     resume); clearing first means overrides never leak across batches with
     colliding filenames."""
-    if not merge:
-        _season_override_cache.clear()
-        _episode_override_cache.clear()
-        _episode_end_override_cache.clear()
-        _name_override_cache.clear()
-        _route_override_cache.clear()
-        _part_override_cache.clear()
+    _season_override_cache.clear()
+    _episode_override_cache.clear()
+    _episode_end_override_cache.clear()
+    _name_override_cache.clear()
+    _route_override_cache.clear()
+    _part_override_cache.clear()
     for t in tasks:
         if not t.filename:
             continue
@@ -3890,7 +2916,7 @@ def apply_queue_changes(b=None):
             task.part_override = parts[task.id]
         if 'tmdb_override' in updates and task.filename:
             _tmdb_match_cache[_match_cache_key(task.filename)] = updates['tmdb_override']
-    _apply_queue_overrides(pending_queue, merge=_running_live_batch() is not None)
+    _apply_queue_overrides(pending_queue)
     for key, widget in inputs.items():
         if values[key]:
             widget.value = ''
@@ -3921,12 +2947,11 @@ def get_tmdb_match(filename: str) -> Optional[dict]:
         return None
     return _tmdb_match_cache.get(_match_cache_key(filename))
 
-def analyze_batch_metadata(filenames: List[str], merge: bool = False) -> int:
+def analyze_batch_metadata(filenames: List[str]) -> int:
     """Match a batch of filenames against TMDB. Populates _tmdb_match_cache keyed
     by _match_cache_key (size-suffix and subtitle-language stripped). One search per
     distinct (kind, query, year). Returns the number of files matched."""
-    if not merge:
-        _tmdb_match_cache.clear()
+    _tmdb_match_cache.clear()
     if not tmdb_is_enabled() or not filenames:
         return 0
     queries: Dict[Tuple[str, str, Optional[str]], List[str]] = {}
@@ -3954,8 +2979,7 @@ def analyze_batch_metadata(filenames: List[str], merge: bool = False) -> int:
             match = None
         if match:
             for key in keys:
-                if not merge or key not in _tmdb_match_cache:
-                    _tmdb_match_cache[key] = match
+                _tmdb_match_cache[key] = match
                 matched += 1
     _save_tmdb_query_cache()
     if had_error:
@@ -3998,7 +3022,7 @@ def _multi_ep_end(filename: str, m, season_num: int) -> Optional[int]:
         return None
     return end
 
-def detect_episode_info(filename: str, use_batch: bool = True) -> Dict[str, Any]:
+def detect_episode_info(filename: str) -> Dict[str, Any]:
     """Parse a filename for episode/season/show-name markers.
 
     Pure function (no widget/UI access) so the detection logic can be
@@ -4006,7 +3030,6 @@ def detect_episode_info(filename: str, use_batch: bool = True) -> Dict[str, Any]
     is_tv, season, episode, show_name, part_suffix (CJK multi-part),
     english_part_suffix ("Part X"), has_sxe (strict SxxExx/NxN present),
     episode_end (end of a multi-episode range, None for single episodes).
-    use_batch=False ignores prior queue analysis when resolving a new basename.
     """
     # CJK multi-part markers always apply (these genuinely split one episode into parts)
     part_suffix = ""
@@ -4108,7 +3131,7 @@ def detect_episode_info(filename: str, use_batch: bool = True) -> Dict[str, Any]
     episode_detected = False
 
     # PRIORITY 1: Use batch-detected episode if available (most reliable)
-    batch_ep = get_batch_episode(filename) if use_batch else None
+    batch_ep = get_batch_episode(filename)
     if batch_ep is not None:
         episode_num = batch_ep
         is_tv = True
@@ -4380,26 +3403,24 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
         return os.path.join(full_dir, new_filename), "TV"
 
 # --- CORE LOGIC ---
-def setup_environment(needs_mega, needs_ytdlp, needs_aria, during_active=False):
+def setup_environment(needs_mega, needs_ytdlp, needs_aria):
     drive_path = f"{COLAB_ROOT}drive"
     if drive is not None and not os.path.exists(drive_path): drive.mount(drive_path)
     
     # Try to load secrets again (may not have been accessible on initial load)
-    if not during_active:
-        check_and_load_secrets()
+    check_and_load_secrets()
     
     # Restore saved settings now that Drive (and settings.json) is finally readable —
     # the startup load ran before the mount and found nothing. Widgets the user already
     # changed this session keep their values; then save once so choices made before the
     # mount (unsaveable at the time — no Drive) are persisted too.
-    if not during_active:
-        load_dir_settings()
-        save_dir_settings()
+    load_dir_settings()
+    save_dir_settings()
 
     # Drive API auth happens here, on the main thread: Colab renders a consent
     # prompt, and settings (which decide whether the API is wanted at all) have
     # only just been restored above.
-    if drive_api_checkbox.value and not during_active:
+    if drive_api_checkbox.value:
         _init_drive_api()
     
     # Create media folders and config folder
@@ -4408,12 +3429,12 @@ def setup_environment(needs_mega, needs_ytdlp, needs_aria, during_active=False):
         _ensure_dest_dir(full_p)
     if not os.path.exists(UD_CONFIG_PATH): os.makedirs(UD_CONFIG_PATH)
     
-    if needs_ytdlp and (not during_active or not shutil.which('yt-dlp')):
+    if needs_ytdlp:
         # Always upgrade yt-dlp to latest version (YouTube changes frequently)
         print("🛠️ Installing/updating yt-dlp...")
         subprocess.run(["pip", "install", "-U", "yt-dlp"], check=True, stdout=subprocess.DEVNULL)
     else:
-        print("⭐️ Skipping yt-dlp setup (already available or not needed)")
+        print("⭐️ Skipping yt-dlp (Not needed)")
 
     pkg_map = {
         "unrar": "unrar", 
@@ -6025,24 +5046,21 @@ def process_magnet_file_tasks(tasks: List[DownloadTask], rd_key: str) -> int:
                             if 'download' in d:
                                 print(f"   📥 [{idx}/{len(links)}] {d.get('filename', 'file')[:50]}")
                                 task_id = task.id if task else f"rd_{str(uuid4())[:8]}"
-                                if task:
-                                    task.status = "downloading"
                                 f = download_with_aria2(d['download'], d['filename'], COLAB_ROOT, task_id=task_id)
                                 if f is DUPLICATE_SKIP:
                                     if task: task.status, task.error = "skipped", None
                                     success_count += 1
                                 elif f:
-                                    if task: task.status = "moving"
                                     handle_file_processing(f, source="magnet")
                                     if task: task.status, task.error = "done", None
                                     success_count += 1
                                 else:
-                                    if task: task.status, task.error = "failed", "Download failed"
+                                    if task: task.error = "Download failed"
                             else:
                                 if task: task.error = f"Unrestrict error: {d.get('error', 'unknown')}"
                         except Exception as e:
                             print(f"   ❌ Failed to download: {str(e)[:60]}")
-                            if task: task.status, task.error = "failed", str(e)[:100]
+                            if task: task.error = str(e)[:100]
 
                     break
                 
@@ -6087,13 +5105,11 @@ def _update_torrent_progress(prefix: str, status: str, progress_pct: float,
             progress_bar.description = f"{prefix}: {status}"
 
 def _make_torrent_file_task(magnet_url: str, link_type: str, torrent_id, file_id,
-                            file_name: str, size_bytes: int,
-                            allow_small: bool = False) -> Optional[DownloadTask]:
+                            file_name: str, size_bytes: int) -> Optional[DownloadTask]:
     """Build a queue task for one file inside a debrid torrent.
-    Returns None for tiny files (samples/NFOs) unless they are subtitles or
-    live in an extras folder, where the user can opt into them in the queue."""
+    Returns None for tiny files (samples/NFOs) unless they are subtitles."""
     size_mb = size_bytes / (1024 * 1024)
-    if not allow_small and size_mb < 1 and not file_name.lower().endswith(tuple(KEEP_EXTENSIONS)):
+    if size_mb < 1 and not file_name.lower().endswith(tuple(KEEP_EXTENSIONS)):
         return None
     return DownloadTask(
         url=magnet_url,
@@ -6269,87 +5285,6 @@ def _tb_folder_file_is_irrelevant(file_name: str, size_bytes: int) -> bool:
             and re.search(r'(?<![a-z0-9])sample(?![a-z0-9])', stem) is not None)
 
 
-def _tb_file_in_extras_folder(raw_name: str) -> bool:
-    """Recognize ancillary folders in a TorBox file's original relative path."""
-    parents = unquote(raw_name).replace('\\', '/').split('/')[:-1]
-    for parent in parents:
-        label = re.sub(r'[\s._-]+', ' ', parent).strip().casefold()
-        if re.fullmatch(
-            r'(?:extras?|bonus(?: features?| material| content)?|special features?|'
-            r'featurettes?|deleted scenes?|behind the scenes|trailers?|samples?|'
-            r'bloopers?|outtakes?|interviews?|making of)(?: \d+)?', label):
-            return True
-    return False
-
-
-def _tb_contextual_filename(raw_name: str, item_name: str = '') -> str:
-    """Fill missing episode identity from TorBox's nearest useful parent folders.
-
-    Produce one safe local filename so queue caches, downloads, duplicate checks
-    and saved sessions all use the same identity. Explicit file seasons and show
-    names win over folder hints; the original basename (including subtitle tags)
-    remains at the end. Never copy folder episode ranges into a single file.
-    """
-    parts = [part for part in unquote(raw_name).replace('\\', '/').split('/')
-             if part and part not in ('.', '..')]
-    if not parts:
-        return sanitize_filename(raw_name)
-    filename = sanitize_filename(parts[-1])
-    parse_name, _ = _split_subtitle_lang(filename)
-    info = detect_episode_info(parse_name, use_batch=False)
-    if not info['episode_detected']:
-        return filename
-
-    season = None
-    folder_show = None
-    # mylist sometimes supplies only short filenames; its item name is then the
-    # only show/season context. Paths take priority over that outermost fallback.
-    parents = ([item_name] if item_name else []) + parts[:-1]
-    for parent in reversed(parents):
-        parent = sanitize_filename(parent)
-        marker = re.search(r'(?i)\b(?:Season[ ._-]*|S)(\d{1,2})(?:\b|(?=EP?\d))', parent)
-        if marker and season is None:
-            season = int(marker.group(1))
-        candidate = clean_show_name(parent[:marker.start()] if marker else parent)
-        if candidate.casefold() in {
-            'unknown show', 'subs', 'subtitles', 'subtitle', 'video', 'videos',
-            'extras', 'bonus', 'samples', 'sample', 'complete', 'batch', 'collection',
-            'en', 'eng', 'vi', 'vie', 'zh', 'chi', 'zho', 'ja', 'jpn',
-            'english', 'vietnamese', 'chinese', 'japanese',
-        }:
-            continue
-        if folder_show is None:
-            folder_show = candidate
-
-    # A title after a leading episode marker is usually the episode's title,
-    # not the show's name, when a parent folder supplies a show identity.
-    marker_first = re.match(
-        r'(?i)^(?:\[[^\]]*\D[^\]]*\][ ._-]*)*(?:S\d{1,2}EP?\d|\d{1,2}x\d|'
-        r'(?:Episode|EP?|Episodio|Tập|Folge|Capitulo)[ ._-]*\d|\[\d{1,4}\]|\d{1,4}\b)',
-        parse_name) is not None
-    if info['has_sxe']:
-        strict_marker = re.search(r'(?i)\b(?:S\d{1,2}EP?\d|\d{1,2}x\d)', parse_name)
-        # Numeric show names (24) and bracketed titles are real identities when
-        # they precede an explicit marker; don't mistake them for bare episodes.
-        marker_first = clean_show_name(parse_name[:strict_marker.start()]) == 'Unknown Show'
-    needs_name = marker_first or info['show_name'] == 'Unknown Show'
-    title = folder_show if needs_name else info['show_name']
-    if not title or (info['has_sxe'] and not needs_name):
-        return filename
-    if not needs_name and season is None:
-        return filename
-    if season is None and not info['has_sxe']:
-        # A folder can supply only the show name (e.g. One Piece/1085.mkv).
-        # Do not invent an explicit S01 marker that would disable TMDB's
-        # absolute-episode mapping for such files.
-        return sanitize_filename(f"{title} - {filename}")
-    season = info['season'] if info['has_sxe'] or season is None else season
-    episode_marker = f"S{season:02d}E{info['episode']:02d}"
-    if info['episode_end'] is not None:
-        episode_marker += f"-E{info['episode_end']:02d}"
-    return sanitize_filename(f"{title} - {episode_marker} - {filename}")
-
-
 def resolve_tb_folder_files(url: str, tb_key: str) -> List[DownloadTask]:
     """Resolve a torbox.app/download?id=X&type=Y share link (the site's
     'Copy JDownloader Folder Links' button) into per-file queue tasks.
@@ -6392,17 +5327,15 @@ def resolve_tb_folder_files(url: str, tb_key: str) -> List[DownloadTask]:
     tasks = []
     for f in files:
         file_id = f.get('id', 0)
-        # Keep useful folder identity before flattening into a local filename.
+        # TorBox 'name' is the file's path within the torrent; strip the leading folder
+        # (often a release/quality string) so it can't pollute show-name detection.
         raw_name = f.get('name') or f.get('short_name') or f'file_{file_id}'
         file_name = os.path.basename(raw_name.replace('\\', '/')) or raw_name
-        is_extra = _tb_file_in_extras_folder(raw_name)
-        if not is_extra and _tb_folder_file_is_irrelevant(file_name, f.get('size', 0)):
+        if _tb_folder_file_is_irrelevant(file_name, f.get('size', 0)):
             continue
-        file_name = _tb_contextual_filename(raw_name, name)
         task = _make_torrent_file_task(url, "tb_magnet_file", group_id,
-                                       file_id, file_name, f.get('size', 0), allow_small=is_extra)
+                                       file_id, file_name, f.get('size', 0))
         if task:
-            task.selected_by_default = not is_extra
             tasks.append(task)
     return tasks
 
@@ -6564,12 +5497,9 @@ def resolve_tb_magnet_files(magnet_url: str, tb_key: str) -> List[DownloadTask]:
                     # Strip any leading folder from the torrent-relative path (see resolve_tb_folder_files)
                     raw_name = f.get('name') or f.get('short_name') or f'file_{file_id}'
                     file_name = os.path.basename(raw_name.replace('\\', '/')) or raw_name
-                    is_extra = _tb_file_in_extras_folder(raw_name)
                     task = _make_torrent_file_task(magnet_url, "tb_magnet_file", torrent_id,
-                                                   file_id, file_name, f.get('size', 0),
-                                                   allow_small=is_extra)
+                                                   file_id, file_name, f.get('size', 0))
                     if task:
-                        task.selected_by_default = not is_extra
                         tasks.append(task)
 
                 return tasks
@@ -6689,24 +5619,20 @@ def process_tb_magnet_file_tasks(tasks: List[DownloadTask], tb_key: str) -> int:
                                 # Clean filename (remove size suffix for actual download)
                                 clean_name = _strip_size_suffix(task.filename)
                                 print(f"   📥 [{idx}/{len(file_list)}] {clean_name[:50]}")
-                                task.status = "downloading"
                                 f = download_with_aria2(download_url, clean_name, COLAB_ROOT, task_id=task.id)
                                 if f is DUPLICATE_SKIP:
                                     task.status, task.error = "skipped", None
                                     success_count += 1
                                 elif f:
-                                    task.status = "moving"
                                     handle_file_processing(f, source="magnet")
                                     task.status, task.error = "done", None
                                     success_count += 1
                                 else:
-                                    task.status = "failed"
                                     task.error = "Download failed"
                             else:
                                 print(f"   ❌ TorBox DL error: {dl_err}")
                                 task.error = dl_err[:100]
                         except Exception as e:
-                            task.status = "failed"
                             print(f"   ❌ Failed to download: {str(e)[:60]}")
                             task.error = str(e)[:100]
                     
@@ -7787,16 +6713,13 @@ def update_progress_display(tasks: List[DownloadTask]):
     for t in active:
         if t.id not in _per_task_bars:
             name = t.filename[:40] if t.filename else t.url[:40]
-            if hasattr(_per_task_accordion, 'set_bars'):
-                bar = _ProgressRow(t.id, name)
-            else:
-                bar = widgets.FloatProgress(
-                    value=0.0, min=0.0, max=100.0,
-                    description=name,
-                    bar_style='info',
-                    style={'description_width': '220px'},
-                    layout=widgets.Layout(width='100%', height='22px')
-                )
+            bar = widgets.FloatProgress(
+                value=0.0, min=0.0, max=100.0,
+                description=name,
+                bar_style='info',
+                style={'description_width': '220px'},
+                layout=widgets.Layout(width='100%', height='22px')
+            )
             _per_task_bars[t.id] = bar
     
     # Update active bars with live stats
@@ -7856,20 +6779,17 @@ def update_progress_display(tasks: List[DownloadTask]):
                 bar.close()
             _per_task_done_at.pop(task_id, None)
     
-    # Sync the progress content without rebuilding the disclosure control.
+    # Sync container children and accordion visibility
     visible_bars = list(_per_task_bars.values())
-    if hasattr(_per_task_accordion, 'set_bars') and not _colab_live_status_active:
-        _per_task_accordion.set_bars(visible_bars)
     if visible_bars:
-        if not hasattr(_per_task_accordion, 'set_bars'):
-            _per_task_box.children = visible_bars
+        _per_task_box.children = visible_bars
         active_count = len(active)
         if active_count > 0:
             agg_speed = f"{display_speed:.1f} MB/s" if display_speed > 0 else "starting..."
             _per_task_accordion.set_title(0, f"📥 {active_count} active download{'s' if active_count != 1 else ''} ({agg_speed})")
         else:
             _per_task_accordion.set_title(0, "📥 Finishing...")
-        _per_task_accordion.layout.display = 'none' if _colab_live_status_active else 'block'
+        _per_task_accordion.layout.display = 'block'
     else:
         _per_task_box.children = []
         _per_task_accordion.layout.display = 'none'
@@ -7877,16 +6797,12 @@ def update_progress_display(tasks: List[DownloadTask]):
 def progress_monitor(tasks: List[DownloadTask], interval: float = 0.5):
     """Background thread to update progress display periodically."""
     global stop_monitor
-    reported_error = False
     while not stop_monitor:
         try:
             update_progress_display(tasks)
-        except Exception as e:
-            if not reported_error:
-                print(f'⚠️ Progress display error: {e}')
-                reported_error = True
-        finally:
             time.sleep(interval)
+        except Exception:
+            pass
 
 
 def _run_download_pipeline(
@@ -7901,31 +6817,26 @@ def _run_download_pipeline(
     max_workers: int,
     magnet_file_tasks: Optional[List[DownloadTask]] = None,
     tb_magnet_file_tasks: Optional[List[DownloadTask]] = None,
-    tb_key: str = "",
-    live_manager: Optional[LiveBatchManager] = None
+    tb_key: str = ""
 ) -> Tuple[int, int]:
     """
     Shared download orchestration for parallel and sequential downloads.
 
     Returns: (total_success, total_failed) counts
     """
-    global yt_success_cumulative, yt_fail_cumulative, stop_monitor, batch_start_time, _live_status_tasks
+    global yt_success_cumulative, yt_fail_cumulative, stop_monitor, batch_start_time
     import threading
 
     start_keep_alive()
-    if globals().get('_live_batch') is not None:
-        _live_status_tasks = all_tasks
     download_stats.clear()  # Drop progress entries from any previous batch
     _clear_per_task_bars()
-    if live_manager is None and _live_batch is None:
-        _reset_cancel_state()
-    # Synchronous batches use the kernel interrupt; live batches use the Stop button.
-    if live_manager is None:
-        stop_hint.value = ("<div style='padding:4px 8px;background:#5a1e1e;border-radius:4px;"
-                           "display:inline-block'>⏹ <b>To stop:</b> menu <b>Runtime → Interrupt execution</b> "
-                           "&nbsp;(shortcut <b>Ctrl+M&nbsp;I</b>, Mac <b>⌘+M&nbsp;I</b>) — progress is saved for Resume/Retry.</div>")
-    else:
-        stop_hint.value = "<div style='padding:4px 8px'>Use <b>⏹ Stop Download</b> to save unfinished files for Resume.</div>"
+    _reset_cancel_state()
+    # Point the user at the kernel interrupt for stopping (hidden in the finally).
+    # There is no per-cell ■ button during a download because it runs inside a widget
+    # callback, not a cell execution — the menu/shortcut interrupt is the way.
+    stop_hint.value = ("<div style='padding:4px 8px;background:#5a1e1e;border-radius:4px;"
+                       "display:inline-block'>⏹ <b>To stop:</b> menu <b>Runtime → Interrupt execution</b> "
+                       "&nbsp;(shortcut <b>Ctrl+M&nbsp;I</b>, Mac <b>⌘+M&nbsp;I</b>) — progress is saved for Resume/Retry.</div>")
     stop_hint.layout.display = 'block'
 
     def save_progress(throttle: bool = True):
@@ -7984,57 +6895,24 @@ def _run_download_pipeline(
         
         try:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_task = {
+                    executor.submit(download_worker, task, gofile_token, move_queue, tb_file_key): task
+                    for task in parallel_tasks
+                }
                 try:
-                    if live_manager is None:
-                        future_to_task = {
-                            executor.submit(download_worker, task, gofile_token, move_queue, tb_file_key): task
-                            for task in parallel_tasks
-                        }
-                        completed = as_completed(future_to_task)
-                    else:
-                        ready = deque(parallel_tasks)
-                        live_manager.begin_parallel(parallel_tasks)
-                        future_to_task = {}
-                        completed = None
-
-                    while True:
-                        if live_manager is not None:
-                            ready.extend(live_manager.take_parallel())
-                            while ready and len(future_to_task) < max_workers and not _cancel_requested:
-                                task = ready.popleft()
-                                future = executor.submit(download_worker, task, gofile_token, move_queue, tb_file_key)
-                                future_to_task[future] = task
-                            if _cancel_requested:
-                                # Never submitted items stay pending for Resume.
-                                ready.clear()
-                            if future_to_task:
-                                finished, _ = wait(tuple(future_to_task), timeout=0.25,
-                                                   return_when=FIRST_COMPLETED)
-                            else:
-                                finished = ()
-                            if not finished and not future_to_task:
-                                if live_manager.close_parallel_if_empty():
+                    for future in as_completed(future_to_task):
+                        task = future_to_task[future]
+                        try:
+                            result = future.result()
+                            for i, t in enumerate(all_tasks):
+                                if t.id == result.id:
+                                    all_tasks[i] = result
                                     break
-                                continue
-                        else:
-                            try:
-                                finished = (next(completed),)
-                            except StopIteration:
-                                break
-
-                        for future in finished:
-                            task = future_to_task.pop(future)
-                            try:
-                                result = future.result()
-                                for i, t in enumerate(all_tasks):
-                                    if t.id == result.id:
-                                        all_tasks[i] = result
-                                        break
-                                save_progress()
-                            except Exception as e:
-                                print(f"   ❌ Task failed: {str(e)[:80]}")
-                                task.status = "failed"
-                                task.error = str(e)[:100]
+                            save_progress()
+                        except Exception as e:
+                            print(f"   ❌ Task failed: {str(e)[:80]}")
+                            task.status = "failed"
+                            task.error = str(e)[:100]
                 except KeyboardInterrupt:
                     # Terminate the aria2 subprocesses HERE, before the executor's
                     # shutdown(wait=True) on with-exit would otherwise block on them.
@@ -8209,36 +7087,25 @@ def _run_auto_retry_chain(mode: str):
     _auto_retry_state['remaining'] -= 1
     attempt = _auto_retry_state['total'] - _auto_retry_state['remaining']
     try:
-        print(f"\n🔁 Auto Retry {attempt}/{_auto_retry_state['total']} starting in 5s — use Stop Download to cancel a live run...")
+        print(f"\n🔁 Auto Retry {attempt}/{_auto_retry_state['total']} starting in 5s — interrupt (Ctrl+M I, Mac ⌘+M I) to cancel...")
         for _ in range(5):
-            if cancel_requested():
-                _auto_retry_state['remaining'] = 0
-                print("\n🛑 Auto Retry cancelled — session kept for manual retry.")
-                return
             time.sleep(1)  # 1s steps so an interrupt lands promptly
     except KeyboardInterrupt:
         _auto_retry_state['remaining'] = 0
         print("\n🛑 Auto Retry cancelled — session kept, use 🔁 Retry Failed to continue manually.")
         return
-    if cancel_requested():
-        _auto_retry_state['remaining'] = 0
-        print("\n🛑 Auto Retry cancelled — session kept for manual retry.")
-        return
     execute_batch(mode, resume=True, auto_retry_chain=True)
 
 
-def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str,
-                           live_manager: Optional[LiveBatchManager] = None):
+def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str):
     """Execute download for selected tasks from queue."""
     global yt_success_cumulative, yt_fail_cumulative
     yt_success_cumulative = 0
     yt_fail_cumulative = 0
     _arm_auto_retry()
 
-    if live_manager is None:
-        _restore_standard_status_widgets()
-        clear_output(wait=True)
-        display(input_ui)
+    clear_output(wait=True)
+    display(input_ui)
     settings_ui.layout.display = 'none'
     btn.disabled = True
     btn_quick.disabled = True
@@ -8284,9 +7151,6 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str,
                     limit_reached = False
                     consecutive_failures = 0
                     for i, task in enumerate(fshare_unresolved, 1):
-                        if live_manager is not None and cancel_requested():
-                            print('   🛑 FShare preparation stopped; remaining files stay pending')
-                            break
                         print(f"   [{i}/{total_fshare}] {task.filename[:60]}{'...' if len(task.filename) > 60 else ''}")
                         dl_link = _fshare_web_get_download_link(task.url, session)
                         if dl_link == "FSHARE_LIMIT_REACHED":
@@ -8329,15 +7193,13 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str,
                     print("   ❌ FShare login failed — skipping FShare downloads")
                     parallel_tasks = [t for t in parallel_tasks if t.link_type != 'fshare']
         
-        all_tasks = live_manager.all_tasks if live_manager is not None else selected_tasks.copy()
+        all_tasks = selected_tasks.copy()
         
         total_parallel = len(parallel_tasks)
         total_sequential = len(youtube_urls) + len(mega_urls) + len(debrid_urls) + len(magnet_file_tasks) + len(tb_magnet_file_tasks)
         print(f"📊 Starting: {total_parallel} parallel + {total_sequential} sequential\n")
-
+        
         # Run shared download pipeline
-        if live_manager is not None:
-            _set_live_controls()
         total_success, total_failed = _run_download_pipeline(
             all_tasks=all_tasks,
             parallel_tasks=parallel_tasks,
@@ -8350,36 +7212,11 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str,
             max_workers=max_workers,
             magnet_file_tasks=magnet_file_tasks,
             tb_magnet_file_tasks=tb_magnet_file_tasks,
-            tb_key=tb_key,
-            live_manager=live_manager
+            tb_key=tb_key
         )
-
-        # Files added after the parallel pool closed (including sequential links)
-        # form another wave. The manager closes atomically with the last empty check.
-        while live_manager is not None and not cancel_requested():
-            wave = live_manager.next_wave_or_finish()
-            if wave is None:
-                break
-            wave_parallel = [t for t in wave if t.link_type not in SEQUENTIAL_LINK_TYPES]
-            total_success, total_failed = _run_download_pipeline(
-                all_tasks=all_tasks,
-                parallel_tasks=wave_parallel,
-                youtube_urls=[t.url for t in wave if t.link_type == 'youtube'],
-                mega_urls=[t.url for t in wave if t.link_type == 'mega'],
-                debrid_urls=[t.url for t in wave if t.link_type == 'magnet'],
-                mode=mode,
-                gofile_token=gofile_token,
-                rd_key=rd_key or token_rd.value.strip(),
-                max_workers=max_workers,
-                magnet_file_tasks=[t for t in wave if t.link_type == 'magnet_file'],
-                tb_magnet_file_tasks=[t for t in wave if t.link_type == 'tb_magnet_file'],
-                tb_key=tb_key or token_tb.value.strip(),
-                live_manager=live_manager
-            )
         
         # Handle results
-        unfinished = any(t.status in ('pending', 'downloading', 'moving') for t in all_tasks)
-        if total_failed > 0 or unfinished or cancel_requested():
+        if total_failed > 0:
             failed_files = [t.filename for t in all_tasks if t.status == 'failed']
             if cancel_requested():
                 print(f"\n🛑 Batch stopped by user — {total_success} completed, {total_failed} cancelled/failed.")
@@ -8421,13 +7258,6 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str,
         btn_retry.layout.display = 'inline-block'
     except Exception as e:
         print(f"\n❌ Critical Error: {e}")
-        if live_manager is not None:
-            save_session(live_manager.all_tasks,
-                         playlist_range=playlist_selection.value.strip(),
-                         yt_success=yt_success_cumulative,
-                         yt_fail=yt_fail_cumulative,
-                         subtitle_langs_value=subtitle_langs.value)
-            btn_retry.layout.display = 'inline-block'
     finally:
         stop_keep_alive()
         stop_hint.layout.display = 'none'
@@ -8440,67 +7270,17 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str,
 
     # Auto Retry fires outside try/finally so keep-alive, cancel state, and buttons
     # are fully reset before the next pass (mirrors clicking 🔁 Retry Failed).
-    if live_manager is None:
-        _run_auto_retry_chain(mode)
-
-
-def _resolve_queue_links(urls: List[str]) -> List[DownloadTask]:
-    """Shared resolution and playlist expansion for initial and appended links."""
-    gofile_token = token_gf.value.strip()
-    debrid_service, rd_key, tb_key = get_active_debrid()
-    ytdlp_hosts = STREAMING_HOSTS + ('tiktok.com', 'dailymotion.com', 'soundcloud.com')
-    needs_ytdlp = any(url_matches_host(u, ytdlp_hosts) for u in urls) or \
-                  any(url_matches_host(u, ('archive.org',)) and '/details/' in u for u in urls)
-    needs_mega = any(url_matches_host(u, ('mega.nz', 'transfer.it')) for u in urls)
-    needs_aria = not (needs_ytdlp and not needs_mega) or any(
-        url_matches_host(u, ('gofile.io', 'pixeldrain.com', 'real-debrid.com', 'mega.nz', 'fshare.vn'))
-        or u.startswith('magnet:') for u in urls)
-
-    if _running_live_batch():
-        setup_environment(needs_mega, needs_ytdlp, needs_aria, during_active=True)
-    else:
-        setup_environment(needs_mega, needs_ytdlp, needs_aria)
-
-    s, t = get_gofile_session(gofile_token)
-
-    print(f"🔍 Resolving {len(urls)} links...")
-    parallel_tasks, youtube_urls, mega_urls, debrid_urls = resolve_all_links(urls, s, t, rd_key, tb_key, debrid_service)
-
-    # Create session-compatible task list for saving
-    all_tasks = parallel_tasks.copy()
-
-    # Expand YouTube playlists into individual video tasks for queue display
-    for url in youtube_urls:
-        yt_tasks = resolve_youtube_playlist(url)
-        all_tasks.extend(yt_tasks)
-
-    for url in mega_urls:
-        all_tasks.append(DownloadTask(url=url, filename="", source="mega", link_type="mega"))
-    for url in debrid_urls:
-        # Distinguish between magnet links and other debrid-related links
-        if url.startswith("magnet:"):
-            all_tasks.append(DownloadTask(url=url, filename="", source="debrid", link_type="magnet"))
-        else:
-            debrid_type = "tb" if debrid_service == 'tb' else "rd"
-            all_tasks.append(DownloadTask(url=url, filename="", source="debrid", link_type=debrid_type))
-
-    return all_tasks
+    _run_auto_retry_chain(mode)
 
 
 def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False, auto_retry_chain: bool = False):
     global yt_success_cumulative, yt_fail_cumulative  # Must be at function start
-
-    if _live_batch is not None and cancel_requested():
-        print('🛑 Download stopped. The session is available for Resume.')
-        return
     if not auto_retry_chain:
         _arm_auto_retry()  # user-initiated (Resolve/Quick/Resume/Retry) — fresh retry budget
     queue_open = False  # True while the queue preview is waiting for user input
     all_tasks = []  # Ensure defined for the KeyboardInterrupt handler even if we stop early
-    if _live_batch is None:
-        _restore_standard_status_widgets()
-        clear_output(wait=True)
-        display(input_ui)
+    clear_output(wait=True)
+    display(input_ui)
     settings_ui.layout.display = 'none'  # Close settings panel if open
     btn.disabled = True
     btn_quick.disabled = True
@@ -8627,7 +7407,38 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False, aut
                 btn.disabled = False
                 return
 
-            all_tasks = _resolve_queue_links(urls)
+            ytdlp_hosts = STREAMING_HOSTS + ('tiktok.com', 'dailymotion.com', 'soundcloud.com')
+            needs_ytdlp = any(url_matches_host(u, ytdlp_hosts) for u in urls) or \
+                          any(url_matches_host(u, ('archive.org',)) and '/details/' in u for u in urls)
+            needs_mega = any(url_matches_host(u, ('mega.nz', 'transfer.it')) for u in urls)
+            needs_aria = not (needs_ytdlp and not needs_mega) or any(
+                url_matches_host(u, ('gofile.io', 'pixeldrain.com', 'real-debrid.com', 'mega.nz', 'fshare.vn'))
+                or u.startswith('magnet:') for u in urls)
+
+            setup_environment(needs_mega, needs_ytdlp, needs_aria)
+            
+            s, t = get_gofile_session(gofile_token)
+            
+            print(f"🔍 Resolving {len(urls)} links...")
+            parallel_tasks, youtube_urls, mega_urls, debrid_urls = resolve_all_links(urls, s, t, rd_key, tb_key, debrid_service)
+            
+            # Create session-compatible task list for saving
+            all_tasks = parallel_tasks.copy()
+            
+            # Expand YouTube playlists into individual video tasks for queue display
+            for url in youtube_urls:
+                yt_tasks = resolve_youtube_playlist(url)
+                all_tasks.extend(yt_tasks)
+            
+            for url in mega_urls:
+                all_tasks.append(DownloadTask(url=url, filename="", source="mega", link_type="mega"))
+            for url in debrid_urls:
+                # Distinguish between magnet links and other debrid-related links
+                if url.startswith("magnet:"):
+                    all_tasks.append(DownloadTask(url=url, filename="", source="debrid", link_type="magnet"))
+                else:
+                    debrid_type = "tb" if debrid_service == 'tb' else "rd"
+                    all_tasks.append(DownloadTask(url=url, filename="", source="debrid", link_type=debrid_type))
 
             # Save initial session
             save_session(all_tasks,
@@ -8640,9 +7451,7 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False, aut
             else:
                 # Show queue preview instead of immediate download
                 show_queue_preview(all_tasks, mode)
-                if all_tasks:
-                    text_area.value = ''  # Ready for more links in the same field.
-                queue_open = True  # Keep Quick/Resume disabled while adding/reviewing.
+                queue_open = True  # Keep buttons disabled until the queue is acted on
             return  # Wait for user to click "Start Selected"
         
         # This code only runs for RESUME mode (preview was skipped)
@@ -8651,9 +7460,6 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False, aut
         print(f"📊 Tasks: {total_parallel} parallel + {total_sequential} sequential\n")
 
         # Run shared download pipeline
-        if _live_batch is not None and cancel_requested():
-            print('🛑 Download stopped before the retry began. The session is available for Resume.')
-            return
         total_success, total_failed = _run_download_pipeline(
             all_tasks=all_tasks,
             parallel_tasks=parallel_tasks,
@@ -8670,8 +7476,7 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False, aut
         )
         
         # Handle results
-        unfinished = any(t.status in ('pending', 'downloading', 'moving') for t in all_tasks)
-        if total_failed > 0 or unfinished or cancel_requested():
+        if total_failed > 0:
             if cancel_requested():
                 print(f"\n🛑 Batch stopped by user — {total_success} completed, {total_failed} cancelled/failed (session saved)")
                 _auto_retry_state['remaining'] = 0  # user stopped — don't auto-retry
@@ -8708,8 +7513,8 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False, aut
         stop_hint.layout.display = 'none'
         _reset_cancel_state()
         if not queue_open:
-            # An open queue enables Add Links, but keeps Quick/Resume disabled;
-            # hide_queue()/start_from_queue() restore the initial controls later.
+            # While the queue preview is open the buttons stay disabled;
+            # hide_queue()/start_from_queue() re-enable them later.
             btn.disabled = False
             btn_quick.disabled = False
             btn_resume.disabled = False
@@ -8738,8 +7543,7 @@ def on_quick_download(b=None):
     execute_batch("video", quick_mode=True)
 
 # --- BINDINGS ---
-btn.on_click(on_resolve_links)
-btn_stop.on_click(stop_live_batch)
+btn.on_click(lambda b: execute_batch("video"))
 btn_quick.on_click(on_quick_download)
 btn_resume.on_click(lambda b: execute_batch("video", resume=True))
 btn_retry.on_click(lambda b: execute_batch("video", resume=True))  # Retry = resume machinery, no restart needed

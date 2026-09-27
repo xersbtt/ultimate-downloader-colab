@@ -4,6 +4,27 @@ All notable changes to the Ultimate Downloader will be documented in this file.
 
 ---
 
+## v7.0 (Unreleased)
+**Theme: Live Queues, Resizable Preview & TorBox Folder Context**
+
+### ✨ New Features
+- **Add links while a reviewed batch runs**: after starting a resolved queue, paste more URLs into the Links field and click **Add Links**. Review the new files and click **Add to Download**; parallel files take the next free slot, while sequential sources run in a later wave. **Stop Download** saves unfinished work for Resume. One live batch owns the session and checks new files against completed and active tasks; a same-name file must wait for the next batch because naming caches use filenames as keys. Quick Download and Resume keep their existing flow.
+- **Extend a queue before downloading**: **Resolve Links** becomes **Add Links** while a queue is open. Newly resolved files append without losing existing order, edits, selection, or streaming preferences, and duplicate queue entries are skipped. The Links field clears only after a successful resolution; an empty, failed, or interrupted resolution leaves the queue and input available for retry. The combined queue is saved for Resume.
+- **Resizable queue table**: File, Source, Size, Destination, and Overrides have separate columns with draggable dividers, double-click auto-fit, persistent widths during the current runtime, and full text on hover. Selection follows task IDs through sorting, editing, additions, and redraws. Colab installs `anywidget` when needed; the standard queue list remains available if the custom table cannot start.
+- **TorBox folder-aware episode names**: JDownloader folder links use parent folders and the TorBox item name to supply missing show and season information, including nested `Show/Season 2/Episode 1.mkv` layouts. The resolved filename carries that identity through TMDB matching, subtitle pairing, local downloads, duplicate checks, and Resume. Explicit markers in filenames take precedence, and episode ranges in folder names are not copied to individual files.
+
+### 🔧 Improvements
+- **More direct queue selection**: larger checkboxes and whole-row targets toggle a file without clearing other selections. Shift-click extends a range; arrow keys move focus, Space toggles the focused file, and the header checkbox selects or clears all files.
+- **TorBox extras remain optional**: files in ancillary folders such as Extras, Bonus Features, and Trailers remain in folder-link and magnet queues, including tiny files that would otherwise be filtered out, but start unselected. They can still be selected manually. Regular files and Specials folders remain selected by default.
+- **Regression coverage**: added tests for live additions and stopping, queue-table selection and sizing, progress-panel behavior, TorBox folder naming, extras selection, and saved-session round trips.
+
+### 🐛 Bug Fixes
+- **Live status refreshes in Colab**: the browser polls a fresh snapshot about once per second, so the overall count, progress, messages, and per-file bars update while background downloads continue or new links are added. The message log is bounded, standard widgets remain the fallback outside Colab, and a display error retains the progress monitor's pause.
+- **Readable unselected queue rows**: the table supplies matching foreground and background colors for light and dark notebook themes, including alternating, hovered, and selected rows.
+- **Per-file progress panel stays open or closed as chosen**: the custom renderer uses a native disclosure control and updates its contents without rebuilding it, so incoming progress does not reset the expanded state. The standard renderer keeps its accordion.
+
+---
+
 ## v6.9 (Latest)
 **Theme: Queue Editing, Automatic Anime Routing & Reliable TorBox Batches**
 

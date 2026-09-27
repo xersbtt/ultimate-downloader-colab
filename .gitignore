@@ -60,6 +60,7 @@ cookies.txt
 
 # Antigravity workflows (local only)
 .agent/
+.claude/
 
 # UI Designer tool (local only)
 ui_designer.html
@@ -68,6 +69,10 @@ ui_designer.html
 test_*.py
 !test_tmdb_anime_classification.py
 !test_queue_editing.py
+!test_queue_additions_torbox.py
+!test_queue_table.py
+!test_progress_panel.py
+!test_live_queue.py
 test_*.txt
 debug_*.py
 
