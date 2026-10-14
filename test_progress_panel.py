@@ -85,6 +85,17 @@ class ProgressPanelTests(unittest.TestCase):
         self.addCleanup(fallback.close)
         self.assertIs(self.ns['_create_download_progress_panel'](fallback), fallback)
 
+    def test_server_cooldown_keeps_progress_and_shows_retry_countdown(self):
+        self.ns['download_stats']['0'] = dict(
+            pct=60, speed_mbs=0, retry_reason='Server unavailable (HTTP 503)', retry_until=130)
+        self.ns['update_progress_display'](self.tasks)
+
+        row = self.panel.bars[0]
+        self.assertEqual(row['value'], 60)
+        self.assertEqual(row['state'], 'info')
+        self.assertIn('HTTP 503', row['description'])
+        self.assertIn('retry in 30s', row['description'])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,0 +1,8801 @@
+import os
+import re
+import json
+import requests
+import subprocess
+import shutil
+import time
+import difflib
+import queue
+import builtins
+import html
+from collections import deque
+from typing import Optional, Tuple, List, Dict, Any, Callable
+from dataclasses import dataclass, field, fields, asdict
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from threading import Lock, RLock, local, Thread, current_thread, main_thread
+from uuid import uuid4
+import ipywidgets as widgets
+from IPython.display import display, clear_output, HTML, JSON
+from urllib.parse import urlparse, unquote, parse_qs
+try:
+    from google.colab import drive
+except ImportError:
+    drive = None  # Running outside Colab (local testing) — Drive mount disabled
+
+# --- COLAB SECRETS HELPER ---
+def get_colab_secret(key: str, default: str = "") -> str:
+    """Retrieve a secret from Colab secrets, return default if not found."""
+    try:
+        from google.colab import userdata
+        return userdata.get(key)
+    except (ImportError, ModuleNotFoundError):
+        return default
+    except Exception as e:
+        # This catches SecretNotFoundError and NotebookAccessError
+        return default
+
+# --- SETTINGS CHANGE TRACKING ---
+# _loading_settings: True while load_dir_settings/check_and_load_secrets write widget
+# values programmatically, so the save-on-change observers neither rewrite settings.json
+# mid-load (which would persist half-loaded state over the file) nor mistake those
+# writes for user edits. _user_touched_settings: widgets the user actually changed this
+# session — the post-mount settings reload leaves these alone, so a stored value never
+# overrides a live choice.
+_loading_settings = False
+_user_touched_settings: set = set()
+
+
+def check_and_load_secrets():
+    """Re-check secrets and populate fields if they were empty on initial load."""
+    try:
+        from google.colab import userdata
+    except (ImportError, ModuleNotFoundError):
+        return
+    # (widget, secret name) pairs — widgets are defined below in the UI section
+    secret_fields = [
+        (token_rd, 'RD_TOKEN'),
+        (token_tb, 'TB_TOKEN'),
+        (token_gf, 'GOFILE_TOKEN'),
+        (token_tmdb, 'TMDB_API_KEY'),
+        (token_fshare_email, 'FSHARE_EMAIL'),
+        (token_fshare_password, 'FSHARE_PASSWORD'),
+    ]
+    global _loading_settings
+    _loading_settings = True  # secret writes are programmatic, not user edits
+    try:
+        for widget, secret_name in secret_fields:
+            if widget.value:
+                continue
+            try:
+                val = userdata.get(secret_name)
+                if val:
+                    widget.value = val
+                    print(f"🔑 {secret_name} loaded from Colab Secrets")
+            except Exception:
+                pass
+    finally:
+        _loading_settings = False
+
+# --- CONFIGURATION ---
+COLAB_ROOT = "/content/"
+DRIVE_BASE = f"{COLAB_ROOT}drive/My Drive/"
+UD_CONFIG_PATH = f"{DRIVE_BASE}Ultimate Downloader/"  # Config folder for session & history files
+DRIVE_TV_PATH = "TV Shows"
+DRIVE_MOVIE_PATH = "Movies"
+DRIVE_YOUTUBE_PATH = "YouTube"
+DRIVE_DOWNLOADS_PATH = "Downloads"
+DRIVE_ANIME_SERIES_PATH = "Anime Series"
+DRIVE_ANIME_MOVIES_PATH = "Anime Movies"
+MIN_FILE_SIZE_MB = 10
+KEEP_EXTENSIONS = {'.srt', '.ass', '.sub', '.vtt'}
+SESSION_FILE = f"{UD_CONFIG_PATH}session.json"
+HISTORY_FILE = f"{UD_CONFIG_PATH}history.json"
+SETTINGS_FILE = f"{UD_CONFIG_PATH}settings.json"
+FSHARE_COOKIE_FILE = f"{UD_CONFIG_PATH}fshare_cookies.json"
+TMDB_CACHE_FILE = f"{UD_CONFIG_PATH}tmdb_cache.json"
+COOKIE_PATH = f"{COLAB_ROOT}cookies.txt"
+MAX_CONCURRENT_DEFAULT = 3
+
+# API Configuration
+REQUEST_TIMEOUT = 30  # Default timeout for HTTP requests
+GOFILE_WEBSITE_TOKEN = "4fd6sg89d7s6"  # Website token for Gofile API - update if authentication fails
+TORBOX_API_BASE = "https://api.torbox.app/v1/api"  # TorBox API base URL
+TMDB_API_BASE = "https://api.themoviedb.org/3"  # TMDB v3 API (metadata matching)
+TMDB_MATCH_THRESHOLD = 0.60  # Minimum title similarity to accept a search result
+TMDB_QUERY_CACHE_MAX = 500   # Persistent query cache cap (oldest dropped first)
+TMDB_CACHE_VERSION = 2       # Search-algorithm version; schema freshness is checked per match
+TMDB_METADATA_VERSION = 1    # Normalized-match schema (includes library classification)
+TMDB_ANIMATION_GENRE_ID = 16
+TMDB_ANIME_KEYWORDS = {'anime', 'japanese animation'}
+TMDB_CLEARED = {'cleared': True}  # DownloadTask.tmdb_override value meaning "force regex, no TMDB"
+
+# Known resolution values (for filename parsing)
+KNOWN_RESOLUTIONS = {360, 480, 540, 720, 1080, 1440, 2160, 4320}
+YEAR_RANGE = range(1900, 2100)
+
+# Debrid-supported file hosts (route through selected debrid service when token available)
+DEBRID_SUPPORTED_HOSTS = {
+    '1fichier.com', '4shared.com', 'alfafile.net', 'clicknupload.org', 'ddownload.com',
+    'dailymotion.com', 'dropbox.com', 'filefactory.com', 'hexupload.net', 'hitfile.net',
+    'k2s.cc', 'keep2share.cc', 'mediafire.com', 'mega.nz', 'mixdrop.co', 'nitroflare.com',
+    'oboom.com', 'rapidgator.net', 'redtube.com', 'scribd.com', 'sendspace.com',
+    'solidfiles.com', 'soundcloud.com', 'streamtape.com', 'turbobit.net', 'ulozto.net',
+    'upload.ee', 'uploaded.net', 'uptobox.com', 'userscloud.com', 'vidoza.net',
+    'vimeo.com', 'wetransfer.com', 'wipfiles.net', 'worldbytez.com', 'youporn.com',
+}
+RD_SUPPORTED_HOSTS = DEBRID_SUPPORTED_HOSTS  # Backward-compatible alias
+
+# --- DOWNLOAD TASK DATACLASS ---
+@dataclass
+class DownloadTask:
+    url: str  # Direct download URL (may be resolved API URL)
+    filename: str
+    source: str
+    link_type: str  # gofile, pixeldrain, direct, youtube, mega, rd, tb
+    id: str = field(default_factory=lambda: str(uuid4()))  # Unique ID for tracking
+    status: str = "pending"  # pending, downloading, moving (downloaded, Drive move pending), done, failed, skipped
+    error: Optional[str] = None
+    cookie: Optional[str] = None
+    original_url: Optional[str] = None  # Original user-provided URL (for re-resolving on resume)
+    tmdb_override: Optional[dict] = None  # Manual TMDB correction (persisted); {'cleared': True} forces regex
+    season_override: Optional[int] = None  # Manual season number (persisted); None = detect from filename/TMDB
+    episode_override: Optional[int] = None  # Manual episode number (persisted); set by queue 🔢 Renumber
+    episode_end_override: Optional[int] = None  # Manual range end (persisted); with episode_override N, names the file ENN-Eend
+    name_override: Optional[str] = None  # Manual name for organise (persisted); set by queue ✏️ Force Name
+    year_override: Optional[str] = None  # Manual year accompanying name_override (persisted)
+    route_override: Optional[str] = None  # Manual destination category (persisted); set by queue 🎯 Route as
+    part_override: Optional[int] = None  # Manual part suffix (persisted); N = force -ptN, 0 = force none
+    selected_by_default: bool = True  # Resolver hint for the queue preview; users can still select the row
+
+_TASK_FIELDS = {f.name for f in fields(DownloadTask)}
+
+# Link types with dedicated sequential processors. Every other link type (gofile,
+# pixeldrain, direct, rd, tb, fshare, mediafire, 1fichier, ...) downloads through
+# the parallel aria2 pool — partitioning by exclusion so new resolver types are
+# never silently dropped.
+SEQUENTIAL_LINK_TYPES = {'youtube', 'mega', 'magnet', 'magnet_file', 'tb_magnet_file'}
+
+def task_from_dict(data: Dict[str, Any]) -> DownloadTask:
+    """Build a DownloadTask from a session dict, ignoring unknown keys from older versions."""
+    return DownloadTask(**{k: v for k, v in data.items() if k in _TASK_FIELDS})
+
+# --- THREAD SAFETY ---
+progress_lock = Lock()
+print_lock = Lock()  # Prevent interleaved print output from parallel threads
+_session_save_lock = Lock()  # session.json is written from the main thread AND the Drive mover thread
+download_stats: Dict[str, Dict[str, float]] = {}  # task_id -> {'pct': 0-100, 'speed_mbs': MB/s}
+# Sentinel returned by download_with_aria2 when the file is already in Drive (a skip,
+# not a failure). Callers must check `is DUPLICATE_SKIP` before treating a falsy result
+# as failed, so resume doesn't retry already-complete files forever.
+DUPLICATE_SKIP = "__duplicate_skip__"
+stop_monitor = False  # Flag to stop progress monitor thread
+batch_start_time: Optional[float] = None  # Track when batch started for overall ETA
+last_display_speed: float = 0.0  # Persist last known speed to prevent flickering
+
+# --- BATCH CANCELLATION ---
+# Normal synchronous batches stop via the kernel interrupt. Opt-in live batches run
+# in the background and expose a Stop button. Both paths set this flag, terminate
+# active subprocesses, and leave not-yet-started tasks pending for Resume.
+_cancel_requested = False
+_active_procs: Dict[str, Any] = {}  # key -> running subprocess.Popen
+_active_procs_lock = Lock()
+
+def cancel_requested() -> bool:
+    return _cancel_requested
+
+def stop_active_downloads():
+    """Signal cancellation and terminate every registered subprocess. Called from the
+    pipeline's KeyboardInterrupt handlers when the user interrupts the kernel."""
+    global _cancel_requested
+    _cancel_requested = True
+    with _active_procs_lock:
+        procs = list(_active_procs.values())
+    for p in procs:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+def _register_proc(key: str, process):
+    with _active_procs_lock:
+        _active_procs[key] = process
+
+def _unregister_proc(key: str):
+    with _active_procs_lock:
+        _active_procs.pop(key, None)
+
+def _reset_cancel_state():
+    """Clear the cancel flag and process registry between batches."""
+    global _cancel_requested, _disk_stall_abort
+    _cancel_requested = False
+    _disk_stall_abort = False
+    with _active_procs_lock:
+        _active_procs.clear()
+
+# --- DISK-SPACE GUARD ---
+# Colab hard-terminates the runtime when the local disk fills up. Debrid
+# downloads are faster than the FUSE move to Drive, so a big batch of large
+# files can fill /content before the mover drains it. The guard delays new
+# downloads (and pauses running ones) until moves free enough space, instead
+# of letting the session die.
+DISK_FLOOR_GB = 4.0         # Pause a running download when free space drops below this
+DISK_START_GB = 10.0        # Don't start a new download with less than this free
+DISK_CHECK_SECS = 5         # How often a running download polls free space
+DISK_WAIT_POLL_SECS = 10    # How often a blocked download re-checks free space
+DISK_WAIT_STALL_SECS = 600  # Give up when space stops improving and nothing can free it
+
+# --- RATE-LIMITED HOSTS ---
+# Hosts that meter by request count, not just bandwidth. aria2's stock behaviour
+# here (16 connections, and a 1M split floor) fires a burst of fresh Range
+# requests as a file nears completion — worst on resume, where the whole
+# remainder is small and still gets split every way at once. TorBox answers that
+# burst with HTTP 429, so the last few percent of a file never lands, and the
+# partial it leaves behind is exactly the state that triggers the burst again.
+#
+# Connection counts here are deliberately small: TorBox sells concurrency by tier
+# (the entry plan allows 3 slots), so the budget that matters is
+# Parallel DLs x connections-per-file, not either number alone. Two connections
+# leaves headroom at any slider setting, and costs no throughput — a throttled
+# transfer runs far slower than a clean single-stream one.
+# Measured on the entry tier: 3 parallel x 2 connections (6 at once) runs clean,
+# so a "slot" meters transfers, not TCP connections. Don't tighten below this
+# without evidence; the old 16-connection default was the actual fault.
+RATE_LIMITED_HOSTS = ('torbox.app', 'tb-cdn.io')
+THROTTLE_BACKOFF_SECS = 5   # Start with a short probe after a transfer is throttled
+THROTTLE_MAX_BACKOFF_SECS = 30
+MAX_THROTTLE_WAITS = 4      # Consecutive 429 waits without download progress
+
+# requestdl pacing is shared by every TorBox flow and worker. Just-in-time link
+# resolution must not mean that all available workers hit the API simultaneously;
+# one request per second keeps the whole runtime at or below 60/minute. A 429
+# without Retry-After opens a shared cooldown so other workers wait too instead
+# of independently retrying and extending the throttle.
+TB_REQUESTDL_MIN_INTERVAL_SECS = 1.0
+TB_REQUESTDL_429_COOLDOWN_SECS = 60.0
+_tb_requestdl_rate_lock = Lock()
+_tb_requestdl_next_at = 0.0
+
+_disk_guard_lock = Lock()
+_moves_in_flight = 0        # Drive transfers currently copying — each frees local space when done
+_disk_stall_abort = False   # A wait already timed out this batch; fail fast instead of re-stalling
+
+# --- DRIVE TRANSFER THROUGHPUT ---
+# Measured on the Drive API path: 3 concurrent uploads sustained ~45 MB/s each, so
+# per-stream throughput holds as streams are added and aggregate scales with the
+# mover count. Where it stops scaling is empirical, hence the slider and this
+# summary: raise movers until the aggregate figure stops moving. (Through the FUSE
+# mount none of this applies — that path caps out around 24 MB/s in total.)
+DRIVE_MOVERS_DEFAULT = 3    # Concurrent Drive uploads in overlap mode
+MOVE_QUEUE_DEPTH = 2        # Finished files allowed to queue on top of the in-flight ones
+
+_drive_xfer_lock = Lock()
+_drive_xfer_bytes = 0          # Bytes pushed to Drive this batch
+_drive_xfer_secs = 0.0         # Summed per-file transfer time (> wall clock when parallel)
+_drive_xfer_files = 0
+_drive_xfer_first = None       # Earliest transfer start / latest end, for wall-clock rate
+_drive_xfer_last = None
+
+def _reset_drive_xfer_stats():
+    """Clear the per-batch Drive throughput counters."""
+    global _drive_xfer_bytes, _drive_xfer_secs, _drive_xfer_files
+    global _drive_xfer_first, _drive_xfer_last
+    with _drive_xfer_lock:
+        _drive_xfer_bytes = 0
+        _drive_xfer_secs = 0.0
+        _drive_xfer_files = 0
+        _drive_xfer_first = None
+        _drive_xfer_last = None
+
+def _record_drive_transfer(nbytes: int, started: float, ended: float):
+    """Record one completed Drive transfer (called from every mover thread)."""
+    global _drive_xfer_bytes, _drive_xfer_secs, _drive_xfer_files
+    global _drive_xfer_first, _drive_xfer_last
+    with _drive_xfer_lock:
+        _drive_xfer_bytes += nbytes
+        _drive_xfer_secs += max(ended - started, 0.0)
+        _drive_xfer_files += 1
+        if _drive_xfer_first is None or started < _drive_xfer_first:
+            _drive_xfer_first = started
+        if _drive_xfer_last is None or ended > _drive_xfer_last:
+            _drive_xfer_last = ended
+
+def _drive_xfer_summary() -> Optional[str]:
+    """One-line Drive throughput report, or None if nothing was transferred.
+
+    Aggregate = bytes / wall clock spent transferring — the number that actually
+    got faster. Per-stream = bytes / summed per-file time, which more movers do
+    not change. Their ratio is the parallel speed-up the mover count bought, so
+    comparing two batches at different mover counts is a direct A/B."""
+    with _drive_xfer_lock:
+        if not _drive_xfer_files or _drive_xfer_first is None:
+            return None
+        total_mb = _drive_xfer_bytes / (1024 * 1024)
+        wall = max(_drive_xfer_last - _drive_xfer_first, 0.001)
+        stream_secs = max(_drive_xfer_secs, 0.001)
+        files = _drive_xfer_files
+    agg = total_mb / wall
+    per = total_mb / stream_secs
+    return (f"📤 Drive transfers: {files} file(s), {total_mb / 1024:.2f} GB in {wall / 60:.1f} min "
+            f"— {agg:.1f} MB/s aggregate, {per:.1f} MB/s per stream ({agg / per:.1f}x from parallelism)")
+def _disk_free_gb() -> float:
+    """Free space on the Colab local disk in GB (inf when unmeasurable, e.g. locally)."""
+    try:
+        return shutil.disk_usage(COLAB_ROOT).free / (1024 ** 3)
+    except Exception:
+        return float('inf')
+
+def _move_in_flight() -> bool:
+    return _moves_in_flight > 0
+
+def _downloads_running() -> bool:
+    """True while any registered download subprocess is alive — it will either
+    finish (and free space via its Drive move) or pause itself at the floor."""
+    with _active_procs_lock:
+        return bool(_active_procs)
+
+def _mark_disk_gave_up(task_id):
+    """Tag a task's stats so download_worker reports an accurate failure reason."""
+    if task_id and not _cancel_requested:
+        with progress_lock:
+            download_stats.setdefault(task_id, {'pct': 0.0, 'speed_mbs': 0.0})['disk_gave_up'] = True
+
+def _wait_for_disk_space(needed_gb: float, label: str = "", task_id: Optional[str] = None) -> bool:
+    """Block until at least needed_gb is free on the local disk.
+
+    Returns True once enough space is free. Returns False when cancelled, or when
+    free space stops improving with nothing left that could free it (no Drive move
+    in flight, no download still running) — waiting longer would deadlock, e.g.
+    every worker paused on a huge partial. The caller fails that one download and
+    the session survives; partials stay on disk for Resume/Retry.
+    """
+    global _disk_stall_abort
+    free = _disk_free_gb()
+    if free >= needed_gb:
+        _disk_stall_abort = False  # Space recovered — future waits are worth trying again
+        return True
+    if _disk_stall_abort and not _move_in_flight() and not _downloads_running():
+        with print_lock:
+            print(f"   ⏭️ Skipped — local disk still full ({free:.1f} GB free) and nothing is freeing space")
+        return False
+    with print_lock:
+        print(f"   ⏸️ Low disk: {free:.1f} GB free (need {needed_gb:.0f} GB) — waiting for Drive moves to free space...")
+    if task_id:
+        with progress_lock:
+            stats = download_stats.setdefault(task_id, {'pct': 0.0, 'speed_mbs': 0.0})
+            stats['speed_mbs'] = 0.0
+            stats['disk_wait'] = True
+    try:
+        best = free
+        last_gain = time.time()
+        while not _cancel_requested:
+            for _ in range(DISK_WAIT_POLL_SECS):
+                time.sleep(1)
+                if _cancel_requested:
+                    return False
+            free = _disk_free_gb()
+            if free >= needed_gb:
+                _disk_stall_abort = False
+                with print_lock:
+                    print(f"   ▶️ Disk space recovered ({free:.1f} GB free) — resuming {label or 'download'}")
+                return True
+            if free > best + 0.5 or _move_in_flight() or _downloads_running():
+                # Space is draining, or something is still running that will free
+                # space when it completes — keep waiting
+                best = max(best, free)
+                last_gain = time.time()
+            elif time.time() - last_gain > DISK_WAIT_STALL_SECS:
+                _disk_stall_abort = True
+                with print_lock:
+                    print(f"   ❌ Still only {free:.1f} GB free after {DISK_WAIT_STALL_SECS // 60} min with nothing freeing space — giving up on {label or 'this download'}")
+                    print(f"      💡 Partial files are kept: Retry re-uses them. For very large files, lower Parallel DLs.")
+                return False
+        return False  # Cancelled while waiting
+    finally:
+        if task_id:
+            with progress_lock:
+                stats = download_stats.get(task_id)
+                if stats:
+                    stats.pop('disk_wait', None)
+
+# --- COLAB KEEP-ALIVE ---
+_keep_alive_stop = False
+_keep_alive_thread = None  # Handle to the running keep-alive thread (only one at a time)
+_rd_magnet_delay = 0  # Adaptive delay (seconds) between RD addMagnet calls; auto-set when rate-limited
+
+def _keep_alive_worker(interval: int = 120):
+    """Background thread: simulate Colab interaction to prevent idle timeout."""
+    from IPython.display import display as ipy_display, Javascript
+    while not _keep_alive_stop:
+        try:
+            ipy_display(Javascript('''
+                (function() {
+                    // Click the connect button to reset Colab's idle timer
+                    var btn = document.querySelector("colab-connect-button");
+                    if (btn) { btn.click(); }
+                    console.log("Colab keep-alive: " + new Date().toLocaleTimeString());
+                })();
+            '''))
+        except Exception:
+            pass
+        # Sleep in short increments so stop_keep_alive() takes effect promptly
+        waited = 0
+        while waited < interval and not _keep_alive_stop:
+            time.sleep(5)
+            waited += 5
+
+def start_keep_alive():
+    """Start background keep-alive thread to prevent Colab idle disconnection.
+    Idempotent: does nothing if a keep-alive thread is already running."""
+    global _keep_alive_stop, _keep_alive_thread
+    if _keep_alive_thread is not None and _keep_alive_thread.is_alive():
+        return
+    _keep_alive_stop = False
+    import threading
+    _keep_alive_thread = threading.Thread(target=_keep_alive_worker, daemon=True)
+    _keep_alive_thread.start()
+
+def stop_keep_alive():
+    """Stop the background keep-alive thread."""
+    global _keep_alive_stop
+    _keep_alive_stop = True
+
+# --- UI ELEMENTS ---
+token_gf = widgets.Text(description='Gofile:', placeholder='Optional', value=get_colab_secret('GOFILE_TOKEN'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
+token_tmdb = widgets.Text(description='TMDB:', placeholder='API Key (optional)', value=get_colab_secret('TMDB_API_KEY'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
+tmdb_enabled_checkbox = widgets.Checkbox(value=True, description='TMDB matching', tooltip='Match filenames for canonical names, years, anime library routing, and season mapping', indent=False, layout=widgets.Layout(width='150px'))
+token_rd = widgets.Text(description='RD Token:', placeholder='Real-Debrid API Key', value=get_colab_secret('RD_TOKEN'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
+token_tb = widgets.Text(description='TB Token:', placeholder='TorBox API Key', value=get_colab_secret('TB_TOKEN'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
+# Debrid sits second in its row, after the 280px auto-organise checkbox — the same slot
+# the 280px Name field occupies in the row below. Same 50px label width as Year:, so the
+# dropdown and the Year box line up without margin tweaks.
+debrid_service_toggle = widgets.Dropdown(
+    options=['None', 'Real-Debrid', 'TorBox'],
+    value='None',
+    description='Debrid:',
+    tooltip='Select debrid service for premium links & magnets',
+    style={'description_width': '75px'},  # matches Auto Retry so both label+field pairs align
+    layout=widgets.Layout(width='215px')
+)
+token_fshare_email = widgets.Text(description='FShare:', placeholder='Email', value=get_colab_secret('FSHARE_EMAIL'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
+token_fshare_password = widgets.Password(description='Password:', placeholder='FShare Password', value=get_colab_secret('FSHARE_PASSWORD'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
+# Season match (default): bare episode numbers on TMDB-matched shows are converted to
+# SxxEyy via per-season counts (e.g. "One Piece - 1085" → S19E..). Absolute: keep the
+# number as-is (S01E1085) for libraries scanned with absolute ordering. Only affects
+# TMDB-matched shows whose filenames carry no explicit SxxExx/NxN season marker, so it
+# lives in ⚙️ Settings beside the TMDB controls rather than in the per-batch input row.
+episode_numbering_toggle = widgets.Dropdown(
+    options=['Season match', 'Absolute'],
+    value='Season match',
+    description='Episode numbering:',
+    tooltip='Season match: convert absolute episode numbers to SxxEyy using TMDB season data. Absolute: keep the absolute number as-is (e.g. S01E1085). Applies only to TMDB-matched shows with no season marker in the filename.',
+    style={'description_width': '130px'},  # matches the settings key-field label column
+    layout=widgets.Layout(width='270px')
+)
+playlist_selection = widgets.Text(description='Playlist:', placeholder='e.g. 1,3,5-10 (Empty=All)', style={'description_width': '60px'}, layout=widgets.Layout(width='220px'))
+concurrent_slider = widgets.IntSlider(value=MAX_CONCURRENT_DEFAULT, min=1, max=5, description='Parallel DLs:', style={'description_width': '80px'}, layout=widgets.Layout(width='280px'))
+auto_retry_input = widgets.Text(description='Auto Retry:', placeholder='e.g. 3 (Empty=Off)', tooltip='Automatically re-run 🔁 Retry Failed when a batch ends with failures, up to this many extra passes. Empty or 0 = off. Stops early once nothing is left failed; a kernel interrupt cancels the chain.', style={'description_width': '75px'}, layout=widgets.Layout(width='215px'))
+# Opt-in: finished files move to Drive on a dedicated mover thread so the pool starts
+# the next download immediately. Off = each worker moves its own file before taking
+# another, which doubles as backpressure when Colab disk or debrid slots are tight.
+async_moves_checkbox = widgets.Checkbox(value=False, description='Overlap Drive moves with downloads', tooltip='Finished files move to Drive in the background while the next download starts immediately. Uses more local disk (up to 3 finished files can queue) and keeps more debrid slots busy — leave off if Colab disk space or your provider\'s concurrent slots are tight.', indent=False, layout=widgets.Layout(width='320px'))
+# Opt-in: send finished files to Drive over the REST API instead of writing them
+# through the mount. The mount is a write-back cache, so a write there returns
+# before Drive actually has the file; the API returns only when the upload is done.
+drive_api_checkbox = widgets.Checkbox(value=False, description='Upload to Drive via API (bypass the mount)', tooltip='Writes through the Drive mount are staged locally and uploaded in the background, so a file can be reported complete minutes before it reaches Drive — and is lost outright if the runtime ends first. This uploads over the Drive API instead: slower to report, but "complete" means complete. Falls back to the mount automatically if the API is unavailable.', indent=False, layout=widgets.Layout(width='360px'))
+# How many Drive uploads run at once in overlap mode. Separate from Parallel DLs:
+# that slider is bounded by the debrid plan's concurrent slots, this one by how many
+# uploads Drive will take and how much local disk the pending backlog needs.
+drive_movers_slider = widgets.IntSlider(value=DRIVE_MOVERS_DEFAULT, min=1, max=8, description='Drive movers:', tooltip='Concurrent Drive uploads when overlap is on. Only meaningful with the Drive API enabled — writes to the mount are drained by a single background uploader no matter how many movers run. Each in-flight upload holds one finished file on local disk, so higher values need more free space. Raise it until the aggregate MB/s printed at the end of a batch stops improving.', style={'description_width': '95px'}, layout=widgets.Layout(width='300px'))
+# Auto-organisation checkbox for main UI. Width matches the Parallel DLs slider
+# (280px) so the Debrid and Auto Retry label+field pairs align across both rows.
+auto_organize_checkbox = widgets.Checkbox(value=True, description='Auto-organise', tooltip='Auto-rename and organise files. Uncheck to save with original filenames to Downloads.', indent=False, layout=widgets.Layout(width='280px'))
+
+def _aligned_links_row(content, label=''):
+    """Share the Links label gutter with the queue's heading and table."""
+    gutter = widgets.HTML(
+        f'<div style="text-align:right;padding-right:8px">{label}</div>',
+        layout=widgets.Layout(width='88px', flex='0 0 88px', margin='0'))
+    return widgets.HBox([gutter, content], layout=widgets.Layout(
+        width='98%', margin='2px', align_items='flex-start'))
+
+
+text_area = widgets.Textarea(placeholder='Paste Links Here (Transfer.it, Mega, YouTube, etc.)...',
+    layout=widgets.Layout(width='100%', min_width='0', flex='1 1 0%', height='150px', margin='0'))
+links_row = _aligned_links_row(text_area, 'Links:')
+btn = widgets.Button(description="Resolve Links", button_style='success', icon='search')
+btn_quick = widgets.Button(description="Quick Download", button_style='primary', icon='bolt', tooltip='Download immediately without queue preview', layout=widgets.Layout(width='140px'))
+btn_resume = widgets.Button(description="Resume Previous Session", button_style='warning', icon='play', layout=widgets.Layout(display='none', width='180px', align_items='center'))
+btn_restart = widgets.Button(description="🔄 Restart Runtime", button_style='danger', tooltip='Restart runtime then Resume Previous Session', layout=widgets.Layout(display='none'))
+# Synchronous batches show the interrupt hint; background live batches show Stop.
+stop_hint = widgets.HTML(value="", layout=widgets.Layout(display='none'))
+btn_stop = widgets.Button(description="⏹ Stop Download", button_style='danger',
+                          tooltip='Stop active downloads and save the queue for Resume',
+                          layout=widgets.Layout(display='none', width='150px'))
+btn_retry = widgets.Button(description="🔁 Retry Failed", button_style='warning', tooltip='Retry failed downloads from the saved session', layout=widgets.Layout(display='none', width='130px'))
+btn_history = widgets.Button(description="📜 History", button_style='', tooltip='View Download History', layout=widgets.Layout(width='100px'))
+btn_settings = widgets.Button(description="⚙️ Settings", button_style='', tooltip='Settings & Manage Files', layout=widgets.Layout(width='105px'))
+btn_about = widgets.Button(description="ℹ️ About", button_style='', tooltip='About', layout=widgets.Layout(width='90px'))
+progress_bar = widgets.FloatProgress(value=0.0, min=0.0, max=100.0, description='Idle', bar_style='info', layout=widgets.Layout(width='98%'))
+status_label = widgets.HTML(value="")
+live_log = widgets.HTML(layout=widgets.Layout(display='none', width='98%',
+                                               max_height='220px', overflow='auto'))
+_builtin_print = builtins.print
+_live_log_lock = Lock()
+_live_log_messages = deque(maxlen=100)
+_colab_live_status_active = False
+
+
+def print(*args, **kwargs):
+    """Send this module's background batch messages straight to the live log.
+
+    Keep log traffic to one bounded widget value instead of syncing an Output
+    widget's entire growing output history on every message.
+    """
+    if (globals().get('_live_batch') is not None and kwargs.get('file') is None
+            and (current_thread() is not main_thread() or _colab_live_status_active)):
+        separator = kwargs.get('sep') if kwargs.get('sep') is not None else ' '
+        ending = kwargs.get('end') if kwargs.get('end') is not None else '\n'
+        message = separator.join(str(arg) for arg in args) + ending
+        try:
+            with _live_log_lock:
+                _live_log_messages.append(message)
+                if not _colab_live_status_active:
+                    live_log.value = ("<pre style='white-space:pre-wrap;overflow-wrap:anywhere;"
+                                      "margin:0;font:12px monospace'>"
+                                      + html.escape(''.join(_live_log_messages)) + "</pre>")
+            return
+        except Exception:
+            pass  # A closed display must not abort a transfer.
+    _builtin_print(*args, **kwargs)
+
+# --- PER-DOWNLOAD PROGRESS BARS ---
+# Individual bars for each parallel download, shown in a collapsible panel.
+_per_task_bars: Dict[str, Any] = {}  # task_id -> widget or lightweight custom-panel row
+_per_task_done_at: Dict[str, float] = {}  # task_id -> completion timestamp (for linger)
+_PER_TASK_LINGER = 2.0  # seconds a completed bar stays visible before removal
+
+
+class _ProgressRow:
+    """Local state for the custom panel; only the panel syncs to the browser."""
+    __slots__ = ('model_id', 'description', 'value', 'bar_style')
+
+    def __init__(self, task_id: str, description: str):
+        self.model_id = task_id
+        self.description = description
+        self.value = 0.0
+        self.bar_style = 'info'
+
+    def close(self):
+        pass
+
+
+_per_task_box = widgets.VBox([], layout=widgets.Layout(width='100%'))
+_per_task_accordion = widgets.Accordion(children=[_per_task_box])
+_per_task_accordion.set_title(0, '📥 Downloads')
+_per_task_accordion.selected_index = None  # collapsed by default
+_per_task_accordion.layout = widgets.Layout(width='98%', display='none')  # hidden until needed
+
+# --- SETTINGS/MANAGEMENT UI ---
+btn_clear_history = widgets.Button(description="Clear Download History", button_style='warning', tooltip='Delete history.json', layout=widgets.Layout(width='180px'))
+btn_clear_ytarchive = widgets.Button(description="Clear YT Archive", button_style='warning', tooltip='Delete yt_history.txt (allows re-downloading videos)', layout=widgets.Layout(width='150px'))
+btn_clear_session = widgets.Button(description="Clear Session", button_style='warning', tooltip='Delete session.json', layout=widgets.Layout(width='120px'))
+btn_settings_close = widgets.Button(description="Close", button_style='', layout=widgets.Layout(width='70px'))
+settings_status = widgets.HTML(value="")
+
+# Cookie UI (experimental)
+btn_upload_cookies = widgets.Button(description="📤 Upload Cookies", button_style='info', tooltip='Upload cookies.txt for YouTube Premium (experimental)', layout=widgets.Layout(width='140px'))
+btn_clear_cookies = widgets.Button(description="🗑️ Clear Cookies", button_style='warning', tooltip='Delete cookies.txt (fixes format errors)', layout=widgets.Layout(width='130px'))
+cookie_status = widgets.HTML(value="")
+
+# Quick Download subtitle settings
+quick_dl_subs_checkbox = widgets.Checkbox(value=False, description='Include Subtitles in Quick Downloads', indent=False, layout=widgets.Layout(width='250px'))
+quick_dl_subtitle_langs = widgets.SelectMultiple(
+    options=[('English', 'en'), ('Vietnamese', 'vi'), ('Chinese', 'zh'), ('Japanese', 'ja'), ('Korean', 'ko'),
+             ('Thai', 'th'), ('Indonesian', 'id'), ('Spanish', 'es'), ('French', 'fr'), ('German', 'de'), ('Portuguese', 'pt'), ('Russian', 'ru')],
+    value=['en', 'vi'],
+    description='Languages:',
+    rows=6,  # whole rows only — a fixed pixel height clipped the last visible item
+    layout=widgets.Layout(width='300px')
+)
+
+# Embedded subtitle extraction settings — auto-extract toggle + retroactive library
+# scan tool (merged from the standalone Smart Subtitle Extractor)
+auto_extract_subs_checkbox = widgets.Checkbox(value=False, description='Extract embedded subs after download', indent=False, layout=widgets.Layout(width='250px'))
+extract_sub_langs = widgets.SelectMultiple(
+    options=[('English', 'en'), ('Vietnamese', 'vi'), ('Chinese', 'zh'), ('Japanese', 'ja'), ('Korean', 'ko'),
+             ('Thai', 'th'), ('Indonesian', 'id'), ('Spanish', 'es'), ('French', 'fr'), ('German', 'de'), ('Portuguese', 'pt'), ('Russian', 'ru')],
+    value=['en', 'vi'],
+    description='Languages:',
+    rows=6,  # whole rows only — a fixed pixel height clipped the last visible item
+    layout=widgets.Layout(width='300px')
+)
+extract_any_track_checkbox = widgets.Checkbox(value=False, description='Fall back to first text track when no language matches', indent=False, layout=widgets.Layout(width='380px'))
+extract_dir_input = widgets.Text(value=DRIVE_TV_PATH, layout=widgets.Layout(width='200px'))
+btn_browse_extract = widgets.Button(description='📁', tooltip='Browse Drive folders', layout=widgets.Layout(width='35px'))
+btn_extract_library = widgets.Button(description='📑 Extract from Library', button_style='info',
+                                     tooltip='Scan the folder for videos with embedded subtitle tracks and write missing .srt sidecars',
+                                     layout=widgets.Layout(width='180px'))
+
+# Secrets status UI
+secrets_status = widgets.HTML(value="")
+
+# Confirmation UI elements
+confirm_message = widgets.HTML(value="")
+btn_confirm_yes = widgets.Button(description="Yes, Delete", button_style='danger', layout=widgets.Layout(width='100px'))
+btn_confirm_cancel = widgets.Button(description="Cancel", button_style='', layout=widgets.Layout(width='80px'))
+confirm_box = widgets.HBox([confirm_message, btn_confirm_yes, btn_confirm_cancel], 
+                           layout=widgets.Layout(display='none', padding='5px', border='1px solid #f0ad4e', margin='5px 0'))
+
+# Track which action is pending confirmation
+pending_action = {'type': None}
+
+# Directory configuration widgets with browse buttons
+dir_tv_input = widgets.Text(value=DRIVE_TV_PATH, layout=widgets.Layout(width='200px'))
+dir_movie_input = widgets.Text(value=DRIVE_MOVIE_PATH, layout=widgets.Layout(width='200px'))
+dir_youtube_input = widgets.Text(value=DRIVE_YOUTUBE_PATH, layout=widgets.Layout(width='200px'))
+dir_downloads_input = widgets.Text(value=DRIVE_DOWNLOADS_PATH, layout=widgets.Layout(width='200px'))
+dir_anime_series_input = widgets.Text(value=DRIVE_ANIME_SERIES_PATH, layout=widgets.Layout(width='200px'))
+dir_anime_movies_input = widgets.Text(value=DRIVE_ANIME_MOVIES_PATH, layout=widgets.Layout(width='200px'))
+
+btn_browse_tv = widgets.Button(description='📁', tooltip='Browse Drive folders', layout=widgets.Layout(width='35px'))
+btn_browse_movie = widgets.Button(description='📁', tooltip='Browse Drive folders', layout=widgets.Layout(width='35px'))
+btn_browse_youtube = widgets.Button(description='📁', tooltip='Browse Drive folders', layout=widgets.Layout(width='35px'))
+btn_browse_downloads = widgets.Button(description='📁', tooltip='Browse Drive folders', layout=widgets.Layout(width='35px'))
+btn_browse_anime_series = widgets.Button(description='📁', tooltip='Browse Drive folders', layout=widgets.Layout(width='35px'))
+btn_browse_anime_movies = widgets.Button(description='📁', tooltip='Browse Drive folders', layout=widgets.Layout(width='35px'))
+
+# Folder browser state
+browser_state = {'current_path': '', 'target_widget': None, 'active': False}
+
+# Browser UI widgets
+browser_path_label = widgets.HTML("")
+browser_folder_list = widgets.Select(options=[], description='', layout=widgets.Layout(width='320px', height='120px'))
+btn_browser_up = widgets.Button(description='⬆️ Up', layout=widgets.Layout(width='60px'))
+btn_browser_open = widgets.Button(description='� Open', layout=widgets.Layout(width='70px'))
+btn_browser_select = widgets.Button(description='✓ Select', button_style='success', layout=widgets.Layout(width='70px'))
+btn_browser_close = widgets.Button(description='✕', button_style='danger', layout=widgets.Layout(width='35px'))
+new_folder_input = widgets.Text(placeholder='New folder name', layout=widgets.Layout(width='150px'))
+btn_create_folder = widgets.Button(description='➕ Create', button_style='info', layout=widgets.Layout(width='90px'))
+
+browser_ui = widgets.VBox([
+    widgets.HBox([browser_path_label, btn_browser_close]),
+    browser_folder_list,
+    widgets.HBox([btn_browser_up, btn_browser_open, btn_browser_select]),
+    widgets.HBox([new_folder_input, btn_create_folder])
+], layout=widgets.Layout(display='none', border='1px solid #888', padding='5px', margin='5px 0'))
+
+def get_folders_in_path(path):
+    """Get list of folders in the given path."""
+    folders = []
+    try:
+        full_path = os.path.join(DRIVE_BASE, path) if path else DRIVE_BASE
+        for item in os.listdir(full_path):
+            item_path = os.path.join(full_path, item)
+            if os.path.isdir(item_path) and not item.startswith('.'):
+                folders.append(item)
+        folders.sort()
+    except Exception:
+        pass
+    return folders
+
+def update_browser_ui():
+    """Update the browser UI with current path contents."""
+    path = browser_state['current_path']
+    display_path = f"📁 /{path}" if path else "📁 / (Drive Root)"
+    browser_path_label.value = f"<b>{display_path}</b>"
+    folders = get_folders_in_path(path)
+    browser_folder_list.options = folders if folders else ['(empty)']
+    browser_folder_list.value = folders[0] if folders else None
+
+def open_browser(target_widget):
+    """Open the folder browser for the given input widget."""
+    def handler(b):
+        # Check if Drive is mounted
+        if not os.path.exists(DRIVE_BASE):
+            dir_status.value = "<small style='color:orange'>⚠️ Mount Drive first (run a download)</small>"
+            return
+        browser_state['target_widget'] = target_widget
+        browser_state['current_path'] = ''
+        browser_state['active'] = True
+        browser_ui.layout.display = 'block'
+        update_browser_ui()
+        dir_status.value = "<small>Navigate folders, then click ✓ Select</small>"
+    return handler
+
+def on_browser_up(b):
+    """Navigate up one directory level."""
+    path = browser_state['current_path']
+    if path:
+        parent = os.path.dirname(path)
+        browser_state['current_path'] = parent
+        update_browser_ui()
+
+def on_browser_open(b):
+    """Navigate into the selected folder."""
+    selected = browser_folder_list.value
+    if selected and selected != '(empty)':
+        path = browser_state['current_path']
+        new_path = os.path.join(path, selected) if path else selected
+        browser_state['current_path'] = new_path
+        update_browser_ui()
+
+def on_browser_select(b):
+    """Select the current folder or selected subfolder."""
+    selected = browser_folder_list.value
+    path = browser_state['current_path']
+    # If a folder is selected, use that; otherwise use current path
+    if selected and selected != '(empty)':
+        final_path = os.path.join(path, selected) if path else selected
+    else:
+        final_path = path
+    if browser_state['target_widget']:
+        browser_state['target_widget'].value = final_path
+    browser_ui.layout.display = 'none'
+    browser_state['active'] = False
+    dir_status.value = f"<small style='color:green'>✓ Set to: {final_path}</small>"
+
+def on_browser_close(b):
+    """Close the folder browser."""
+    browser_ui.layout.display = 'none'
+    browser_state['active'] = False
+    dir_status.value = ""
+
+def on_create_folder(b):
+    """Create new folder in current browsing path."""
+    folder_name = new_folder_input.value.strip()
+    if not folder_name:
+        dir_status.value = "<small style='color:orange'>⚠️ Enter a folder name</small>"
+        return
+    try:
+        path = browser_state['current_path']
+        base = os.path.join(DRIVE_BASE, path) if path else DRIVE_BASE
+        new_path = os.path.join(base, folder_name)
+        if os.path.exists(new_path):
+            dir_status.value = f"<small style='color:orange'>⚠️ '{folder_name}' already exists</small>"
+            return
+        os.makedirs(new_path)
+        new_folder_input.value = ""
+        update_browser_ui()
+        # Select the new folder
+        browser_folder_list.value = folder_name
+        dir_status.value = f"<small style='color:green'>✅ Created '{folder_name}'</small>"
+    except Exception as e:
+        dir_status.value = f"<small style='color:red'>❌ Error: {e}</small>"
+
+btn_browse_tv.on_click(open_browser(dir_tv_input))
+btn_browse_movie.on_click(open_browser(dir_movie_input))
+btn_browse_youtube.on_click(open_browser(dir_youtube_input))
+btn_browse_downloads.on_click(open_browser(dir_downloads_input))
+btn_browse_anime_series.on_click(open_browser(dir_anime_series_input))
+btn_browse_anime_movies.on_click(open_browser(dir_anime_movies_input))
+btn_browse_extract.on_click(open_browser(extract_dir_input))
+btn_browser_up.on_click(on_browser_up)
+btn_browser_open.on_click(on_browser_open)
+btn_browser_select.on_click(on_browser_select)
+btn_browser_close.on_click(on_browser_close)
+btn_create_folder.on_click(on_create_folder)
+
+# Organised folder config (shown when auto-organise is enabled). Labels sit on the
+# same right-aligned 130px column as the key fields above — wide enough that the
+# long ones (Anime Series/Movies) always show fully.
+def _dir_label(text):
+    return widgets.HTML(f"<div style='text-align:right; padding-right:8px'><small><b>{text}</b></small></div>", layout=widgets.Layout(width='130px'))
+
+organized_dir_config = widgets.VBox([
+    widgets.HBox([_dir_label('TV Shows:'), dir_tv_input, btn_browse_tv]),
+    widgets.HBox([_dir_label('Movies:'), dir_movie_input, btn_browse_movie]),
+    widgets.HBox([_dir_label('YouTube:'), dir_youtube_input, btn_browse_youtube]),
+    widgets.HBox([_dir_label('Anime Series:'), dir_anime_series_input, btn_browse_anime_series]),
+    widgets.HBox([_dir_label('Anime Movies:'), dir_anime_movies_input, btn_browse_anime_movies]),
+    browser_ui
+])
+
+# Simple downloads folder config (shown when auto-organise is disabled)
+downloads_dir_config = widgets.VBox([
+    widgets.HBox([_dir_label('Downloads:'), dir_downloads_input, btn_browse_downloads]),
+    browser_ui
+], layout=widgets.Layout(display='none'))
+
+dir_config_row = widgets.VBox([
+    organized_dir_config,
+    downloads_dir_config
+])
+dir_status = widgets.HTML("")
+
+settings_buttons = widgets.HBox([btn_clear_history, btn_clear_ytarchive, btn_clear_session, btn_settings_close])
+cookie_row = widgets.HBox([btn_upload_cookies, btn_clear_cookies, cookie_status])
+api_keys_row = widgets.HBox([token_gf, token_rd, token_tb], layout=widgets.Layout(flex_flow='row wrap'))
+tmdb_row = widgets.HBox([token_tmdb, tmdb_enabled_checkbox], layout=widgets.Layout(flex_flow='row wrap'))
+# Numbering toggle sits under the TMDB controls because it only affects TMDB-matched
+# shows (absolute-episode → SxxEyy conversion); its 130px label matches the key fields.
+tmdb_numbering_row = widgets.HBox([episode_numbering_toggle])
+fshare_keys_row = widgets.HBox([token_fshare_email, token_fshare_password], layout=widgets.Layout(flex_flow='row wrap'))
+# 55px indent = the settings label column (130px) minus Debrid's own 75px label, so
+# the dropdown box lines up under the key fields. (The toggle keeps 75px to stay
+# aligned with Auto Retry in the main UI — it's the same widget instance in both places.)
+debrid_row = widgets.HBox([debrid_service_toggle], layout=widgets.Layout(margin='0 0 0 55px'))
+settings_ui = widgets.VBox([
+    widgets.HTML("<b>⚙️ Settings & File Management</b>"),
+    widgets.HTML("<div style='margin-top:10px'><small><b>🔑 API Keys:</b></small></div>"),
+    api_keys_row,
+    debrid_row,
+    tmdb_row,
+    tmdb_numbering_row,
+    widgets.HTML("<div style='margin-top:10px'><small><b>🇻🇳 FShare Account:</b></small></div>"),
+    fshare_keys_row,
+    secrets_status,
+    widgets.HTML("<div style='margin-top:10px'><small><b>📁 Download Directories (relative to Google Drive):</b></small></div>"),
+    dir_config_row,
+    dir_status,
+    widgets.HTML("<div style='margin-top:10px'><small><b>🍪 YouTube Cookies (Experimental):</b></small></div>"),
+    cookie_row,
+    widgets.HTML("<div style='margin-top:10px'><small><b>🚀 Performance:</b></small></div>"),
+    widgets.HBox([async_moves_checkbox]),
+    widgets.HBox([drive_api_checkbox]),
+    widgets.HBox([drive_movers_slider]),
+    widgets.HTML("<div style='margin-top:10px'><small><b>⚡ Quick Download Options:</b></small></div>"),
+    widgets.HBox([quick_dl_subs_checkbox, quick_dl_subtitle_langs]),
+    widgets.HTML("<div style='margin-top:10px'><small><b>📑 Embedded Subtitles:</b></small></div>"),
+    widgets.HBox([auto_extract_subs_checkbox, extract_sub_langs]),
+    widgets.HBox([extract_any_track_checkbox]),
+    widgets.HBox([_dir_label('Library folder:'), extract_dir_input, btn_browse_extract, btn_extract_library]),
+    widgets.HTML("<div style='margin-top:10px'><small><b>🗑️ Clear Data:</b></small></div>"),
+    settings_buttons,
+    confirm_box,
+    settings_status
+], layout=widgets.Layout(display='none', padding='10px', border='1px solid #ccc', margin='5px 0'))
+
+# --- ABOUT UI ---
+btn_about_close = widgets.Button(description="Close", button_style='', layout=widgets.Layout(width='80px'))
+about_ui = widgets.VBox([
+    widgets.HTML("""
+        <div style='padding: 10px;'>
+            <h3>ℹ️ About Ultimate Downloader</h3>
+            <p><strong>Version:</strong> 7.0</p>
+            <p><strong>Author:</strong> xersbtt</p>
+            <p><strong>Repository:</strong> <a href='https://github.com/xersbtt/ultimate-downloader-colab' target='_blank'>github.com/xersbtt/ultimate-downloader-colab</a></p>
+            <hr>
+            <p><strong>Copyright © 2025-2026 xersbtt</strong></p>
+            <p><small>
+                Permission is hereby granted, free of charge, to any person obtaining a copy
+                of this software and associated documentation files (the "Software"), to deal
+                in the Software without restriction, including without limitation the rights
+                to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+                copies of the Software, and to permit persons to whom the Software is
+                furnished to do so, subject to the following conditions:<br><br>
+                The above copyright notice and this permission notice shall be included in all
+                copies or substantial portions of the Software.<br><br>
+                THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+                IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+                FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+            </small></p>
+            <p><strong>Licence:</strong> MIT</p>
+            <p><small>Metadata provided by <a href='https://www.themoviedb.org' target='_blank'>TMDB</a>. This product uses the TMDB API but is not endorsed or certified by TMDB.</small></p>
+        </div>
+    """),
+    btn_about_close
+], layout=widgets.Layout(display='none', padding='10px', border='1px solid #ccc', margin='5px 0'))
+
+def toggle_about(b=None):
+    """Toggle about panel visibility."""
+    if about_ui.layout.display == 'none':
+        about_ui.layout.display = 'block'
+        settings_ui.layout.display = 'none'  # Close settings if open
+    else:
+        about_ui.layout.display = 'none'
+
+btn_about.on_click(toggle_about)
+btn_about_close.on_click(lambda b: setattr(about_ui.layout, 'display', 'none'))
+
+# Helper functions to get current directory paths from widgets
+def get_tv_path():
+    """Get TV shows path from widget or default."""
+    return dir_tv_input.value.strip() or DRIVE_TV_PATH
+
+def get_movie_path():
+    """Get movies path from widget or default."""
+    return dir_movie_input.value.strip() or DRIVE_MOVIE_PATH
+
+def get_youtube_path():
+    """Get YouTube path from widget or default."""
+    return dir_youtube_input.value.strip() or DRIVE_YOUTUBE_PATH
+
+def get_downloads_path():
+    """Get Downloads path from widget or default."""
+    return dir_downloads_input.value.strip() or DRIVE_DOWNLOADS_PATH
+
+def get_anime_series_path():
+    """Get Anime Series path from widget or default."""
+    return dir_anime_series_input.value.strip() or DRIVE_ANIME_SERIES_PATH
+
+def get_anime_movies_path():
+    """Get Anime Movies path from widget or default."""
+    return dir_anime_movies_input.value.strip() or DRIVE_ANIME_MOVIES_PATH
+
+def is_auto_organize_enabled():
+    """Check if auto-organization is enabled."""
+    return auto_organize_checkbox.value
+
+# --- SETTINGS PERSISTENCE ---
+def save_dir_settings():
+    """Save directory settings to settings.json."""
+    try:
+        if not os.path.exists(UD_CONFIG_PATH):
+            os.makedirs(UD_CONFIG_PATH, exist_ok=True)
+        settings = {
+            'tv_path': dir_tv_input.value.strip(),
+            'movie_path': dir_movie_input.value.strip(),
+            'youtube_path': dir_youtube_input.value.strip(),
+            'downloads_path': dir_downloads_input.value.strip(),
+            'anime_series_path': dir_anime_series_input.value.strip(),
+            'anime_movies_path': dir_anime_movies_input.value.strip(),
+            'auto_organize': auto_organize_checkbox.value,
+            'quick_dl_subs': quick_dl_subs_checkbox.value,
+            'tmdb_enabled': tmdb_enabled_checkbox.value,
+            'quick_dl_langs': list(quick_dl_subtitle_langs.value),
+            'auto_retry': auto_retry_input.value.strip(),
+            'async_moves': async_moves_checkbox.value,
+            'drive_api': drive_api_checkbox.value,
+            'drive_movers': drive_movers_slider.value,
+            'episode_numbering': episode_numbering_toggle.value,
+            # FShare password is intentionally NOT saved — plaintext credentials
+            # don't belong on Drive. Use Colab Secrets (FSHARE_PASSWORD) instead.
+            'fshare_email': token_fshare_email.value.strip(),
+            'debrid_service': debrid_service_toggle.value,
+            'auto_extract_subs': auto_extract_subs_checkbox.value,
+            'extract_langs': list(extract_sub_langs.value),
+            'extract_any_track': extract_any_track_checkbox.value,
+            'extract_dir': extract_dir_input.value.strip()
+        }
+        with open(SETTINGS_FILE, 'w') as f:
+            json.dump(settings, f)
+    except Exception as e:
+        # Expected before Drive is mounted; warn only if Drive is available but the write failed
+        if os.path.exists(DRIVE_BASE):
+            print(f"⚠️ Could not save settings: {e}")
+
+def load_dir_settings():
+    """Restore settings.json into the widgets — directory paths and UI state alike.
+    A widget the user has already changed this session always keeps its value
+    (_user_touched_settings), so the post-mount reload in setup_environment restores
+    sticky settings without overriding in-progress choices. Runs at startup too,
+    where it is a no-op unless Drive happens to be mounted already."""
+    global _loading_settings
+    try:
+        if not os.path.exists(SETTINGS_FILE):
+            return  # normal before the Drive mount — setup_environment reloads later
+        with open(SETTINGS_FILE, 'r') as f:
+            settings = json.load(f)
+        def keep(widget):  # True when the user's in-session change outranks the file
+            return widget in _user_touched_settings
+        _loading_settings = True  # suppress save-on-change while widgets are written
+        try:
+            if settings.get('tv_path') and not keep(dir_tv_input):
+                dir_tv_input.value = settings['tv_path']
+            if settings.get('movie_path') and not keep(dir_movie_input):
+                dir_movie_input.value = settings['movie_path']
+            if settings.get('youtube_path') and not keep(dir_youtube_input):
+                dir_youtube_input.value = settings['youtube_path']
+            if settings.get('downloads_path') and not keep(dir_downloads_input):
+                dir_downloads_input.value = settings['downloads_path']
+            if settings.get('anime_series_path') and not keep(dir_anime_series_input):
+                dir_anime_series_input.value = settings['anime_series_path']
+            if settings.get('anime_movies_path') and not keep(dir_anime_movies_input):
+                dir_anime_movies_input.value = settings['anime_movies_path']
+            if settings.get('fshare_email') and not keep(token_fshare_email):
+                token_fshare_email.value = settings['fshare_email']
+            # Legacy: older versions stored the password in settings.json.
+            # Still read it so existing users aren't locked out, but it is
+            # no longer written back (use Colab Secrets FSHARE_PASSWORD).
+            if settings.get('fshare_password') and not token_fshare_password.value:
+                token_fshare_password.value = settings['fshare_password']
+            if 'auto_organize' in settings and not keep(auto_organize_checkbox):
+                auto_organize_checkbox.value = settings['auto_organize']
+            if 'quick_dl_subs' in settings and not keep(quick_dl_subs_checkbox):
+                quick_dl_subs_checkbox.value = settings['quick_dl_subs']
+            if 'tmdb_enabled' in settings and not keep(tmdb_enabled_checkbox):
+                tmdb_enabled_checkbox.value = settings['tmdb_enabled']
+            if 'quick_dl_langs' in settings and not keep(quick_dl_subtitle_langs):
+                quick_dl_subtitle_langs.value = tuple(settings['quick_dl_langs'])
+            if 'auto_extract_subs' in settings and not keep(auto_extract_subs_checkbox):
+                auto_extract_subs_checkbox.value = bool(settings['auto_extract_subs'])
+            if 'extract_langs' in settings and not keep(extract_sub_langs):
+                extract_sub_langs.value = tuple(settings['extract_langs'])
+            if 'extract_any_track' in settings and not keep(extract_any_track_checkbox):
+                extract_any_track_checkbox.value = bool(settings['extract_any_track'])
+            if settings.get('extract_dir') and not keep(extract_dir_input):
+                extract_dir_input.value = settings['extract_dir']
+            if settings.get('debrid_service') and not keep(debrid_service_toggle):
+                debrid_service_toggle.value = settings['debrid_service']
+            if 'auto_retry' in settings and not keep(auto_retry_input):
+                auto_retry_input.value = str(settings['auto_retry'])
+            if 'async_moves' in settings and not keep(async_moves_checkbox):
+                async_moves_checkbox.value = bool(settings['async_moves'])
+            if 'drive_api' in settings and not keep(drive_api_checkbox):
+                drive_api_checkbox.value = bool(settings['drive_api'])
+            if 'drive_movers' in settings and not keep(drive_movers_slider):
+                # Clamped: a settings.json from a build with a wider range must not
+                # push the slider outside its own min/max (ipywidgets raises).
+                drive_movers_slider.value = max(drive_movers_slider.min,
+                                                min(drive_movers_slider.max, int(settings['drive_movers'])))
+            if settings.get('episode_numbering') in ('Season match', 'Absolute') and not keep(episode_numbering_toggle):
+                episode_numbering_toggle.value = settings['episode_numbering']
+        finally:
+            _loading_settings = False
+        update_main_ui_visibility()
+    except Exception as e:
+        print(f"⚠️ Could not load settings (using defaults): {e}")
+
+def update_folder_config_visibility():
+    """Show/hide appropriate folder config based on auto-organise checkbox."""
+    if auto_organize_checkbox.value:
+        organized_dir_config.layout.display = 'block'
+        downloads_dir_config.layout.display = 'none'
+    else:
+        organized_dir_config.layout.display = 'none'
+        downloads_dir_config.layout.display = 'block'
+
+def update_main_ui_visibility():
+    """Refresh visibility of settings that depend on the auto-organise checkbox."""
+    update_folder_config_visibility()
+
+def on_auto_organize_change(change):
+    """Handle auto-organise checkbox change."""
+    if change['type'] == 'change' and change['name'] == 'value':
+        update_main_ui_visibility()
+        if not _loading_settings:
+            _user_touched_settings.add(change['owner'])
+            save_dir_settings()
+
+# Auto-save when an observed setting changes — real user edits only: programmatic
+# writes during load_dir_settings/check_and_load_secrets are ignored, and the widget
+# is remembered as user-touched so a later reload never overrides the user's choice.
+def on_dir_change(change):
+    """Save settings when the user changes any observed input."""
+    if change['type'] == 'change' and change['name'] == 'value' and not _loading_settings:
+        _user_touched_settings.add(change['owner'])
+        save_dir_settings()
+
+auto_organize_checkbox.observe(on_auto_organize_change, names='value')
+dir_tv_input.observe(on_dir_change, names='value')
+dir_movie_input.observe(on_dir_change, names='value')
+dir_youtube_input.observe(on_dir_change, names='value')
+dir_downloads_input.observe(on_dir_change, names='value')
+dir_anime_series_input.observe(on_dir_change, names='value')
+dir_anime_movies_input.observe(on_dir_change, names='value')
+quick_dl_subs_checkbox.observe(on_dir_change, names='value')
+tmdb_enabled_checkbox.observe(on_dir_change, names='value')
+quick_dl_subtitle_langs.observe(on_dir_change, names='value')
+token_fshare_email.observe(on_dir_change, names='value')
+token_fshare_password.observe(on_dir_change, names='value')
+debrid_service_toggle.observe(on_dir_change, names='value')
+auto_retry_input.observe(on_dir_change, names='value')
+async_moves_checkbox.observe(on_dir_change, names='value')
+drive_api_checkbox.observe(on_dir_change, names='value')
+drive_movers_slider.observe(on_dir_change, names='value')
+episode_numbering_toggle.observe(on_dir_change, names='value')
+auto_extract_subs_checkbox.observe(on_dir_change, names='value')
+extract_sub_langs.observe(on_dir_change, names='value')
+extract_any_track_checkbox.observe(on_dir_change, names='value')
+extract_dir_input.observe(on_dir_change, names='value')
+
+# Try to load settings on startup (will work if Drive already mounted)
+load_dir_settings()
+
+
+# --- QUEUE MANAGEMENT UI ---
+# Inline assets keep the single-cell / raw-GitHub Colab entry point self-contained.
+_QUEUE_TABLE_CSS = """
+.ud-queue { --ud-text: #202124; --ud-surface: #ffffff; --ud-alternate: #f8fafc;
+  --ud-header: #f1f3f5; --ud-border: #cbd5e1; --ud-hover: #edf5ff;
+  --ud-selected: #d9eaff; --ud-selected-text: #162d46; --ud-muted: #52606d;
+  font: 13px system-ui, sans-serif; color: var(--ud-text); background: var(--ud-surface);
+  color-scheme: light; }
+@media (prefers-color-scheme: dark) {
+  .ud-queue { --ud-text: #e8eaed; --ud-surface: #202124; --ud-alternate: #27292d;
+    --ud-header: #303238; --ud-border: #59616d; --ud-hover: #303e50;
+    --ud-selected: #244b76; --ud-selected-text: #ffffff; --ud-muted: #bac4d0;
+    color-scheme: dark; }
+}
+.ud-queue .ud-scroll { overflow: auto; height: 280px; border: 1px solid var(--ud-border);
+  border-radius: 4px; background: var(--ud-surface); }
+.ud-queue table { table-layout: fixed; border-collapse: separate; border-spacing: 0; margin: 0;
+  color: var(--ud-text); background: var(--ud-surface); }
+.ud-queue th, .ud-queue td { box-sizing: border-box; padding: 7px 10px; text-align: left;
+  border-right: 1px solid var(--ud-border); border-bottom: 1px solid var(--ud-border); height: 34px; }
+.ud-queue th { position: sticky; top: 0; z-index: 1; background: var(--ud-header); color: var(--ud-text);
+  font-weight: 600; user-select: none; }
+.ud-queue .ud-cell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: inherit; }
+.ud-queue tbody tr { cursor: pointer; }
+.ud-queue tbody td { background: var(--ud-surface); color: var(--ud-text); }
+.ud-queue tbody tr:nth-child(even) td { background: var(--ud-alternate); }
+.ud-queue tbody tr:hover td { background: var(--ud-hover); color: var(--ud-text); }
+.ud-queue tbody tr[aria-selected=true] td { background: var(--ud-selected); color: var(--ud-selected-text); }
+.ud-queue tbody tr:focus { outline: 2px solid #4285f4; outline-offset: -2px; }
+.ud-queue input[type=checkbox] { width: 20px; height: 20px; vertical-align: middle;
+  margin: 0 8px 0 0; accent-color: #1967d2; cursor: pointer; }
+.ud-queue .ud-resize { position: absolute; right: -1px; top: 0; width: 9px;
+  height: 100%; cursor: col-resize; touch-action: none; }
+.ud-queue .ud-resize:hover, .ud-queue .ud-resize:focus { background: #4285f480; outline: none; }
+.ud-queue .ud-help { color: var(--ud-muted); margin-top: 6px; font-size: 12px; }
+"""
+
+_QUEUE_TABLE_ESM = r"""
+export default {
+  render({model, el}) {
+    const columns = [
+      ['number', '#', 72], ['name', 'File', 120], ['source', 'Source', 80],
+      ['size', 'Size', 70], ['destination', 'Destination', 160], ['overrides', 'Overrides', 90]
+    ];
+    const defaults = [72, 330, 110, 90, 480, 180];
+    const root = document.createElement('div'); root.className = 'ud-queue';
+    const scroll = document.createElement('div'); scroll.className = 'ud-scroll';
+    const table = document.createElement('table');
+    table.setAttribute('aria-label', 'Download queue');
+    table.setAttribute('aria-multiselectable', 'true'); table.setAttribute('role', 'grid');
+    const colgroup = document.createElement('colgroup');
+    const head = table.createTHead().insertRow();
+    table.insertBefore(colgroup, table.firstChild);
+    const body = table.createTBody();
+    const help = document.createElement('div'); help.className = 'ud-help';
+    help.textContent = 'Click anywhere on a row to select or deselect that file. Shift-click adds a range. Arrow keys move focus; Space toggles selection. Use the header checkbox to select or clear all. Drag header dividers to resize; double-click to fit.';
+    scroll.append(table); root.append(scroll, help); el.append(root);
+    const abort = new AbortController();
+    const listen = (node, event, fn) => node.addEventListener(event, fn, {signal: abort.signal});
+    const clamp = (width, i) => Math.max(columns[i][2], Math.min(2000, Number(width) || defaults[i]));
+    let widths = defaults.slice(), anchor = null, active = null;
+    let rowNodes = new Map(), resizeState = null;
+    const selectAll = document.createElement('input'); selectAll.type = 'checkbox';
+    selectAll.setAttribute('aria-label', 'Select all files');
+    function applyWidths() {
+      [...colgroup.children].forEach((col, i) => { col.style.width = widths[i] + 'px'; });
+      table.style.width = widths.reduce((sum, width) => sum + width, 0) + 'px';
+      head.querySelectorAll('.ud-resize').forEach((handle, i) => handle.setAttribute('aria-valuenow', widths[i]));
+    }
+    function readWidths() {
+      const stored = model.get('column_widths') || [];
+      widths = defaults.map((width, i) => clamp(stored[i] ?? width, i)); applyWidths();
+    }
+    function saveWidths() { model.set('column_widths', widths.slice()); model.save_changes(); }
+    columns.forEach(([key, label, min], i) => {
+      colgroup.append(document.createElement('col'));
+      const th = document.createElement('th'); th.scope = 'col';
+      if (!i) th.append(selectAll);
+      const text = document.createElement('span'); text.textContent = label; th.append(text);
+      const handle = document.createElement('span'); handle.className = 'ud-resize'; handle.tabIndex = 0;
+      handle.setAttribute('role', 'separator'); handle.setAttribute('aria-orientation', 'vertical');
+      handle.setAttribute('aria-label', `Resize ${label} column`);
+      handle.setAttribute('aria-valuemin', min); handle.setAttribute('aria-valuemax', 2000);
+      listen(handle, 'pointerdown', event => {
+        if (event.button !== 0) return;
+        event.preventDefault(); event.stopPropagation();
+        resizeState = {i, x: event.clientX, width: widths[i]};
+        handle.setPointerCapture(event.pointerId);
+      });
+      listen(handle, 'pointermove', event => {
+        if (!resizeState || resizeState.i !== i) return;
+        widths[i] = clamp(resizeState.width + event.clientX - resizeState.x, i); applyWidths();
+      });
+      const finish = () => { if (resizeState?.i === i) { resizeState = null; saveWidths(); } };
+      listen(handle, 'pointerup', finish); listen(handle, 'lostpointercapture', finish);
+      listen(handle, 'pointercancel', finish);
+      listen(handle, 'keydown', event => {
+        if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+        event.preventDefault(); widths[i] = clamp(widths[i] + (event.key === 'ArrowRight' ? 20 : -20), i);
+        applyWidths(); saveWidths();
+      });
+      listen(handle, 'dblclick', () => {
+        const context = document.createElement('canvas').getContext('2d');
+        context.font = getComputedStyle(root).font;
+        const values = [label, ...(model.get('rows') || []).map(row => String(row[key] || ''))];
+        widths[i] = clamp(Math.max(...values.map(value => context.measureText(value).width)) + (i ? 32 : 52), i);
+        applyWidths(); saveWidths();
+      });
+      th.append(handle); head.append(th);
+    });
+    function updateSelection() {
+      const selected = new Set(model.get('selected_ids') || []);
+      let count = 0;
+      rowNodes.forEach(({tr, checkbox}, id) => {
+        const chosen = selected.has(id); count += chosen ? 1 : 0;
+        tr.setAttribute('aria-selected', String(chosen)); checkbox.checked = chosen;
+      });
+      selectAll.checked = rowNodes.size > 0 && count === rowNodes.size;
+      selectAll.indeterminate = count > 0 && count < rowNodes.size;
+    }
+    function commitSelection(ids) {
+      const chosen = new Set(ids);
+      // IDs, rather than row numbers, keep delayed browser events safe after sorting/removal.
+      model.set('selected_ids', (model.get('rows') || []).filter(row => chosen.has(row.id)).map(row => row.id));
+      model.save_changes(); updateSelection();
+    }
+    function choose(id, event) {
+      const ids = (model.get('rows') || []).map(row => row.id);
+      let selected = new Set(model.get('selected_ids') || []);
+      if (event.shiftKey && anchor && ids.includes(anchor)) {
+        const a = ids.indexOf(anchor), b = ids.indexOf(id);
+        ids.slice(Math.min(a, b), Math.max(a, b) + 1).forEach(value => selected.add(value));
+      } else {
+        if (selected.has(id)) selected.delete(id); else selected.add(id);
+        anchor = id;
+      }
+      active = id; commitSelection(selected);
+    }
+    listen(selectAll, 'change', () => commitSelection(selectAll.checked ? [...rowNodes.keys()] : []));
+    // Delegate row events so replacing rows does not retain old nodes/listeners.
+    listen(body, 'click', event => {
+      const tr = event.target.closest('tr[data-id]'); if (!tr) return;
+      choose(tr.dataset.id, event); tr.focus({preventScroll: true});
+    });
+    listen(body, 'keydown', event => {
+      const tr = event.target.closest('tr[data-id]'); if (!tr) return;
+      const ids = [...rowNodes.keys()], index = ids.indexOf(tr.dataset.id);
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {
+        event.preventDefault(); commitSelection(ids);
+      } else if (event.key === ' ') {
+        event.preventDefault(); choose(tr.dataset.id, event);
+      } else if (['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) {
+        event.preventDefault();
+        const next = event.key === 'Home' ? 0 : event.key === 'End' ? ids.length - 1 :
+          Math.max(0, Math.min(ids.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1)));
+        if (event.shiftKey) {
+          if (!anchor || !rowNodes.has(anchor)) anchor = tr.dataset.id;
+          choose(ids[next], event);
+        } else anchor = ids[next];
+        active = ids[next]; rowNodes.get(active).tr.focus();
+      }
+    });
+    function renderRows() {
+      const focused = body.contains(document.activeElement), top = scroll.scrollTop, left = scroll.scrollLeft;
+      const fragment = document.createDocumentFragment(); rowNodes = new Map();
+      const rows = model.get('rows') || [];
+      rows.forEach((row, index) => {
+        const tr = document.createElement('tr'); tr.dataset.id = row.id;
+        tr.tabIndex = 0; tr.setAttribute('aria-rowindex', index + 2);
+        let checkbox;
+        columns.forEach(([key], i) => {
+          const td = tr.insertCell(); const cell = document.createElement('div'); cell.className = 'ud-cell';
+          const value = String(row[key] || ''); cell.title = value;
+          if (!i) {
+            checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.tabIndex = -1;
+            checkbox.setAttribute('aria-label', `Select ${row.name}`); cell.append(checkbox);
+          }
+          cell.append(document.createTextNode(value)); td.append(cell);
+        });
+        rowNodes.set(row.id, {tr, checkbox}); fragment.append(tr);
+      });
+      if (!rows.length) {
+        const tr = document.createElement('tr'), td = tr.insertCell(); td.colSpan = columns.length;
+        td.textContent = 'No files in the queue.'; fragment.append(tr);
+      }
+      body.replaceChildren(fragment); updateSelection();
+      if (focused && rowNodes.has(active)) rowNodes.get(active).tr.focus({preventScroll: true});
+      scroll.scrollTop = top; scroll.scrollLeft = left;
+    }
+    model.on('change:rows', renderRows); model.on('change:selected_ids', updateSelection);
+    model.on('change:column_widths', readWidths);
+    readWidths(); renderRows();
+    return () => {
+      abort.abort(); model.off('change:rows', renderRows);
+      model.off('change:selected_ids', updateSelection); model.off('change:column_widths', readWidths);
+      root.remove();
+    };
+  }
+};
+"""
+
+
+def _create_queue_widget():
+    """A resizable table with the old selection API used by queue actions."""
+    try:
+        try:
+            import anywidget
+        except ImportError:
+            if drive is None:
+                raise
+            import sys
+            print('🛠️ Installing queue table support...')
+            subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'anywidget>=0.9,<1'],
+                           check=True, timeout=120)
+            import anywidget
+        import traitlets
+        if drive is not None:
+            from google.colab import output
+            output.enable_custom_widget_manager()
+
+        class QueueTable(anywidget.AnyWidget):
+            _esm = _QUEUE_TABLE_ESM
+            _css = _QUEUE_TABLE_CSS
+            rows = traitlets.List(traitlets.Dict()).tag(sync=True)
+            selected_ids = traitlets.List(traitlets.Unicode()).tag(sync=True)
+            column_widths = traitlets.List(traitlets.Int(), [72, 330, 110, 90, 480, 180]).tag(sync=True)
+            _options = ()
+
+            @property
+            def options(self):
+                return self._options
+
+            @options.setter
+            def options(self, values):
+                self._options = tuple(values)
+                self.selected_ids = []
+                if not self._options:
+                    self.rows = []
+
+            def set_rows(self, rows):
+                self.rows = rows
+
+            @property
+            def value(self):
+                selected = set(self.selected_ids)
+                return tuple(option for option, row in zip(self.options, self.rows)
+                             if row['id'] in selected)
+
+            @value.setter
+            def value(self, values):
+                selected = set(values)
+                self.selected_ids = [row['id'] for option, row in zip(self.options, self.rows)
+                                     if option in selected]
+
+        return QueueTable(layout=widgets.Layout(width='100%', min_width='0', margin='0'))
+    except Exception as e:
+        print(f'⚠️ Resizable queue unavailable; using the standard list ({type(e).__name__}).')
+        return widgets.SelectMultiple(options=[],
+                                      layout=widgets.Layout(width='100%', min_width='0', height='280px', margin='0'))
+
+
+queue_list = _create_queue_widget()
+
+# The custom Colab widget manager also renders the standard controls. Use a
+# native disclosure for progress so expansion does not rely on Accordion's
+# child-view/layout machinery or on Python processing a click during a download.
+_DOWNLOAD_PROGRESS_CSS = """
+.ud-download-progress { color: var(--jp-ui-font-color1, #202124); font: 13px system-ui, sans-serif;
+  border: 1px solid #b8bec6; border-radius: 4px; }
+.ud-download-progress summary { cursor: pointer; padding: 8px 10px;
+  background: var(--jp-layout-color2, #f1f3f5); user-select: none; }
+.ud-download-progress summary:focus-visible { outline: 2px solid #4285f4; outline-offset: -2px; }
+.ud-download-progress .ud-progress-body { padding: 6px 10px; }
+.ud-download-progress .ud-progress-row { display: flex; align-items: center; gap: 12px; padding: 5px 0; }
+.ud-download-progress .ud-progress-name { flex: 0 1 45%; min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.ud-download-progress progress { flex: 1; min-width: 60px; height: 16px; accent-color: #4285f4; }
+.ud-download-progress progress[data-state=warning] { accent-color: #e5a100; }
+.ud-download-progress progress[data-state=success] { accent-color: #268a43; }
+.ud-download-progress progress[data-state=danger] { accent-color: #d93025; }
+"""
+
+_DOWNLOAD_PROGRESS_ESM = r"""
+export default {
+  render({model, el}) {
+    const details = document.createElement('details'); details.className = 'ud-download-progress';
+    const summary = document.createElement('summary');
+    summary.title = 'Show or hide individual download progress';
+    const body = document.createElement('div'); body.className = 'ud-progress-body';
+    details.append(summary, body); el.append(details);
+    details.open = Boolean(model.get('expanded'));
+    function rememberExpansion() {
+      // Native <details> opens immediately even while the kernel is busy. Only
+      // remember the choice for redisplay; streamed updates never set `open`.
+      model.set('expanded', details.open); model.save_changes();
+    }
+    details.addEventListener('toggle', rememberExpansion);
+    function updateTitle() { summary.textContent = model.get('title'); }
+    const rows = new Map();
+    function updateBars() {
+      const bars = model.get('bars') || [], keep = new Set(bars.map(bar => bar.id));
+      rows.forEach((row, id) => { if (!keep.has(id)) { row.node.remove(); rows.delete(id); } });
+      bars.forEach((bar, index) => {
+        let row = rows.get(bar.id);
+        if (!row) {
+          const node = document.createElement('div'); node.className = 'ud-progress-row';
+          const name = document.createElement('span'); name.className = 'ud-progress-name';
+          const progress = document.createElement('progress'); progress.max = 100;
+          node.append(name, progress); row = {node, name, progress}; rows.set(bar.id, row);
+        }
+        if (row.name.textContent !== bar.description) row.name.textContent = bar.description;
+        if (row.name.title !== bar.description) row.name.title = bar.description;
+        const value = Math.max(0, Math.min(100, Number(bar.value) || 0));
+        if (row.progress.value !== value) row.progress.value = value;
+        if (row.progress.dataset.state !== bar.state) row.progress.dataset.state = bar.state;
+        if (row.progress.getAttribute('aria-label') !== bar.description)
+          row.progress.setAttribute('aria-label', bar.description);
+        if (body.children[index] !== row.node) body.insertBefore(row.node, body.children[index] || null);
+      });
+    }
+    model.on('change:title', updateTitle); model.on('change:bars', updateBars);
+    updateTitle(); updateBars();
+    return () => {
+      details.removeEventListener('toggle', rememberExpansion);
+      model.off('change:title', updateTitle); model.off('change:bars', updateBars); details.remove();
+    };
+  }
+};
+"""
+
+
+def _create_download_progress_panel(fallback):
+    """Use native browser expansion alongside the custom queue renderer."""
+    if not hasattr(queue_list, 'set_rows'):
+        return fallback  # Keep the standard controls when custom widgets aren't available.
+    try:
+        import anywidget
+        import traitlets
+
+        class DownloadProgressPanel(anywidget.AnyWidget):
+            _esm = _DOWNLOAD_PROGRESS_ESM
+            _css = _DOWNLOAD_PROGRESS_CSS
+            title = traitlets.Unicode('📥 Individual downloads').tag(sync=True)
+            bars = traitlets.List(traitlets.Dict()).tag(sync=True)
+            expanded = traitlets.Bool(False).tag(sync=True)
+
+            def set_title(self, index, title):
+                self.title = title
+
+            def set_bars(self, bars):
+                self.bars = [dict(id=bar.model_id, description=bar.description,
+                                  value=bar.value, state=bar.bar_style) for bar in bars]
+
+        panel = DownloadProgressPanel(layout=widgets.Layout(width='98%', display='none'))
+        fallback.close()
+        return panel
+    except Exception:
+        return fallback
+
+
+_per_task_accordion = _create_download_progress_panel(_per_task_accordion)
+
+btn_queue_up = widgets.Button(description="▲ Up", button_style='', layout=widgets.Layout(width='80px'))
+btn_queue_down = widgets.Button(description="▼ Down", button_style='', layout=widgets.Layout(width='80px'))
+btn_queue_select_all = widgets.Button(description="Select All", button_style='', layout=widgets.Layout(width='80px'))
+btn_queue_select_none = widgets.Button(description="None", button_style='', layout=widgets.Layout(width='60px'))
+btn_queue_remove = widgets.Button(description="Remove", button_style='danger', layout=widgets.Layout(width='70px'))
+btn_queue_sort = widgets.Button(description="Sort A-Z", button_style='', icon='sort-alpha-asc', tooltip='Sort queue alphabetically by filename', layout=widgets.Layout(width='90px'))
+queue_sort_ascending = True  # Track current sort direction
+btn_queue_start = widgets.Button(description="▶ Start Download", button_style='success', layout=widgets.Layout(width='130px'))
+btn_queue_start_subs = widgets.Button(description="📝 Download Subtitles", button_style='info', layout=widgets.Layout(width='170px', display='none'))  # Hidden by default
+btn_queue_cancel = widgets.Button(description="Cancel", button_style='warning', layout=widgets.Layout(width='70px'))
+
+# Subtitle language selector
+subtitle_langs = widgets.SelectMultiple(
+    options=[('English', 'en'), ('Vietnamese', 'vi'), ('Chinese', 'zh'), ('Japanese', 'ja'), 
+             ('Korean', 'ko'), ('Thai', 'th'), ('Indonesian', 'id'), ('Spanish', 'es'), 
+             ('French', 'fr'), ('German', 'de'), ('Portuguese', 'pt'), ('Russian', 'ru')],
+    value=['en', 'vi'],
+    description='Subtitles:',
+    layout=widgets.Layout(width='200px', height='80px')
+)
+
+queue_controls = widgets.HBox([
+    widgets.HTML("", layout=widgets.Layout(width='115px')),  # spacer — buttons start where the row fields do
+    btn_queue_up, btn_queue_down, btn_queue_sort, btn_queue_select_all, btn_queue_select_none,
+    btn_queue_start, btn_queue_start_subs, btn_queue_cancel, btn_queue_remove])
+queue_options = widgets.HBox([subtitle_langs])  # Uses description for alignment like queue_list
+
+# Manual identity correction: a TMDB match (automatic canonical name/year) or a
+# forced Name/Year (its manual counterpart, which wins for naming). The TMDB group
+# shows only when TMDB matching is enabled; the whole row only when auto-organise is
+# on — identity only matters when files are renamed and routed.
+tmdb_override_input = widgets.Text(placeholder='TMDB URL, tv:12345 / movie:12345, or a title to search', layout=widgets.Layout(width='300px'))
+btn_tmdb_match = widgets.Button(description='🔍 Match Selected', button_style='info', tooltip='Apply a TMDB match to the selected queue item(s)', layout=widgets.Layout(width='150px'))
+btn_tmdb_clear = widgets.Button(description='✖ Clear Match', button_style='', tooltip='Remove the TMDB match — use filename parsing instead', layout=widgets.Layout(width='120px'))
+tmdb_group = widgets.HBox([
+    widgets.HTML("<div style='text-align:right; padding-right:8px'><small><b>🎬 Fix Match:</b></small></div>", layout=widgets.Layout(width='115px')),
+    tmdb_override_input, btn_tmdb_match, btn_tmdb_clear
+])
+queue_name_input = widgets.Text(placeholder='Name (forces folder/file name)', tooltip='Manual show/movie name — wins over TMDB naming while retaining its automatic library classification', layout=widgets.Layout(width='220px'))
+queue_year_input = widgets.Text(placeholder='Year', tooltip='Optional year for the folder name (e.g. 2025)', layout=widgets.Layout(width='70px'))
+btn_name_apply = widgets.Button(description='Set Name', button_style='info', tooltip='Force this name/year for the selected queue item(s)', layout=widgets.Layout(width='100px'))
+btn_name_clear = widgets.Button(description='✖ Clear Name', button_style='', tooltip='Remove the forced name — use TMDB/filename detection again', layout=widgets.Layout(width='120px'))
+name_group = widgets.HBox([
+    widgets.HTML("<small><b>&nbsp;&nbsp;✏️ Force Name:</b></small>"),
+    queue_name_input, queue_year_input, btn_name_apply, btn_name_clear
+])
+identity_row = widgets.HBox([tmdb_group, name_group], layout=widgets.Layout(flex_flow='row wrap', display='none'))
+
+# Manual routing: send the selected rows to a specific library folder — so one batch
+# can mix anime and live-action, series and movies ('Downloads (as-is)' skips
+# organising for those rows). Auto = use filename/TMDB detection.
+route_dropdown = widgets.Dropdown(
+    options=[('Auto', ''), ('TV Series', 'tv'), ('Anime Series', 'anime_series'),
+             ('Movie', 'movie'), ('Anime Movie', 'anime_movie'), ('Downloads (as-is)', 'downloads')],
+    value='', layout=widgets.Layout(width='150px'))
+btn_route_apply = widgets.Button(description='Apply Route', button_style='info', tooltip='Route the selected queue item(s) to this folder (Auto = clear the override)', layout=widgets.Layout(width='110px'))
+btn_route_clear = widgets.Button(description='✖ Clear Route', button_style='', tooltip='Remove the forced route — detect the category again', layout=widgets.Layout(width='120px'))
+route_row = widgets.HBox([
+    widgets.HTML("<div style='text-align:right; padding-right:8px'><small><b>🎯 Route as:</b></small></div>", layout=widgets.Layout(width='115px')),
+    route_dropdown, btn_route_apply, btn_route_clear
+])
+
+
+# Manual season override (for batches whose filenames carry no season marker —
+# without this, season 2+ files parse as season 1 and get skipped as duplicates)
+season_override_input = widgets.Text(placeholder='e.g. 2', tooltip='Season number to force (0 = Specials)', layout=widgets.Layout(width='80px'))
+btn_season_apply = widgets.Button(description='Set Season', button_style='info', tooltip='Force this season for the selected queue item(s) — overrides filename parsing and TMDB mapping', layout=widgets.Layout(width='110px'))
+btn_season_clear = widgets.Button(description='✖ Clear Season', button_style='', tooltip='Remove the forced season — use filename/TMDB detection again', layout=widgets.Layout(width='130px'))
+renumber_start_input = widgets.Text(placeholder='1', tooltip='Episode number to start renumbering from (default 1). A range like 7-9 names the first file S01E07-E09 (multi-episode file); later files continue from E10', layout=widgets.Layout(width='60px'))
+btn_renumber = widgets.Button(description='Renumber', button_style='info', tooltip='Renumber the selected queue item(s) sequentially from this episode, in queue order — a video and its subtitle share one number', layout=widgets.Layout(width='100px'))
+btn_renumber_clear = widgets.Button(description='✖ Clear', button_style='', tooltip='Remove the forced episode numbers — use filename/TMDB detection again', layout=widgets.Layout(width='90px'))
+# Manual part suffix (multi-file episodes): append -ptN sequentially to the selected
+# rows, or strip a detected/forced suffix entirely — wins over Part X / 上篇 detection
+part_override_input = widgets.Text(placeholder='1', tooltip='Part number to start from (default 1)', layout=widgets.Layout(width='55px'))
+btn_part_apply = widgets.Button(description='Set Part', button_style='info', tooltip='Append -ptN sequentially to the selected item(s) in queue order (e.g. 1 → -pt1, -pt2, …) — a video and its subtitle share one number', layout=widgets.Layout(width='90px'))
+btn_part_remove = widgets.Button(description='✖ No Part', button_style='', tooltip='Strip any -ptN suffix from the selected item(s), detected or forced', layout=widgets.Layout(width='95px'))
+season_override_row = widgets.HBox([
+    widgets.HTML("<div style='text-align:right; padding-right:8px'><small><b>🗂️ Force Season:</b></small></div>", layout=widgets.Layout(width='115px')),
+    season_override_input, btn_season_apply, btn_season_clear,
+    widgets.HTML("<small><b>&nbsp;&nbsp;🔢 Renumber from:</b></small>"),
+    renumber_start_input, btn_renumber, btn_renumber_clear,
+    widgets.HTML("<small><b>&nbsp;&nbsp;📎 Part:</b></small>"),
+    part_override_input, btn_part_apply, btn_part_remove
+], layout=widgets.Layout(flex_flow='row wrap'))
+
+btn_queue_apply_changes = widgets.Button(
+    description='Apply Changes', button_style='primary', icon='check',
+    tooltip='Apply all filled text fields to the selected files together; blank fields stay unchanged',
+    layout=widgets.Layout(width='150px'))
+queue_edit_actions = widgets.HBox([
+    btn_queue_apply_changes,
+    widgets.HTML('<small>Apply filled Match, Name/Year, Season, Episode and Part fields together. '
+                 'Blanks stay unchanged. Use Apply Route for routing.</small>'),
+], layout=widgets.Layout(flex_flow='row wrap', align_items='center'))
+
+# Playlist range selector (shown only for YouTube playlists)
+playlist_options = widgets.HBox([
+    widgets.HTML("<div style='text-align:right; padding-right:8px'><small><b>🎯 Playlist Range:</b></small></div>", layout=widgets.Layout(width='115px')),
+    playlist_selection
+], layout=widgets.Layout(display='none'))  # Hidden by default
+queue_ui = widgets.VBox([
+    _aligned_links_row(widgets.VBox([
+        widgets.HTML("<b>📋 Queue Preview</b> <small>(Select items to manage)</small>",
+                     layout=widgets.Layout(margin='0 0 6px 0')),
+        queue_list,
+    ], layout=widgets.Layout(width='100%', min_width='0', flex='1 1 0%', margin='0'))),
+    identity_row,
+    route_row,
+    season_override_row,
+    queue_edit_actions,
+    playlist_options,
+    queue_options,
+    queue_controls
+], layout=widgets.Layout(display='none', width='100%', margin='0'))  # Hidden by default
+
+
+input_ui = widgets.VBox([
+    widgets.HTML("<h3>🚀 Ultimate Downloader v7.0</h3>"),
+    widgets.HBox([auto_organize_checkbox, debrid_service_toggle]),
+    widgets.HBox([concurrent_slider, auto_retry_input]),
+    links_row,
+    widgets.HBox([btn, btn_quick, btn_stop, btn_retry, btn_resume, btn_restart, btn_history, btn_settings, btn_about]),
+    stop_hint,
+    settings_ui,
+    about_ui,
+    queue_ui,
+    progress_bar,
+    _per_task_accordion,
+    status_label,
+    live_log,
+    widgets.HTML("<hr>")
+])
+
+# Ensure UI visibility is correct after all widgets are created
+update_main_ui_visibility()
+
+# --- SESSION MANAGEMENT ---
+# Cumulative YouTube download counters (persist across resume)
+yt_success_cumulative = 0
+yt_fail_cumulative = 0
+
+def load_session() -> Optional[Dict[str, Any]]:
+    """Load previous session from Drive if it exists."""
+    try:
+        if os.path.exists(SESSION_FILE):
+            with open(SESSION_FILE, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"⚠️ Could not load session: {e}")
+    return None
+
+_last_session_save = 0.0
+SESSION_SAVE_MIN_INTERVAL = 5.0  # seconds between throttled session writes (Drive FUSE is slow)
+
+def save_session(
+    tasks: List[DownloadTask],
+    *,  # Force all following parameters to be keyword-only
+    playlist_range: str = "",
+    yt_success: int = 0,
+    yt_fail: int = 0,
+    subtitle_langs_value: list = None,
+    throttle: bool = False
+):
+    """Persist current download state to Drive.
+
+    API tokens and passwords are intentionally NOT saved — on resume they are
+    re-read from the widgets / Colab Secrets instead of plaintext on Drive.
+
+    With throttle=True, writes are skipped if the last write was less than
+    SESSION_SAVE_MIN_INTERVAL seconds ago (per-task saves during large batches).
+    """
+    global _last_session_save
+    if throttle and time.time() - _last_session_save < SESSION_SAVE_MIN_INTERVAL:
+        return
+    try:
+        with _session_save_lock:
+            session = {
+                "version": "7.0",
+                "started_at": datetime.now().isoformat(),
+                "playlist_range": playlist_range,
+                "yt_success": yt_success,
+                "yt_fail": yt_fail,
+                "subtitle_langs": list(subtitle_langs_value) if subtitle_langs_value else ['en', 'vi'],
+                "tasks": [asdict(t) for t in tasks]
+            }
+            with open(SESSION_FILE, 'w') as f:
+                json.dump(session, f, indent=2)
+            _last_session_save = time.time()
+    except Exception as e:
+        print(f"⚠️ Could not save session: {e}")
+
+def clear_session():
+    """Delete session file after successful completion."""
+    try:
+        with _session_save_lock:
+            if os.path.exists(SESSION_FILE):
+                os.remove(SESSION_FILE)
+    except Exception:
+        pass
+
+def check_resume_available():
+    """Show/hide resume button based on session file existence."""
+    if os.path.exists(SESSION_FILE):
+        btn_resume.layout.display = 'inline-flex'
+    else:
+        btn_resume.layout.display = 'none'
+
+# --- DOWNLOAD HISTORY ---
+_history_lock = Lock()  # parallel workers all log downloads — serialise the read-modify-write
+
+def _load_history() -> list:
+    """Read history.json tolerantly. Before writes were locked and atomic, concurrent
+    workers could leave trailing garbage after the JSON array ('Extra data' errors) —
+    recover such files by taking the first complete JSON document and ignoring the
+    tail. Raises only when nothing parseable is left."""
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    with open(HISTORY_FILE, 'r') as f:
+        text = f.read()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        history, _ = json.JSONDecoder().raw_decode(text.lstrip())
+        if not isinstance(history, list):
+            raise ValueError("history is not a list")
+        return history
+
+def log_download(filename: str, source: str, size_mb: float, destination: str, status: str = "success"):
+    """Append download to persistent history log for debugging. Locked and written
+    via temp-file + atomic replace: unsynchronised plain writes from parallel
+    workers are what used to corrupt the file with trailing garbage."""
+    try:
+        with _history_lock:
+            try:
+                history = _load_history()
+            except Exception:
+                history = []  # unrecoverable file — restart the log rather than stop logging
+            entry = {
+                "timestamp": datetime.now().isoformat(),
+                "filename": filename,
+                "source": source,
+                "size_mb": round(size_mb, 2),
+                "destination": destination,
+                "status": status
+            }
+            history.insert(0, entry)  # Newest first
+            history = history[:500]   # Keep last 500 entries
+            tmp = HISTORY_FILE + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump(history, f, indent=2)
+            os.replace(tmp, HISTORY_FILE)  # readers never see a partial file
+    except Exception:
+        pass  # Silent fail for logging
+
+def view_history(b=None):
+    """Open history file location in output."""
+    if os.path.exists(HISTORY_FILE):
+        print(f"📜 History file: {HISTORY_FILE}")
+        print(f"   (Open in Google Drive to view)")
+        try:
+            history = _load_history()
+            print(f"\n📊 Last 10 downloads (times in UTC):")
+            for i, entry in enumerate(history[:10], 1):
+                ts = entry.get('timestamp', '')[:16].replace('T', ' ')
+                fn = entry.get('filename', 'Unknown')[:40]
+                src = entry.get('source', '?')
+                size = entry.get('size_mb', 0)
+                print(f"   {i}. [{ts}] {fn} ({src}, {size:.1f}MB)")
+        except Exception as e:
+            print(f"   ⚠️ Could not read history ({str(e)[:60]}) — clear it in ⚙️ Settings to start fresh")
+    else:
+        print("📜 No download history yet.")
+
+
+def check_secrets_status():
+    """Check Colab secrets status and update display."""
+    gf_status = "✅" if token_gf.value.strip() else "❌"
+    rd_status = "✅" if token_rd.value.strip() else "❌"
+    tb_status = "✅" if token_tb.value.strip() else "❌"
+    tmdb_status = "✅" if token_tmdb.value.strip() else "❌"
+    fs_status = "✅" if token_fshare_email.value.strip() and token_fshare_password.value.strip() else "❌"
+    debrid = debrid_service_toggle.value
+    debrid_label = f"<b>[{debrid}]</b>"
+    secrets_status.value = f"<span style='font-size:12px'>{gf_status} Gofile &nbsp; {rd_status} Real-Debrid &nbsp; {tb_status} TorBox &nbsp; {tmdb_status} TMDB &nbsp; {fs_status} FShare &nbsp; | Debrid: {debrid_label}</span>"
+
+def check_cookie_status():
+    """Check if cookies.txt exists and update status display."""
+    if os.path.exists(COOKIE_PATH):
+        cookie_status.value = "<span style='color:green'>✅ Loaded</span>"
+    else:
+        cookie_status.value = "<span style='color:gray'>— None</span>"
+
+def upload_cookies(b=None):
+    """Upload cookies.txt file for YouTube authentication (experimental)."""
+    try:
+        from google.colab import files
+        from IPython.display import clear_output
+        settings_status.value = "<span style='color:blue'>📤 Select cookies.txt file...</span>"
+        uploaded = files.upload()
+        clear_output(wait=True)
+        display(input_ui)
+        if uploaded:
+            for filename in uploaded.keys():
+                shutil.move(filename, COOKIE_PATH)
+                settings_status.value = f"<span style='color:green'>✅ Cookies uploaded from {filename}</span>"
+                break
+        else:
+            settings_status.value = "<span style='color:gray'>Upload cancelled</span>"
+        check_cookie_status()
+    except ImportError:
+        settings_status.value = "<span style='color:red'>❌ Cookie upload only works in Google Colab</span>"
+    except Exception as e:
+        settings_status.value = f"<span style='color:red'>❌ Upload failed: {str(e)[:40]}</span>"
+
+def clear_cookies(b=None):
+    """Delete cookies.txt file to fix authentication/format errors."""
+    try:
+        if os.path.exists(COOKIE_PATH):
+            os.remove(COOKIE_PATH)
+            settings_status.value = "<span style='color:green'>✅ Cookies cleared! Downloads will use anonymous access.</span>"
+        else:
+            settings_status.value = "<span style='color:gray'>ℹ️ No cookies file to clear.</span>"
+        check_cookie_status()
+    except Exception as e:
+        settings_status.value = f"<span style='color:red'>❌ Error: {str(e)[:50]}</span>"
+
+def toggle_settings(b=None):
+    """Toggle settings panel visibility."""
+    if settings_ui.layout.display == 'none':
+        settings_ui.layout.display = 'block'
+        settings_status.value = ""
+        confirm_box.layout.display = 'none'
+        pending_action['type'] = None
+        # Refresh status indicators
+        check_secrets_status()
+        check_cookie_status()
+    else:
+        settings_ui.layout.display = 'none'
+
+def close_settings(b=None):
+    """Close settings panel."""
+    settings_ui.layout.display = 'none'
+    confirm_box.layout.display = 'none'
+    pending_action['type'] = None
+
+def restart_runtime(b=None):
+    """Restart Colab runtime for fresh session."""
+    try:
+        from google.colab import runtime
+        print("🔄 Restarting runtime... Use 'Resume Previous' after restart.")
+        runtime.unassign()
+    except ImportError:
+        print("❌ Runtime restart only available in Google Colab")
+    except Exception as e:
+        print(f"❌ Could not restart: {e}")
+
+def show_confirmation(action_type: str, message: str):
+    """Show confirmation dialog for a pending action."""
+    pending_action['type'] = action_type
+    confirm_message.value = f"<span style='color:#856404'>⚠️ {message}</span>"
+    confirm_box.layout.display = 'flex'
+    settings_status.value = ""
+
+def cancel_confirmation(b=None):
+    """Cancel the pending confirmation."""
+    pending_action['type'] = None
+    confirm_box.layout.display = 'none'
+    settings_status.value = "<span style='color:gray'>Cancelled.</span>"
+
+def confirm_action(b=None):
+    """Execute the confirmed action."""
+    action = pending_action['type']
+    pending_action['type'] = None
+    confirm_box.layout.display = 'none'
+    
+    if action == 'history':
+        _do_clear_history()
+    elif action == 'ytarchive':
+        _do_clear_ytarchive()
+    elif action == 'session':
+        _do_clear_session()
+
+def request_clear_history(b=None):
+    """Request confirmation to clear download history."""
+    show_confirmation('history', "Delete download history? This action cannot be undone.")
+
+def request_clear_ytarchive(b=None):
+    """Request confirmation to clear YT archive."""
+    show_confirmation('ytarchive', "Delete YT archive? This allows re-downloading previously downloaded videos.")
+
+def request_clear_session(b=None):
+    """Request confirmation to clear session."""
+    show_confirmation('session', "Delete session file? This removes resume capability.")
+
+def _do_clear_history():
+    """Actually clear the download history file."""
+    try:
+        if os.path.exists(HISTORY_FILE):
+            os.remove(HISTORY_FILE)
+            settings_status.value = "<span style='color:green'>✅ Download history cleared!</span>"
+        else:
+            settings_status.value = "<span style='color:gray'>ℹ️ No history file to clear.</span>"
+    except Exception as e:
+        settings_status.value = f"<span style='color:red'>❌ Error: {str(e)[:50]}</span>"
+
+def _do_clear_ytarchive():
+    """Actually clear the yt-dlp download archive."""
+    archive_path = f"{UD_CONFIG_PATH}yt_history.txt"
+    try:
+        if os.path.exists(archive_path):
+            os.remove(archive_path)
+            settings_status.value = "<span style='color:green'>✅ YT archive cleared! You can now re-download previous videos.</span>"
+        else:
+            settings_status.value = "<span style='color:gray'>ℹ️ No YT archive file to clear.</span>"
+    except Exception as e:
+        settings_status.value = f"<span style='color:red'>❌ Error: {str(e)[:50]}</span>"
+
+def _do_clear_session():
+    """Actually clear the session file."""
+    try:
+        if os.path.exists(SESSION_FILE):
+            os.remove(SESSION_FILE)
+            btn_resume.layout.display = 'none'
+            btn_retry.layout.display = 'none'
+            settings_status.value = "<span style='color:green'>✅ Session cleared!</span>"
+        else:
+            settings_status.value = "<span style='color:gray'>ℹ️ No session file to clear.</span>"
+    except Exception as e:
+        settings_status.value = f"<span style='color:red'>❌ Error: {str(e)[:50]}</span>"
+
+
+
+# --- QUEUE MANAGEMENT ---
+pending_queue: List[DownloadTask] = []  # Global queue state
+
+
+class LiveBatchManager:
+    """One running batch, including tasks committed after it started.
+
+    The lock makes the transition from an empty batch to a finished batch atomic
+    with adding work. Parallel additions join the current pool; additions during
+    sequential processing form another wave before the batch is declared done.
+    """
+    def __init__(self, tasks: List[DownloadTask], mode: str):
+        self.lock = Lock()
+        self.token = uuid4().hex
+        self.mode = mode
+        self.all_tasks = list(tasks)
+        self.pending_parallel: List[DownloadTask] = []
+        self.pending_wave: List[DownloadTask] = []
+        self.parallel_view: Optional[List[DownloadTask]] = None
+        self.parallel_open = False
+        self.running = True
+
+    def is_running(self) -> bool:
+        with self.lock:
+            return self.running
+
+    def add(self, tasks: List[DownloadTask]) -> bool:
+        with self.lock:
+            if not self.running:
+                return False
+            self.all_tasks.extend(tasks)
+            runnable = [t for t in tasks if t.status == 'pending']
+            if self.parallel_open:
+                parallel = [t for t in runnable if t.link_type not in SEQUENTIAL_LINK_TYPES]
+                self.pending_parallel.extend(parallel)
+                self.pending_wave.extend(t for t in runnable if t.link_type in SEQUENTIAL_LINK_TYPES)
+                if self.parallel_view is not None:
+                    self.parallel_view.extend(parallel)
+            else:
+                self.pending_wave.extend(runnable)
+            return True
+
+    def begin_parallel(self, view: List[DownloadTask]):
+        with self.lock:
+            self.parallel_view = view
+            self.parallel_open = True
+
+    def take_parallel(self) -> List[DownloadTask]:
+        with self.lock:
+            tasks, self.pending_parallel = self.pending_parallel, []
+            return tasks
+
+    def close_parallel_if_empty(self) -> bool:
+        """Return False when an addition raced the pool's final completion."""
+        with self.lock:
+            if self.pending_parallel:
+                return False
+            self.parallel_open = False
+            self.parallel_view = None
+            return True
+
+    def next_wave_or_finish(self) -> Optional[List[DownloadTask]]:
+        with self.lock:
+            if self.pending_wave:
+                tasks, self.pending_wave = self.pending_wave, []
+                return tasks
+            self.running = False
+            return None
+
+    def close(self):
+        with self.lock:
+            self.running = False
+            self.parallel_open = False
+            self.parallel_view = None
+
+
+_live_batch: Optional[LiveBatchManager] = None
+_last_live_status: Optional[dict] = None
+_live_status_tasks: Optional[List[DownloadTask]] = None
+
+
+def _colab_live_status_snapshot(token: str):
+    """Serve one browser-requested snapshot; no background widget push is needed."""
+    global _colab_live_status_active
+    manager = _live_batch
+    if manager is None or manager.token != token:
+        last = _last_live_status
+        if last is not None and last.get('token') == token:
+            return JSON(last)
+        return JSON({'token': token, 'running': False, 'progress': 0,
+                     'description': 'Download finished', 'summary': '',
+                     'bars': [], 'log': ''})
+
+    # The first successful browser poll can replace the stale Colab widget views.
+    if not _colab_live_status_active:
+        _colab_live_status_active = True
+        progress_bar.layout.display = 'none'
+        _per_task_accordion.layout.display = 'none'
+        status_label.layout.display = 'none'
+        live_log.layout.display = 'none'
+
+    with manager.lock:
+        current_tasks = globals().get('_live_status_tasks')
+        tasks = list(current_tasks if current_tasks is not None else manager.all_tasks)
+    with _live_log_lock:
+        log_text = ''.join(_live_log_messages)[-12000:]
+    bars_by_id = {task_id: dict(id=task_id, description=bar.description,
+                                value=float(bar.value), state=bar.bar_style)
+                  for task_id, bar in list(_per_task_bars.items())}
+    done = sum(t.status in ('done', 'skipped') for t in tasks)
+    moving = sum(t.status == 'moving' for t in tasks)
+    failed = sum(t.status == 'failed' for t in tasks)
+    active = [t for t in tasks if t.status == 'downloading']
+    # Sequential TorBox/RD transfers have no progress monitor. Read their aria2
+    # stats here, and keep parallel rows current even if widget sync is delayed.
+    for task in active:
+        stats = download_stats.get(task.id, {})
+        pct = max(0.0, min(100.0, float(stats.get('pct', 0))))
+        speed = float(stats.get('speed_mbs', 0))
+        name = (task.filename or 'download')[:30]
+        detail = 'low disk' if stats.get('disk_wait') else f'{speed:.1f} MB/s' if speed > 0 else 'starting...'
+        bars_by_id[task.id] = dict(id=task.id, description=f'{name}  {int(pct)}% ({detail})',
+                                   value=pct, state='info' if stats.get('disk_wait') else 'warning')
+    bars = list(bars_by_id.values())
+    active_fraction = sum(max(0.0, min(100.0, float(download_stats.get(t.id, {}).get('pct', 0)))) / 100.0
+                          for t in active)
+    total = len(tasks)
+    overall_progress = 100.0 * (done + moving + active_fraction) / total if total else 0.0
+    label = '⚡' if active else '📤' if moving else '✅' if done == total else '⚠️' if failed else 'DL'
+    description = f'{label} {done}/{total}'
+    summary = re.sub(r'<[^>]*>', '', html.unescape(status_label.value or ''))
+    current_stage = progress_bar.description
+    if current_stage and current_stage != description and not re.search(r'\d+/\d+', current_stage):
+        summary = f'{current_stage} · {summary}' if summary else current_stage
+    return JSON({
+        'token': token, 'running': True, 'updated_at': time.time(),
+        'progress': overall_progress,
+        'description': description, 'summary': summary,
+        'counts': {'done': done, 'total': total, 'failed': failed},
+        'bars': bars, 'log': log_text,
+    })
+
+
+def _colab_live_status_html(token: str):
+    """Render a status view that polls from Colab's browser, rather than Python pushing."""
+    markup = r"""
+<div id="__DOM_ID__" style="border:1px solid #888;border-radius:5px;padding:8px;margin:6px 0;color:inherit">
+  <div style="font-weight:600">Live download status <small data-connection style="font-weight:normal">Connecting...</small></div>
+  <div data-description style="margin:6px 0">Starting...</div>
+  <progress data-progress max="100" value="0" style="width:100%;height:16px"></progress>
+  <div data-summary style="margin:5px 0"></div>
+  <details data-files><summary>Individual downloads</summary><div data-rows></div></details>
+  <pre data-log style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:220px;overflow:auto;margin:8px 0 0"></pre>
+</div>
+<script>
+(function() {
+  const token = __TOKEN__;
+  const root = document.getElementById('__DOM_ID__');
+  if (!root) return;
+  const find = name => root.querySelector('[data-' + name + ']');
+  let waiting = false;
+  let timer;
+  async function poll() {
+    if (waiting) return;
+    waiting = true;
+    try {
+      if (!window.google?.colab?.kernel?.invokeFunction) throw new Error('Colab callback unavailable');
+      const response = await google.colab.kernel.invokeFunction('ultimate_downloader.live_status', [token], {});
+      const state = response?.data?.['application/json'];
+      if (!state || state.token !== token) throw new Error('Invalid status response');
+      const updated = state.updated_at ? new Date(state.updated_at * 1000).toLocaleTimeString() : '';
+      find('connection').textContent = state.running ? '· updated ' + updated : '· finished';
+      find('description').textContent = state.description || '';
+      find('progress').value = Math.max(0, Math.min(100, Number(state.progress) || 0));
+      find('summary').textContent = state.summary || '';
+      const log = find('log');
+      const followLog = log.scrollHeight - log.scrollTop - log.clientHeight < 24;
+      log.textContent = state.log || '';
+      if (followLog) log.scrollTop = log.scrollHeight;
+      const rows = find('rows');
+      rows.replaceChildren();
+      for (const bar of state.bars || []) {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;align-items:center;gap:8px;margin:4px 0';
+        const name = document.createElement('span');
+        name.textContent = bar.description;
+        name.style.cssText = 'flex:0 1 50%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+        const progress = document.createElement('progress');
+        progress.max = 100;
+        progress.value = Math.max(0, Math.min(100, Number(bar.value) || 0));
+        progress.style.cssText = 'flex:1;min-width:60px';
+        row.append(name, progress);
+        rows.append(row);
+      }
+      if (!state.running) clearInterval(timer);
+    } catch (error) {
+      find('connection').textContent = '· reconnecting (' + String(error.message || error) + ')';
+    } finally {
+      waiting = false;
+    }
+  }
+  timer = setInterval(poll, 1000);
+  poll();
+})();
+</script>
+"""
+    return HTML(markup.replace('__DOM_ID__', 'ud-live-' + token)
+               .replace('__TOKEN__', json.dumps(token)))
+
+
+def _restore_standard_status_widgets():
+    """Show the normal progress widgets for synchronous runs."""
+    global _colab_live_status_active
+    _colab_live_status_active = False
+    progress_bar.layout.display = 'block'
+    status_label.layout.display = 'block'
+    _per_task_accordion.layout.display = 'block' if _per_task_bars else 'none'
+    live_log.layout.display = 'none'
+
+
+def _running_live_batch() -> Optional[LiveBatchManager]:
+    batch = _live_batch
+    return batch if batch is not None and batch.is_running() else None
+
+
+def _set_live_controls():
+    """Keep the link field usable without allowing a second concurrent batch."""
+    for control in (auto_organize_checkbox, debrid_service_toggle, concurrent_slider,
+                    auto_retry_input, btn_settings, btn_history,
+                    btn_restart):
+        control.disabled = True
+    btn.description = 'Add Links'
+    btn.icon = 'plus'
+    btn.disabled = False
+    btn_quick.disabled = True
+    btn_resume.disabled = True
+    btn_stop.layout.display = 'inline-block'
+
+
+def stop_live_batch(b=None):
+    if _live_batch is None:
+        return
+    btn_stop.disabled = True
+    stop_active_downloads()
+    print('🛑 Stopping active downloads. The remaining queue will be saved for Resume.')
+
+def _queue_dest_preview(task) -> Optional[str]:
+    """Resolved destination for a queue row — the full Drive-relative path the file
+    will take, library folder included (e.g. 'TV Shows/Detective Conan (1996)/
+    Season 01/Detective Conan - S01E1206.mkv'). Uses the same determine_destination_path
+    the download itself uses (dry_run), mirroring handle_file_processing's naming steps:
+    the queue size suffix is stripped and a subtitle's language tag is split off before
+    routing, then re-attached as a Plex ISO code. Returns None when no preview is
+    possible (no filename yet, or an archive whose contents are only known after
+    extraction) — the caller falls back to the plain row display."""
+    if not task.filename:
+        return None
+    clean = _strip_size_suffix(task.filename)
+    if os.path.splitext(clean)[1].lower() in ('.rar', '.zip', '.7z'):
+        return None
+    try:
+        processing_name, lang = _split_subtitle_lang(clean)
+        dest, _ = determine_destination_path(processing_name, task.source or "generic", dry_run=True)
+        if lang:  # same re-attachment as handle_file_processing
+            base, sub_ext = os.path.splitext(dest)
+            dest = f"{base}.{_normalize_sub_lang(lang)}{sub_ext}"
+        # Full Drive-relative path: with per-row routing the library folder is
+        # the part being controlled, so it belongs in the preview
+        return os.path.relpath(dest, DRIVE_BASE).replace(os.sep, '/')
+    except Exception:
+        return None  # a preview glitch must never break the queue display
+
+
+def update_queue_display(preserve_selection: bool = True):
+    """Update the queue list widget with current pending_queue. Each row carries a
+    live destination preview (where the file will go and its final name), recomputed
+    from the current settings, TMDB matches, and forced seasons. preserve_selection
+    keeps the current row selection across edits and live settings refreshes.
+    Only a newly loaded queue explicitly selects everything."""
+    selected = set(_selected_queue_indices()) if preserve_selection else None
+    options = []
+    rows = []
+
+    for i, task in enumerate(pending_queue):
+        source_icon = {"gofile": "📁", "pixeldrain": "💾", "rd": "⚡", "tb": "📦", "tb_host": "📦", "direct": "🔗", 
+                       "youtube": "▶️", "mega": "☁️", "mediafire": "🔥", "1fichier": "📦",
+                       "magnet": "🧲", "magnet_file": "🧲", "tb_magnet_file": "🧲", "archive": "📚",
+                       "fshare": "🇻🇳", "okru": "🟠"}.get(task.link_type, "📄")
+        filename = _strip_size_suffix(task.filename) if task.filename else task.url
+        name = filename
+        overrides = []
+        sov = getattr(task, 'season_override', None)
+        if sov is not None:
+            overrides.append(f'S{sov:02d}')
+            name += f"  [S{sov:02d}]"  # forced season marker
+        eov = getattr(task, 'episode_override', None)
+        if eov is not None:
+            eev = getattr(task, 'episode_end_override', None)
+            # forced episode marker; a range renumber shows its span (E07-E09)
+            name += f"  [E{eov:02d}-E{eev:02d}]" if eev else f"  [E{eov:02d}]"
+            overrides.append(f'E{eov:02d}-E{eev:02d}' if eev else f'E{eov:02d}')
+        pov = getattr(task, 'part_override', None)
+        if pov is not None:
+            overrides.append(f'pt{pov}' if pov else 'No part')
+            name += f"  [pt{pov}]" if pov else "  [no pt]"  # forced part suffix marker
+        ov = getattr(task, 'tmdb_override', None)
+        m = get_tmdb_match(task.filename) if task.filename else None
+        dest = _queue_dest_preview(task)
+        if dest is not None:
+            # ✎ = manual TMDB correction, ✖ = match cleared — the path shows the outcome
+            mark = " ✖" if ov == TMDB_CLEARED else (" ✎" if (m and ov) else "")
+            options.append(f"{i+1}. {source_icon} {name}{mark} → {dest}")
+        elif ov == TMDB_CLEARED:
+            options.append(f"{i+1}. {source_icon} {name}  ✖ no TMDB")
+        elif m:
+            edited = " ✎" if ov else ""  # pencil marks a manual correction
+            tag = f" → {m['name']}" + (f" ({m['year']})" if m['year'] else "") + edited
+            options.append(f"{i+1}. {source_icon} {name}{tag}")
+        else:
+            options.append(f"{i+1}. {source_icon} {name}")
+
+        if ov == TMDB_CLEARED:
+            overrides.append('No TMDB')
+        elif ov:
+            overrides.append('Match')
+        if getattr(task, 'name_override', None):
+            overrides.append('Name')
+        if getattr(task, 'route_override', None):
+            overrides.append(task.route_override.replace('_', ' '))
+        size = re.search(r'\(([^()]*[KMG]i?B)\)\s*$', task.filename or '')
+        source = {'tb_magnet_file': 'TorBox', 'tb': 'TorBox', 'tb_host': 'TorBox',
+                  'magnet_file': 'Real-Debrid', 'rd': 'Real-Debrid'}.get(
+                      task.link_type, task.link_type.replace('_', ' ').title())
+        destination = dest
+        if not destination and m:
+            destination = m['name'] + (f" ({m['year']})" if m.get('year') else '')
+        if not destination:
+            destination = ('After extraction' if os.path.splitext(filename)[1].lower()
+                           in ('.rar', '.zip', '.7z') else 'Not resolved')
+        rows.append(dict(id=task.id, number=str(i + 1), name=filename, source=source,
+                         size=size.group(1) if size else '—', destination=destination,
+                         overrides=', '.join(overrides) or '—'))
+
+    queue_list.options = options
+    if hasattr(queue_list, 'set_rows'):
+        queue_list.set_rows(rows)
+    if selected is not None:
+        # Keep the user's selection across a live settings refresh (matched by row index)
+        queue_list.value = tuple(opt for i, opt in enumerate(options) if i in selected)
+    else:
+        queue_list.value = tuple(options)  # Select all by default
+
+def _on_dest_setting_change(change):
+    """Live-refresh the queue's destination previews when a setting that affects
+    routing changes (Auto-organise, Force Name/Year, Type, Category, Numbering,
+    TMDB on/off). When TMDB matching becomes newly applicable (just enabled, or
+    Force Name cleared) with an empty match cache, the batch match runs first —
+    Start would do the same, so the preview keeps showing what will actually happen."""
+    if change.get('name') != 'value' or not pending_queue:
+        return
+    try:
+        if tmdb_is_enabled() and not _tmdb_match_cache:
+            analyze_batch_metadata([t.filename for t in pending_queue if t.filename])
+            _apply_tmdb_overrides(pending_queue)
+        # Keep the queue's conditional rows in sync with the toggles they depend on
+        tmdb_group.layout.display = 'flex' if tmdb_is_enabled() else 'none'
+        _org = 'flex' if is_auto_organize_enabled() else 'none'
+        identity_row.layout.display = _org
+        route_row.layout.display = _org
+        season_override_row.layout.display = _org
+        queue_edit_actions.layout.display = _org
+        update_queue_display(preserve_selection=True)
+    except Exception:
+        pass  # never let a preview refresh break a settings change
+
+for _w in (auto_organize_checkbox, episode_numbering_toggle, tmdb_enabled_checkbox):
+    _w.observe(_on_dest_setting_change, names='value')
+
+
+def show_queue_preview(tasks: List[DownloadTask], mode: str, append: bool = False):
+    """Show resolved tasks, optionally appending while preserving queue choices."""
+    global pending_queue
+    live = _running_live_batch() is not None
+    selected_ids = {pending_queue[i].id for i in _selected_queue_indices()
+                    if 0 <= i < len(pending_queue)} if append else set()
+    saved_subs = tuple(subtitle_langs.value) if append and any(
+        t.link_type == 'youtube' for t in pending_queue) else None
+    pending_queue = pending_queue + tasks if append else tasks.copy()
+    selected_ids.update(t.id for t in tasks if t.selected_by_default)
+    tasks = pending_queue
+    
+    # Run batch episode analysis to improve episode detection accuracy
+    # This analyzes all filenames together to find the varying number (episode) vs constants
+    filenames = [t.filename for t in tasks if t.filename]
+    batch_results = (analyze_batch_episodes(filenames, merge=True) if live
+                     else analyze_batch_episodes(filenames))
+    if batch_results:
+        print(f"   🎯 Batch analysis detected episode numbers in {len(batch_results)} files")
+
+    # TMDB metadata matching (canonical names, years, season mapping)
+    if tmdb_is_enabled():
+        tmdb_matched = (analyze_batch_metadata(filenames, merge=True) if live
+                        else analyze_batch_metadata(filenames))
+        _apply_tmdb_overrides(pending_queue)  # reapply any prior manual corrections
+        if tmdb_matched:
+            print(f"   🎬 TMDB matched {tmdb_matched} of {len(filenames)} file(s)")
+    if live:
+        _apply_queue_overrides(pending_queue, merge=True)  # keep active-task overrides
+    else:
+        _apply_queue_overrides(pending_queue)
+
+    update_queue_display(preserve_selection=False)
+    queue_list.value = tuple(opt for opt, task in zip(queue_list.options, tasks)
+                             if task.id in selected_ids)
+
+    # Hide subtitle and playlist options initially to prevent flash of old content
+    queue_options.layout.display = 'none'
+    playlist_options.layout.display = 'none'
+    # Identity / Route / Force Season rows: only meaningful when auto-organise will
+    # rename and route files; the TMDB group additionally needs TMDB matching active
+    tmdb_group.layout.display = 'flex' if tmdb_is_enabled() else 'none'
+    _org = 'flex' if is_auto_organize_enabled() else 'none'
+    identity_row.layout.display = _org
+    route_row.layout.display = _org
+    season_override_row.layout.display = _org
+    queue_edit_actions.layout.display = _org
+    queue_ui.layout.display = 'block'
+    if live:
+        # A running YouTube task reads the batch's subtitle/playlist widgets.
+        # Keep those values fixed while previewing newly added links.
+        queue_options.layout.display = 'none'
+        playlist_options.layout.display = 'none'
+        btn_queue_start_subs.layout.display = 'none'
+        btn_queue_start.description = '➕ Add to Download'
+        btn.description = 'Add Links'
+        btn.icon = 'plus'
+        btn.disabled = False
+        btn_quick.disabled = True
+        print(f"📋 {len(tasks)} new item(s) ready. Review them and click 'Add to Download'.")
+        return
+    
+    # Check for YouTube/streaming links
+    youtube_tasks = [t for t in tasks if t.link_type == 'youtube']
+    has_streaming = len(youtube_tasks) > 0
+    
+    # Default full subtitle options
+    DEFAULT_SUBS = [('English', 'en'), ('Vietnamese', 'vi'), ('Chinese', 'zh'), ('Japanese', 'ja'), 
+                    ('Korean', 'ko'), ('Thai', 'th'), ('Indonesian', 'id'), ('Spanish', 'es'), 
+                    ('French', 'fr'), ('German', 'de'), ('Portuguese', 'pt'), ('Russian', 'ru')]
+    
+    if has_streaming:
+        # Check if any URL is a playlist OR there are multiple YouTube videos
+        # After playlist expansion, check original_url for playlist detection
+        has_playlist = any(
+            ('list=' in (t.original_url or t.url) or '/playlist' in (t.original_url or t.url))
+            for t in youtube_tasks
+        )
+        has_multiple_videos = len(youtube_tasks) > 1
+        
+        if has_playlist or has_multiple_videos:
+            # For playlists or multiple videos, show full selector (can't efficiently check all)
+            subtitle_langs.options = DEFAULT_SUBS
+            subtitle_langs.value = ['en', 'vi']
+            queue_options.layout.display = 'block'
+            btn_queue_start_subs.layout.display = 'inline-block'
+            if has_playlist:
+                # Show playlist range selector for actual playlists (non-expanded)
+                # Only show if there are unexpanded playlist URLs (original_url == url)
+                has_unexpanded = any(
+                    (t.original_url is None or t.original_url == t.url) and
+                    ('list=' in t.url or '/playlist' in t.url)
+                    for t in youtube_tasks
+                )
+                if has_unexpanded:
+                    playlist_options.layout.display = 'flex'
+                    print("📋 Playlist detected - use Playlist Range to select specific videos (e.g. 1,3,5-10)")
+            else:
+                print("📋 Multiple videos detected - full subtitle languages available")
+        else:
+            # For a single video only, fetch actual available subtitles
+            print("🔍 Checking available subtitles...")
+            available_subs = get_youtube_subtitles(youtube_tasks[0].url) if youtube_tasks else {}
+            
+            if available_subs:
+                # Update subtitle selector with available languages
+                subtitle_langs.options = [(name, code) for code, name in sorted(available_subs.items(), key=lambda x: x[1])]
+                # Pre-select English and Vietnamese if available
+                preselect = [code for code in ['en', 'vi', 'en-US', 'en-GB'] if code in available_subs]
+                subtitle_langs.value = preselect[:2] if preselect else []
+                queue_options.layout.display = 'block'
+                btn_queue_start_subs.layout.display = 'inline-block'
+                print(f"   ✓ Found {len(available_subs)} subtitle languages available")
+            else:
+                # No subtitles found - hide selector and button
+                queue_options.layout.display = 'none'
+                btn_queue_start_subs.layout.display = 'none'
+                print("   ℹ️ No manual subtitles available for this video")
+    else:
+        queue_options.layout.display = 'none'
+        btn_queue_start_subs.layout.display = 'none'
+    
+    btn.description = 'Add Links'
+    btn.icon = 'plus'
+    btn.disabled = False
+    btn_quick.disabled = True
+    btn_queue_start.description = '▶ Start Download'
+    if saved_subs is not None:
+        available_codes = {code for _, code in subtitle_langs.options}
+        subtitle_langs.value = tuple(code for code in saved_subs if code in available_codes)
+    print(f"📋 Queue loaded with {len(tasks)} items. Review and click 'Start Download' or 'Download Subtitles' to begin.")
+
+
+def _queue_task_key(task: DownloadTask) -> tuple:
+    """Stable resolved-file identity, independent of temporary download URLs."""
+    if task.link_type in ('magnet_file', 'tb_magnet_file'):
+        return task.link_type, task.original_url or task.url
+    if task.link_type == 'youtube':
+        return task.link_type, task.url
+    return task.link_type, task.original_url or task.url, _strip_size_suffix(task.filename)
+
+
+def queue_add_links(b=None):
+    """Resolve another batch without losing queue order, selection or edits."""
+    urls = list(dict.fromkeys(line.strip() for line in text_area.value.splitlines()
+                              if line.strip()))
+    if not urls:
+        print("⚠️ Paste more URLs in the Links field first.")
+        return
+    live = _running_live_batch()
+    controls = (btn, btn_queue_start, btn_queue_start_subs, btn_queue_cancel)
+    previous_states = [control.disabled for control in controls]
+    for control in controls:
+        control.disabled = True
+    start_keep_alive()
+    try:
+        tasks = _resolve_queue_links(urls)
+        if not tasks:
+            print("⚠️ No new files resolved. Your queue and links have been kept.")
+            return
+        seen = {_queue_task_key(task) for task in pending_queue}
+        active_names = {_match_cache_key(task.filename) for task in pending_queue if task.filename} if live else set()
+        if live:
+            with live.lock:
+                seen.update(_queue_task_key(task) for task in live.all_tasks)
+                active_names.update(_match_cache_key(task.filename) for task in live.all_tasks if task.filename)
+        additions = []
+        conflicts = 0
+        for task in tasks:
+            key = _queue_task_key(task)
+            if live and task.filename and _match_cache_key(task.filename) in active_names:
+                conflicts += 1  # filename-keyed naming caches cannot safely serve both tasks at once
+            elif key not in seen:
+                seen.add(key)
+                additions.append(task)
+        if additions:
+            show_queue_preview(additions, 'video', append=True)
+            if not _running_live_batch():
+                save_session(pending_queue, playlist_range=playlist_selection.value.strip())
+        print(f"📋 Added {len(additions)} item(s); skipped {len(tasks) - len(additions) - conflicts} already queued item(s).")
+        if conflicts:
+            print(f"⚠️ {conflicts} file(s) share a name with this active batch. Add those after it finishes to keep their naming separate.")
+        else:
+            text_area.value = ''
+    except KeyboardInterrupt:
+        print("🛑 Adding links interrupted. Your queue has been kept.")
+    except Exception as e:
+        print(f"❌ Could not add links: {e}. Your queue has been kept.")
+    finally:
+        if not live:
+            stop_keep_alive()
+            reset_progress()
+        for control, disabled in zip(controls, previous_states):
+            control.disabled = disabled
+        if _running_live_batch():
+            _set_live_controls()
+
+
+def on_resolve_links(b=None):
+    """Use the same Links field and button for new queues and additions."""
+    if _live_batch is not None and btn.disabled:
+        return
+    if _live_batch is not None and not _running_live_batch():
+        print('⏳ The previous download is finishing. Add the links in a moment.')
+        return
+    if queue_ui.layout.display != 'none' or _running_live_batch():
+        queue_add_links(b)
+    else:
+        execute_batch('video')
+
+
+def _forget_discarded_live_metadata(discarded: List[DownloadTask], retained: List[DownloadTask]):
+    """Remove preview-only naming data without touching active or retained files."""
+    keep = {_match_cache_key(t.filename) for t in retained if t.filename}
+    for task in discarded:
+        if not task.filename:
+            continue
+        key = _match_cache_key(task.filename)
+        if key in keep:
+            continue
+        _batch_episode_cache.pop(_strip_size_suffix(task.filename), None)
+        for cache in (_tmdb_match_cache, _season_override_cache, _episode_override_cache,
+                      _episode_end_override_cache, _name_override_cache, _route_override_cache,
+                      _part_override_cache):
+            cache.pop(key, None)
+
+
+def hide_queue():
+    """Hide queue UI and reset state."""
+    global pending_queue
+    live = _running_live_batch()
+    if live and pending_queue:
+        with live.lock:
+            _forget_discarded_live_metadata(pending_queue, live.all_tasks)
+    pending_queue = []
+    queue_ui.layout.display = 'none'
+    queue_list.options = []
+    playlist_options.layout.display = 'none'
+    identity_row.layout.display = 'none'
+    route_row.layout.display = 'none'
+    tmdb_override_input.value = ''
+    queue_name_input.value = ''
+    queue_year_input.value = ''
+    route_dropdown.value = ''
+    season_override_input.value = ''
+    renumber_start_input.value = ''
+    part_override_input.value = ''
+    btn_queue_start_subs.layout.display = 'none'
+    btn.description = 'Resolve Links'
+    btn.icon = 'search'
+    btn.disabled = False
+    btn_quick.disabled = False
+    btn_resume.disabled = False
+    if _running_live_batch():
+        _set_live_controls()
+
+def queue_move_up(b=None):
+    """Move selected items up in the queue."""
+    global pending_queue
+    selected = list(queue_list.value)
+    if not selected:
+        return
+    indices = [int(s.split('.')[0]) - 1 for s in selected]
+    indices.sort()
+    for idx in indices:
+        if idx > 0 and idx - 1 not in indices:
+            pending_queue[idx], pending_queue[idx-1] = pending_queue[idx-1], pending_queue[idx]
+    update_queue_display()
+    # Re-select moved items
+    new_selected = [queue_list.options[max(0, i-1)] for i in indices]
+    queue_list.value = tuple(new_selected)
+
+def queue_move_down(b=None):
+    """Move selected items down in the queue."""
+    global pending_queue
+    selected = list(queue_list.value)
+    if not selected:
+        return
+    indices = [int(s.split('.')[0]) - 1 for s in selected]
+    indices.sort(reverse=True)
+    for idx in indices:
+        if idx < len(pending_queue) - 1 and idx + 1 not in indices:
+            pending_queue[idx], pending_queue[idx+1] = pending_queue[idx+1], pending_queue[idx]
+    update_queue_display()
+    # Re-select moved items
+    new_selected = [queue_list.options[min(len(pending_queue)-1, i+1)] for i in indices]
+    queue_list.value = tuple(new_selected)
+
+def queue_select_all(b=None):
+    """Select all items in queue."""
+    queue_list.value = tuple(queue_list.options)
+
+def queue_select_none(b=None):
+    """Deselect all items in queue."""
+    queue_list.value = ()
+
+def queue_remove_selected(b=None):
+    """Remove selected items from queue."""
+    global pending_queue
+    selected = list(queue_list.value)
+    if not selected:
+        return
+    indices_to_remove = {int(s.split('.')[0]) - 1 for s in selected}
+    removed = [t for i, t in enumerate(pending_queue) if i in indices_to_remove]
+    pending_queue = [t for i, t in enumerate(pending_queue) if i not in indices_to_remove]
+    live = _running_live_batch()
+    if live:
+        with live.lock:
+            _forget_discarded_live_metadata(removed, live.all_tasks + pending_queue)
+    queue_list.value = ()  # Removed rows must not select the files taking their places.
+    update_queue_display()
+    if not pending_queue:
+        hide_queue()
+        print("📋 Queue is empty.")
+
+def queue_sort_alpha(b=None):
+    """Sort queue items alphabetically by filename, toggling between A-Z and Z-A."""
+    global pending_queue, queue_sort_ascending
+    # Preserve selection: capture selected task IDs before sorting
+    selected_ids = set()
+    selected = list(queue_list.value)
+    if selected:
+        for s in selected:
+            idx = int(s.split('.')[0]) - 1
+            if 0 <= idx < len(pending_queue):
+                selected_ids.add(pending_queue[idx].id)
+    pending_queue.sort(key=lambda t: (t.filename or t.url).lower(), reverse=not queue_sort_ascending)
+    update_queue_display()
+    # Restore selection by matching task IDs to new positions
+    if selected_ids:
+        new_selected = [opt for i, opt in enumerate(queue_list.options)
+                        if i < len(pending_queue) and pending_queue[i].id in selected_ids]
+        queue_list.value = tuple(new_selected)
+    # Toggle direction for next click
+    queue_sort_ascending = not queue_sort_ascending
+    if queue_sort_ascending:
+        btn_queue_sort.description = "Sort A-Z"
+        btn_queue_sort.icon = "sort-alpha-asc"
+    else:
+        btn_queue_sort.description = "Sort Z-A"
+        btn_queue_sort.icon = "sort-alpha-desc"
+
+def queue_cancel(b=None):
+    """Cancel queue and return to link input."""
+    live = _running_live_batch()
+    hide_queue()
+    print("📋 New links discarded; downloads continue." if live else "❌ Queue cancelled.")
+
+
+def _prepare_live_additions(tasks: List[DownloadTask]):
+    """Resolve deferred FShare URLs before they enter the active aria2 pool."""
+    fshare = [t for t in tasks if t.link_type == 'fshare' and 'fshare.vn/file/' in t.url]
+    if not fshare:
+        return
+    email = token_fshare_email.value.strip()
+    password = token_fshare_password.value.strip()
+    session = _get_fshare_web_session(email, password) if email and password else None
+    for task in fshare:
+        link = _fshare_web_get_download_link(task.url, session) if session else None
+        if link and link != 'FSHARE_LIMIT_REACHED':
+            task.url = link
+        else:
+            task.status = 'failed'
+            task.error = ('FShare policy restriction' if link == 'FSHARE_LIMIT_REACHED'
+                          else 'FShare login or link resolution failed')
+        time.sleep(1)
+
+
+def start_from_queue(b=None, mode="video"):
+    """Start downloading selected items from queue."""
+    selected = list(queue_list.value)
+    if not selected:
+        print("⚠️ No items selected! Select items to download.")
+        return
+    
+    # Get selected indices
+    selected_indices = {int(s.split('.')[0]) - 1 for s in selected}
+    selected_tasks = [t for i, t in enumerate(pending_queue) if i in selected_indices]
+    
+    if not selected_tasks:
+        print("⚠️ No valid items selected!")
+        return
+    
+    # During a live run this preview contains only new files. Commit them to the
+    # one active batch instead of starting a second download pipeline.
+    live = _running_live_batch()
+    if _live_batch is not None and live is None:
+        print('⏳ The previous download is finishing. This queue is still available.')
+        return
+    if live:
+        fshare_before = {t.id: (t.url, t.status, t.error) for t in selected_tasks
+                         if t.link_type == 'fshare'}
+        _prepare_live_additions(selected_tasks)
+        if live.add(selected_tasks):
+            hide_queue()
+            save_session(live.all_tasks,
+                         playlist_range=playlist_selection.value.strip(),
+                         yt_success=yt_success_cumulative,
+                         yt_fail=yt_fail_cumulative,
+                         subtitle_langs_value=subtitle_langs.value)
+            print(f"➕ Added {len(selected_tasks)} file(s) to the active download.")
+            _set_live_controls()
+            return
+        for task in selected_tasks:
+            if task.id in fshare_before:
+                task.url, task.status, task.error = fshare_before[task.id]
+        print('⏳ The previous download finished while adding these links. The preview is still available; click Start Download again.')
+        return
+
+    # Hide queue and start download
+    hide_queue()
+    if mode == "subs_only":
+        print(f"📝 Starting subtitle download of {len(selected_tasks)} selected items...")
+    else:
+        print(f"🚀 Starting download of {len(selected_tasks)} selected items...")
+    
+    # Reviewed queues always use one active batch so links can be added mid-download.
+    _launch_live_batch(selected_tasks, mode)
+
+
+def _launch_live_batch(tasks: List[DownloadTask], mode: str):
+    """Return control to Colab so Add Links and Stop clicks can be handled."""
+    global _live_batch, _last_live_status, _live_status_tasks, _colab_live_status_active
+    if _live_batch is not None:
+        print('⚠️ The previous download is still finishing. Try again in a moment.')
+        return
+    _restore_standard_status_widgets()
+    manager = LiveBatchManager(tasks, mode)
+    _live_batch = manager
+    _last_live_status = None
+    _live_status_tasks = manager.all_tasks
+    _colab_live_status_active = False
+    colab_status_enabled = False
+    try:
+        from google.colab import output as colab_output
+        colab_output.register_callback('ultimate_downloader.live_status', _colab_live_status_snapshot)
+        colab_status_enabled = True
+    except Exception:
+        pass  # Standard widgets remain visible outside Colab.
+    _reset_cancel_state()
+    _set_live_controls()
+    btn.disabled = True
+    with _live_log_lock:
+        _live_log_messages.clear()
+        live_log.value = ''
+    live_log.layout.display = 'block'
+    clear_output(wait=True)
+    display(input_ui)
+    if colab_status_enabled:
+        display(_colab_live_status_html(manager.token))
+
+    def run():
+        global _live_batch, _last_live_status, _colab_live_status_active
+        try:
+            execute_selected_tasks(tasks, mode, live_manager=manager)
+            if _auto_retry_state['pending']:
+                manager.close()  # additions stop at the retry boundary
+                btn.disabled = True
+                btn_quick.disabled = True
+                btn_resume.disabled = True
+                _run_auto_retry_chain(mode)
+        except Exception as e:
+            print(f'❌ Live batch error: {e}')
+        finally:
+            manager.close()
+            try:
+                if queue_ui.layout.display != 'none' and pending_queue and not os.path.exists(SESSION_FILE):
+                    save_session(pending_queue, playlist_range=playlist_selection.value.strip(),
+                                 subtitle_langs_value=subtitle_langs.value)
+                btn_stop.disabled = False
+                btn_stop.layout.display = 'none'
+                for control in (auto_organize_checkbox, debrid_service_toggle, concurrent_slider,
+                                auto_retry_input, btn_settings, btn_history,
+                                btn_restart):
+                    control.disabled = False
+                btn_queue_start.description = '▶ Start Download'
+                if queue_ui.layout.display == 'none':
+                    btn.description = 'Resolve Links'
+                    btn.icon = 'search'
+                    btn_quick.disabled = False
+                    btn_resume.disabled = False
+                else:
+                    btn.description = 'Add Links'
+                    btn.icon = 'plus'
+                    btn.disabled = False
+                    btn_quick.disabled = True
+                    btn_resume.disabled = True
+                    if any(t.link_type == 'youtube' for t in pending_queue):
+                        btn_queue_start_subs.layout.display = 'inline-block'
+            finally:
+                if colab_status_enabled and _colab_live_status_active:
+                    try:
+                        _last_live_status = _colab_live_status_snapshot(manager.token).data
+                        _last_live_status['running'] = False
+                    except Exception:
+                        pass
+                if _live_batch is manager:
+                    _live_batch = None
+                _colab_live_status_active = False
+
+    Thread(target=run, name='ultimate-downloader-batch', daemon=True).start()
+
+# --- HELPER FUNCTIONS ---
+def _clear_per_task_bars():
+    """Close and remove all per-download progress bars."""
+    for bar in _per_task_bars.values():
+        bar.close()
+    _per_task_bars.clear()
+    _per_task_done_at.clear()
+    _per_task_box.children = []
+    if hasattr(_per_task_accordion, 'set_bars'):
+        _per_task_accordion.set_bars([])
+    _per_task_accordion.layout.display = 'none'
+
+def reset_progress():
+    """Resets UI to idle state"""
+    progress_bar.value = 0
+    progress_bar.description = "Idle"
+    progress_bar.bar_style = 'info'
+    status_label.value = ""
+    _clear_per_task_bars()
+
+def update_status(message: str):
+    """Thread-safe status update."""
+    with progress_lock:
+        status_label.value = f"<small>{message}</small>"
+
+def normalize_playlist_range(range_str):
+    """Normalize playlist range string for yt-dlp's playlist_items option."""
+    if not range_str or not range_str.strip():
+        return None
+    return range_str.replace(' ', '')
+
+def sanitize_filename(name: str) -> str:
+    name = unquote(name)
+    name = re.sub(r'[<>:"/\\|?*]', '_', name) 
+    name = re.sub(r'[\s_]+', ' ', name).strip()
+    return name
+
+def clean_show_name(name: str) -> str:
+    """Strip leading bracketed content that looks like technical tags (not show names).
+    Technical tags: resolutions, codecs, release groups (usually single words or known patterns)
+    Show names: usually contain spaces (multiple words)
+    """
+    # Keep stripping technical-looking brackets from the start
+    while True:
+        # Check if next bracket is a technical tag (no spaces inside, or matches known patterns)
+        match = re.match(r'^\s*\[([^\]]*)\]', name)
+        if not match:
+            break
+        content = match.group(1)
+        # If bracket contains spaces, it's likely a show name - stop stripping
+        if ' ' in content and not re.match(r'(?i)^(WEB-?DL|Dolby\s*Vision|10\s*bit)$', content):
+            break
+        # Strip this bracket
+        name = name[match.end():]
+    
+    # Also strip leading parenthetical technical tags like (Hi10), (480p), (DragonFox)
+    while True:
+        match = re.match(r'^\s*\(([^)]*)\)', name)
+        if not match:
+            break
+        content = match.group(1)
+        # If parentheses contain spaces, might be show name - stop stripping
+        if ' ' in content:
+            break
+        # Known technical patterns to strip
+        if re.match(r'(?i)^(Hi10|10bit|x264|x265|HEVC|AVC|\d{3,4}p|WEB-?DL|BluRay|[A-Za-z0-9_-]{1,15})$', content):
+            name = name[match.end():]
+            continue
+        # Unknown single word - stop to be safe
+        break
+    
+    # Remove common YouTube prefixes (VIETSUB, ENGSUB, THUYẾT MINH, etc.)
+    name = re.sub(r'(?i)^\s*(?:VIETSUB|VietSub|ENGSUB|EngSub|ENG\s*SUB|VIET\s*SUB|THUYẾT\s*MINH|RAW|FULL|HD)\s*[|｜:：\-–—]\s*', '', name)
+    # Remove technical tags in brackets or standalone
+    name = re.sub(r'(?i)(?:\[?\s*(?:ENG\s*SUB|ENGSUB|FULL|WEB-?DL|WEBRip|BluRay|HDR|10bit|Atmos|DV|Vision|DDP\d\.\d|x265|HEVC|x264|H\.\d{3})\s*\]?)', '', name)
+    name = re.sub(r'(?i)\b(2160p|1080p|720p|480p|4k|8k)\b', '', name)
+    name = re.sub(r'[\[\]\(\)《》「」【】]', ' ', name)
+    # Remove trailing pipe/separator sections (e.g., "Show Name | Episode Info |" -> "Show Name")
+    name = re.sub(r'\s*[|｜]\s*$', '', name)
+    name = re.sub(r'[|｜._-]', ' ', name)
+    name = re.sub(r'(?i)\s+\b(END|FINALE|FINAL)\b$', '', name)
+    clean = re.sub(r'\s+', ' ', name).strip()
+    return clean if clean else "Unknown Show"
+
+def is_safe_path(base_dir: str, filename: str) -> bool:
+    """Prevent directory traversal attacks with strict prefix checking"""
+    try:
+        target_path = os.path.realpath(os.path.join(base_dir, filename))
+        base_path = os.path.realpath(base_dir)
+        return target_path.startswith(base_path + os.sep) or target_path == base_path
+    except Exception:
+        return False
+
+# --- BATCH EPISODE DETECTION ---
+# Global cache for batch analysis results
+_batch_episode_cache: Dict[str, int] = {}  # stripped filename -> detected episode number
+
+def _strip_size_suffix(filename: str) -> str:
+    """Remove trailing file-size annotations like ' (126.7 MB)' added for queue display.
+    Cache keys use the stripped form so lookups work both at queue time (with suffix)
+    and at download time (without)."""
+    return re.sub(r'\s*\([^)]*[KMG]i?B\s*\)\s*$', '', filename)
+
+def _split_subtitle_lang(filename: str) -> Tuple[str, str]:
+    """Split a subtitle's trailing 2-3 letter language tag from its name:
+    'Show.EP01.Eng.srt' -> ('Show.EP01.srt', 'Eng'). Applies to every subtitle format
+    (KEEP_EXTENSIONS: .srt/.ass/.sub/.vtt). Non-tagged subs and non-subs return
+    (filename, ''). Single source of truth for the subtitle language convention, shared
+    by handle_file_processing (which names the saved file) and _match_cache_key (so a
+    subtitle keys the same show as its video)."""
+    _, ext = os.path.splitext(filename)
+    if ext.lower() in KEEP_EXTENSIONS:
+        parts = filename.split('.')
+        if len(parts) >= 3 and len(parts[-2]) in (2, 3):
+            return ".".join(parts[:-2]) + ext, parts[-2]
+    return filename, ''
+
+# Release/fansub subtitle language tags → Plex-friendly ISO codes. 2-letter ISO 639-1,
+# with Traditional/Simplified Chinese kept distinct (zh-Hant/zh-Hans). Keys are
+# casefolded 2-3 char tags (all _split_subtitle_lang can yield); unmapped tags pass
+# through unchanged so an unexpected tag never regresses to a worse name.
+_SUB_LANG_MAP = {
+    'en': 'en', 'eng': 'en',
+    'vi': 'vi', 'vie': 'vi',
+    'ja': 'ja', 'jp': 'ja', 'jpn': 'ja',
+    'ko': 'ko', 'kor': 'ko',
+    'th': 'th', 'tha': 'th',
+    'id': 'id', 'ind': 'id',
+    'es': 'es', 'spa': 'es',
+    'fr': 'fr', 'fra': 'fr', 'fre': 'fr',
+    'de': 'de', 'ger': 'de', 'deu': 'de',
+    'pt': 'pt', 'por': 'pt',
+    'ru': 'ru', 'rus': 'ru',
+    'cht': 'zh-Hant', 'tc': 'zh-Hant',   # Traditional Chinese
+    'chs': 'zh-Hans', 'sc': 'zh-Hans',   # Simplified Chinese
+    'zh': 'zh', 'chi': 'zh', 'zho': 'zh',  # unspecified Chinese
+}
+
+def _normalize_sub_lang(tag: str) -> str:
+    """Map a source subtitle language tag ('Eng', 'Cht') to a Plex-friendly ISO code
+    ('en', 'zh-Hant'). Unrecognised tags are returned unchanged."""
+    return _SUB_LANG_MAP.get(tag.casefold(), tag)
+
+def _match_cache_key(filename: str) -> str:
+    """Canonical key for the TMDB-match and season-override caches. Strips the queue
+    size suffix AND any subtitle language tag, so 'Show.EP01.Eng.srt' resolves to the
+    same entry as the language-stripped name determine_destination_path looks up for
+    subtitles ('Show.EP01.srt') — otherwise subtitles miss the cache and fall back to
+    messy filename parsing while their video gets the clean TMDB name."""
+    return _split_subtitle_lang(_strip_size_suffix(sanitize_filename(filename)))[0]
+
+def analyze_batch_episodes(filenames: List[str], merge: bool = False) -> Dict[str, int]:
+    """
+    Analyze a batch of filenames to detect episode numbers by finding varying patterns.
+    
+    Strategy: Find number patterns that vary sequentially across files (likely episodes)
+    vs patterns that are constant (resolutions, codecs, etc).
+    
+    Returns dict mapping filename -> detected episode number (or None if not found).
+    """
+    global _batch_episode_cache
+    if not merge:
+        _batch_episode_cache = {}
+    
+    if len(filenames) < 2:
+        return {}  # Need at least 2 files for batch analysis
+    
+    # Extract all bracketed numbers from each file with their positions
+    def extract_bracket_numbers(filename: str) -> List[Tuple[int, int, str]]:
+        """Returns list of (position_index, number_value, matched_text) for bracketed numbers."""
+        results = []
+        for i, m in enumerate(re.finditer(r'\[(\d{1,4})\]', filename)):
+            num = int(m.group(1))
+            results.append((i, num, m.group(0)))
+        return results
+    
+    # Also extract dash-separated numbers like "Show - 01" or "Show_-_01_"
+    def extract_dash_numbers(filename: str) -> List[Tuple[int, int, str]]:
+        """Returns list of (position_index, number_value, matched_text) for dash-separated numbers."""
+        results = []
+        # Pattern handles: "- 01 ", "- 01.", "_-_01_", "- 01(", "- 0724 " (4-digit)
+        # Negative lookahead (?![xX]\d) skips NNxNN patterns (e.g., "- 01x05")
+        for i, m in enumerate(re.finditer(r'[-–—]_?(\d{1,4})(?![xX]\d)(?:[_\s\.(\[]|$)', filename)):
+            num = int(m.group(1))
+            results.append((i + 100, num, m.group(0)))  # offset to distinguish from brackets
+        return results
+    
+    # Also extract space-separated numbers like "Show Name 01 Title" or "Slam Dunk 100"
+    def extract_space_numbers(filename: str) -> List[Tuple[int, int, str]]:
+        """Returns list of (position_index, number_value, matched_text) for space-separated episode numbers."""
+        results = []
+        # Match numbers that are surrounded by spaces (or start of string), followed by more text
+        # Avoid matching years (1900-2099) or resolutions (1080, 720, etc.)
+        # Accept [A-Za-z\[] after space to handle fansub bracket tags like [NetflixJP]
+        for i, m in enumerate(re.finditer(r'(?:^|\s)(\d{1,4})(?=\s+[A-Za-z\[])', filename)):
+            num = int(m.group(1))
+            # Skip resolutions and other technical numbers
+            if num in (360, 480, 540, 720, 1080, 1440, 2160, 4320):
+                continue
+            if 1900 <= num <= 2099:  # Skip years
+                continue
+            results.append((i + 200, num, m.group(0)))  # offset to distinguish
+        return results
+    
+    # Extract NNxNN season-episode patterns like "01x05", "1x03", "02x15"
+    def extract_nxn_numbers(filename: str) -> List[Tuple[int, int, str]]:
+        """Returns list of (position_index, episode_value, matched_text) for NNxNN patterns."""
+        results = []
+        for i, m in enumerate(re.finditer(r'(?i)\b(\d{1,2})x(\d{1,4})\b', filename)):
+            ep_num = int(m.group(2))  # Extract episode number (after x)
+            results.append((i + 300, ep_num, m.group(0)))  # offset to distinguish
+        return results
+    
+    # Collect patterns from all files (pre-cleaned of file size info like "(126.7 MiB)")
+    all_patterns = []
+    for fname in filenames:
+        clean_name = _strip_size_suffix(fname)
+        patterns = extract_bracket_numbers(clean_name) + extract_dash_numbers(clean_name) + extract_space_numbers(clean_name) + extract_nxn_numbers(clean_name)
+        all_patterns.append((fname, patterns))  # Keep original filename as key
+    
+    if not all_patterns or not all_patterns[0][1]:
+        return {}  # No patterns found
+    
+    # Find which position index has varying values (likely episode numbers)
+    # Group by position index
+    position_values: Dict[int, List[Tuple[str, int]]] = {}
+    for fname, patterns in all_patterns:
+        for pos_idx, num_val, _ in patterns:
+            if pos_idx not in position_values:
+                position_values[pos_idx] = []
+            position_values[pos_idx].append((fname, num_val))
+    
+    # Find positions where values vary AND form a reasonable sequence
+    episode_position = None
+    best_score = 0
+    
+    for pos_idx, file_nums in position_values.items():
+        if len(file_nums) < len(filenames) * 0.8:
+            continue  # Skip if not present in most files
+        
+        values = [n for _, n in file_nums]
+        unique_values = set(values)
+        
+        # Skip if all same value (constant like 1080, 264, etc.)
+        if len(unique_values) == 1:
+            continue
+        
+        # Skip known non-episode numbers (resolutions, years, bit depths)
+        if any(v in (360, 480, 540, 720, 1080, 1440, 2160, 4320, 264, 265, 10) for v in unique_values):
+            if len(unique_values) == 1 or max(unique_values) > 500:
+                continue
+        
+        # Check if values form a reasonable episode sequence
+        sorted_vals = sorted(unique_values)
+        is_sequential = all(sorted_vals[i+1] - sorted_vals[i] <= 2 for i in range(len(sorted_vals)-1))
+        starts_low = min(unique_values) <= 10  # Episodes usually start from 1-10
+        reasonable_range = max(unique_values) <= 500  # Episodes rarely exceed 500
+        
+        # Score this position
+        score = 0
+        if is_sequential: score += 3
+        if starts_low: score += 2
+        if reasonable_range: score += 1
+        if len(unique_values) > 1: score += 1
+        
+        if score > best_score:
+            best_score = score
+            episode_position = pos_idx
+    
+    if episode_position is None:
+        return {}
+    
+    # Map filenames to their episode numbers at the detected position.
+    # Keys are stripped of size suffixes so download-time filenames still match.
+    result = {}
+    for fname, patterns in all_patterns:
+        for pos_idx, num_val, _ in patterns:
+            if pos_idx == episode_position:
+                result[_strip_size_suffix(fname)] = num_val
+                break
+
+    # Explicit SxxEyy markers outrank the varying-number heuristic: when a file's
+    # strict marker VARIES across the batch it is that file's real season/episode,
+    # so leave the file out of the batch result and let per-file regex parsing read
+    # it (e.g. '... - 28 - S02E01v2' is S02E01, not E28 — the dash number is only
+    # the absolute count). A strict marker constant across 2+ files is a pack label
+    # ('Show.S01E01-E24.../03.mp4'), and for those the heuristic result stands.
+    strict_pairs = {}
+    for fname in filenames:
+        key = _strip_size_suffix(fname)
+        m = re.search(r'(?i)\bS(\d{1,2})EP?(\d{1,4})(?:v\d+)?(?:\b|(?=EP?\d))', key)
+        if m:
+            strict_pairs[key] = (int(m.group(1)), int(m.group(2)))
+    if strict_pairs and (len(strict_pairs) == 1 or len(set(strict_pairs.values())) > 1):
+        for key in strict_pairs:
+            result.pop(key, None)
+
+
+    if merge:
+        _batch_episode_cache = {**result, **_batch_episode_cache}
+    else:
+        _batch_episode_cache = result
+    return result
+
+def get_batch_episode(filename: str) -> Optional[int]:
+    """Get batch-detected episode number for a filename, if available."""
+    return _batch_episode_cache.get(_strip_size_suffix(filename))
+
+# --- TMDB METADATA MATCHING ---
+# Batch-time lookups against TMDB refine the regex-based filename detection:
+# canonical names, years, anime-library classification, and absolute-episode →
+# season mapping. Everything degrades to the regex behaviour when unavailable.
+_tmdb_match_cache: Dict[str, dict] = {}  # stripped filename -> match dict (per batch)
+_tmdb_query_cache: Dict[str, Optional[dict]] = {}  # "kind|query|year" -> match/None (persistent)
+_tmdb_details_cache: Dict[Tuple[str, str], dict] = {}  # (kind, id) -> full details (per runtime)
+_tmdb_query_cache_loaded = False
+
+def tmdb_is_enabled() -> bool:
+    """TMDB matching is active when the checkbox is on and a key is configured."""
+    return tmdb_enabled_checkbox.value and bool(token_tmdb.value.strip())
+
+def _tmdb_get(path: str, params: dict) -> Optional[dict]:
+    """GET a TMDB v3 endpoint. Returns parsed JSON or None on any failure."""
+    try:
+        full_params = dict(params, api_key=token_tmdb.value.strip())
+        r = requests.get(f"{TMDB_API_BASE}{path}", params=full_params, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+def _tmdb_similarity(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a.casefold().strip(), b.casefold().strip()).ratio()
+
+
+def _tmdb_genre_ids(result: dict) -> set:
+    """Genre IDs from either a search result (genre_ids) or details payload
+    (genres). Invalid community-entered values are ignored defensively."""
+    ids = set()
+    for value in result.get('genre_ids') or []:
+        try:
+            ids.add(int(value))
+        except (TypeError, ValueError):
+            pass
+    for genre in result.get('genres') or []:
+        value = genre.get('id') if isinstance(genre, dict) else genre
+        try:
+            ids.add(int(value))
+        except (TypeError, ValueError):
+            pass
+    return ids
+
+
+def _tmdb_country_codes(result: dict) -> set:
+    """ISO country codes from TV origin_country or movie production_countries."""
+    codes = set()
+    for value in result.get('origin_country') or []:
+        if isinstance(value, str) and value:
+            codes.add(value.upper())
+    for country in result.get('production_countries') or []:
+        value = country.get('iso_3166_1') if isinstance(country, dict) else country
+        if isinstance(value, str) and value:
+            codes.add(value.upper())
+    return codes
+
+
+def _tmdb_keyword_names(result: dict) -> set:
+    """Keyword names from an append_to_response=keywords movie/TV payload."""
+    payload = result.get('keywords')
+    if isinstance(payload, dict):
+        entries = payload.get('keywords') or payload.get('results') or []
+    elif isinstance(payload, list):
+        entries = payload
+    else:
+        entries = []
+    return {
+        str(entry.get('name', '')).casefold().strip()
+        for entry in entries if isinstance(entry, dict) and entry.get('name')
+    }
+
+
+def classify_tmdb_library(result: dict) -> dict:
+    """Classify a TMDB payload independently of its movie/TV type.
+
+    TMDB has no native anime media type. Use a conservative intersection instead:
+    Animation plus Japanese language/origin (or an explicit anime keyword). This
+    avoids treating Japanese live action or all Western animation as anime. Missing
+    genre metadata is unknown and routes through the existing standard fallback.
+    """
+    has_genres = 'genre_ids' in result or 'genres' in result
+    genre_ids = _tmdb_genre_ids(result)
+    if not has_genres:
+        return {'library_class': 'unknown', 'is_anime': False, 'anime_evidence': []}
+    if TMDB_ANIMATION_GENRE_ID not in genre_ids:
+        return {'library_class': 'standard', 'is_anime': False, 'anime_evidence': []}
+
+    evidence = ['genre:animation']
+    language = str(result.get('original_language') or '').casefold()
+    countries = _tmdb_country_codes(result)
+    anime_keywords = _tmdb_keyword_names(result) & TMDB_ANIME_KEYWORDS
+    if language == 'ja':
+        evidence.append('language:ja')
+    if 'JP' in countries:
+        evidence.append('country:JP')
+    if anime_keywords:
+        evidence.append(f"keyword:{sorted(anime_keywords)[0]}")
+
+    is_anime = len(evidence) > 1
+    return {
+        'library_class': 'anime' if is_anime else 'standard',
+        'is_anime': is_anime,
+        'anime_evidence': evidence,
+    }
+
+
+def resolve_library_is_anime(route_override: Optional[str], tmdb_match: Optional[dict],
+                             effective_kind: str) -> bool:
+    """Resolve library family with explicit per-file routes taking precedence."""
+    if route_override in ('anime_series', 'anime_movie'):
+        return True
+    if route_override in ('tv', 'movie', 'downloads'):
+        return False
+    if not tmdb_match or tmdb_match.get('type') != effective_kind:
+        return False
+    return tmdb_match.get('library_class') == 'anime'
+
+
+def _tmdb_match_is_current(match) -> bool:
+    """Whether a persisted normalized match has the current classifier schema."""
+    return (
+        isinstance(match, dict)
+        and match.get('metadata_version') == TMDB_METADATA_VERSION
+        and match.get('library_class') in ('anime', 'standard')
+        and isinstance(match.get('is_anime'), bool)
+    )
+
+
+def _load_tmdb_query_cache():
+    global _tmdb_query_cache, _tmdb_query_cache_loaded
+    if _tmdb_query_cache_loaded:
+        return
+    _tmdb_query_cache_loaded = True
+    try:
+        if os.path.exists(TMDB_CACHE_FILE):
+            with open(TMDB_CACHE_FILE, 'r') as f:
+                _tmdb_query_cache = json.load(f)
+    except Exception:
+        _tmdb_query_cache = {}  # Corrupt/unreadable cache — start fresh
+    if not isinstance(_tmdb_query_cache, dict):
+        _tmdb_query_cache = {}
+
+    old_version = _tmdb_query_cache.get('__version__')
+    cleaned = {}
+    for key, value in _tmdb_query_cache.items():
+        if key == '__version__':
+            continue
+        if value is None:
+            # A matching-algorithm version change may turn an old miss into a hit.
+            if old_version == TMDB_CACHE_VERSION:
+                cleaned[key] = None
+        elif isinstance(value, dict):
+            cleaned[key] = value
+        # Keep legacy successes for their still-useful canonical identity. A cache
+        # hit lazily refreshes them by ID; if TMDB is temporarily unavailable the
+        # old naming still works and classification safely falls back to standard.
+    cleaned['__version__'] = TMDB_CACHE_VERSION
+    _tmdb_query_cache = cleaned
+
+def _save_tmdb_query_cache():
+    try:
+        query_keys = [k for k in _tmdb_query_cache if k != '__version__']
+        if len(query_keys) > TMDB_QUERY_CACHE_MAX:
+            for k in query_keys[:len(query_keys) - TMDB_QUERY_CACHE_MAX]:
+                del _tmdb_query_cache[k]
+        _tmdb_query_cache['__version__'] = TMDB_CACHE_VERSION
+        with open(TMDB_CACHE_FILE, 'w') as f:
+            json.dump(_tmdb_query_cache, f)
+    except Exception:
+        pass  # Drive not mounted — cache is best-effort
+
+def _tmdb_alt_titles(kind: str, tmdb_id: int) -> List[str]:
+    """Alternative titles for a result (romaji anime titles live here)."""
+    data = _tmdb_get(f"/{kind}/{tmdb_id}/alternative_titles", {})
+    if not data:
+        return []
+    entries = data.get('results') or data.get('titles') or []  # tv uses 'results', movie 'titles'
+    return [e.get('title', '') for e in entries if e.get('title')]
+
+def _tmdb_fetch_details(kind: str, tmdb_id) -> Optional[dict]:
+    """Fetch full metadata plus keywords, memoizing successful responses.
+
+    Failures are deliberately not cached so fixing an API key or a transient TMDB
+    outage can recover without restarting the runtime.
+    """
+    key = (kind, str(tmdb_id))
+    if key in _tmdb_details_cache:
+        return _tmdb_details_cache[key]
+    data = _tmdb_get(f"/{kind}/{tmdb_id}", {'append_to_response': 'keywords'})
+    if data:
+        _tmdb_details_cache[key] = data
+    return data
+
+def _tmdb_search(kind: str, query: str, year: Optional[str]) -> Optional[dict]:
+    """Search TMDB ('tv' or 'movie') with a similarity gate. Uses the persistent
+    query cache (misses cached as None so they aren't re-queried)."""
+    _load_tmdb_query_cache()
+    cache_key = f"{kind}|{query.casefold()}|{year or ''}"
+    if cache_key in _tmdb_query_cache:
+        cached = _tmdb_query_cache[cache_key]
+        if cached is not None and not _tmdb_match_is_current(cached):
+            cached_kind = cached.get('type') if isinstance(cached, dict) else None
+            cached_id = cached.get('id') if isinstance(cached, dict) else None
+            if cached_kind in ('tv', 'movie') and cached_id is not None:
+                refreshed = _tmdb_fetch_by_id(cached_kind, cached_id)
+                if refreshed:
+                    _tmdb_query_cache[cache_key] = refreshed
+                    cached = refreshed
+        return cached
+
+    # Attempt tiers, most specific first. Filename years are often wrong (encode
+    # year, not release year), and a year left inside the query text ("True
+    # Detective 2019") makes TMDB's text search return nothing — so degrade
+    # gracefully: drop the year filter, then retry with the year stripped from
+    # the query itself. First match wins, so exact titles still take priority.
+    attempts = [(query, year)]
+    if year:
+        attempts.append((query, None))
+    stripped = re.sub(r"[\s.]*\(?(19|20)\d{2}\)?\s*$", '', query).strip()
+    if stripped and stripped.casefold() != query.casefold():
+        attempts.append((stripped, year))
+        if year:
+            attempts.append((stripped, None))
+
+    match = None
+    for q, y in attempts:
+        params = {'query': q, 'include_adult': 'false'}
+        if y:
+            params['first_air_date_year' if kind == 'tv' else 'year'] = y
+        data = _tmdb_get(f"/search/{kind}", params)
+        results = (data or {}).get('results') or []
+        for r in results[:5]:
+            name = r.get('name') or r.get('title') or ''
+            orig = r.get('original_name') or r.get('original_title') or ''
+            score = max(_tmdb_similarity(q, name), _tmdb_similarity(q, orig))
+            if score >= TMDB_MATCH_THRESHOLD:
+                match = r
+                break
+        if match is None and results:
+            # Romaji queries score poorly against localized/original names but live in
+            # alternative titles — check them for the top result only
+            top = results[0]
+            if any(_tmdb_similarity(q, alt) >= TMDB_MATCH_THRESHOLD
+                   for alt in _tmdb_alt_titles(kind, top['id'])):
+                match = top
+        if match is not None:
+            break
+
+    normalized = _tmdb_normalize(kind, match) if match is not None else None
+    _tmdb_query_cache[cache_key] = normalized
+    return normalized
+
+def _tmdb_normalize(kind: str, result: dict) -> dict:
+    """Normalize a TMDB tv/movie result (from search or a /{kind}/{id} fetch) to the
+    match dict used everywhere. Full TV details supply season counts; full movie
+    details are fetched only when an animated search result needs country/keyword
+    evidence that the compact search payload does not contain."""
+    payload = dict(result)
+    preliminary = classify_tmdb_library(payload)
+    genre_ids = _tmdb_genre_ids(payload)
+    classification_details_needed = not ('genre_ids' in payload or 'genres' in payload)
+    if (kind == 'movie' and TMDB_ANIMATION_GENRE_ID in genre_ids
+            and preliminary['library_class'] != 'anime'
+            and 'production_countries' not in payload and 'keywords' not in payload):
+        classification_details_needed = True
+    needs_details = classification_details_needed or (kind == 'tv' and 'seasons' not in payload)
+    details_loaded = False
+    if needs_details:
+        details = _tmdb_fetch_details(kind, result['id'])
+        if details:
+            payload.update(details)
+            details_loaded = True
+
+    name = payload.get('name') or payload.get('title') or ''
+    date = payload.get('first_air_date') or payload.get('release_date') or ''
+    genre_ids = _tmdb_genre_ids(payload)
+    countries = _tmdb_country_codes(payload)
+    classification = classify_tmdb_library(payload)
+    classification_complete = (
+        (not classification_details_needed or details_loaded)
+        and classification['library_class'] != 'unknown'
+    )
+    normalized = {
+        'type': kind,
+        'id': payload['id'],
+        'name': sanitize_filename(name) or 'Unknown',
+        'year': date[:4] if date else '',
+        'genre_ids': sorted(genre_ids),
+        'original_language': str(payload.get('original_language') or '').casefold(),
+        'origin_countries': sorted(countries),
+        # An incomplete classifier result remains stale so a later cache hit retries
+        # the details request instead of persisting a transient failure forever.
+        'metadata_version': TMDB_METADATA_VERSION if classification_complete else 0,
+        **classification,
+    }
+    if kind == 'tv':
+        seasons = {}
+        for season in payload.get('seasons', []):
+            num = season.get('season_number', 0)
+            count = season.get('episode_count', 0)
+            if num > 0 and count > 0:
+                seasons[str(num)] = count
+        normalized['seasons'] = seasons
+    return normalized
+
+def _tmdb_fetch_by_id(kind: str, tmdb_id) -> Optional[dict]:
+    """Fetch a specific tv/movie by TMDB id and normalize it (None if not found)."""
+    data = _tmdb_fetch_details(kind, tmdb_id)
+    if not data or 'id' not in data:
+        return None
+    return _tmdb_normalize(kind, data)
+
+def _resolve_tmdb_override(text: str) -> Optional[dict]:
+    """Resolve a manual correction string to a match dict. Accepts a themoviedb.org
+    URL, a 'tv:12345' / 'movie:12345' id, or free text (searched via /search/multi).
+    Does NOT touch the auto-search query cache."""
+    text = text.strip()
+    if not text:
+        return None
+    url_m = re.search(r'themoviedb\.org/(tv|movie)/(\d+)', text)
+    if url_m:
+        return _tmdb_fetch_by_id(url_m.group(1), url_m.group(2))
+    id_m = re.match(r'(?i)(tv|movie)\s*[:=]\s*(\d+)$', text)
+    if id_m:
+        return _tmdb_fetch_by_id(id_m.group(1).lower(), id_m.group(2))
+    # Free text — multi search returns tv/movie/person with a media_type tag
+    data = _tmdb_get("/search/multi", {'query': text, 'include_adult': 'false'})
+    for r in (data or {}).get('results', []):
+        if r.get('media_type') in ('tv', 'movie'):
+            return _tmdb_normalize(r['media_type'], r)
+    return None
+
+def _apply_tmdb_overrides(tasks: List[DownloadTask]):
+    """Write each task's manual TMDB override into the match cache, overriding any
+    auto-match. Called after analyze_batch_metadata at every entry point so manual
+    corrections survive Quick Download and resume. Legacy saved overrides are
+    rehydrated once per TMDB ID so they gain the current library classification."""
+    upgraded = {}
+    for t in tasks:
+        ov = getattr(t, 'tmdb_override', None)
+        if ov is None or not t.filename:
+            continue
+        key = _match_cache_key(t.filename)
+        if ov == TMDB_CLEARED:
+            _tmdb_match_cache.pop(key, None)  # force regex fallback
+        else:
+            if not _tmdb_match_is_current(ov):
+                ref = (ov.get('type'), ov.get('id')) if isinstance(ov, dict) else (None, None)
+                if ref[0] in ('tv', 'movie') and ref[1] is not None:
+                    if ref not in upgraded:
+                        upgraded[ref] = _tmdb_fetch_by_id(*ref)
+                    if upgraded[ref]:
+                        ov = upgraded[ref]
+                        t.tmdb_override = ov
+            _tmdb_match_cache[key] = ov
+
+def _selected_queue_indices() -> List[int]:
+    """0-based indices of the queue rows the user has selected."""
+    return [int(s.split('.')[0]) - 1 for s in queue_list.value]
+
+def apply_tmdb_override(b=None):
+    """Match Selected: resolve the Fix-Match input and apply it to selected rows."""
+    if not tmdb_is_enabled():
+        print("⚠️ Enable TMDB matching (Settings) and set an API key first")
+        return
+    text = tmdb_override_input.value.strip()
+    if not text:
+        print("⚠️ Enter a TMDB URL, tv:12345 / movie:12345, or a title to search")
+        return
+    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
+    if not indices:
+        print("⚠️ Select the queue item(s) to correct first")
+        return
+    match = _resolve_tmdb_override(text)
+    if not match:
+        print(f"❌ No TMDB result for '{text}'")
+        return
+    for i in indices:
+        task = pending_queue[i]
+        task.tmdb_override = match
+        if task.filename:
+            _tmdb_match_cache[_match_cache_key(task.filename)] = match
+    tmdb_override_input.value = ""
+    update_queue_display()
+    label = match['name'] + (f" ({match['year']})" if match['year'] else "")
+    print(f"✅ Matched {len(indices)} item(s) → {label}")
+
+def clear_tmdb_override(b=None):
+    """Clear Match: drop the TMDB match for selected rows (use filename parsing)."""
+    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
+    if not indices:
+        print("⚠️ Select the queue item(s) to clear first")
+        return
+    for i in indices:
+        task = pending_queue[i]
+        task.tmdb_override = TMDB_CLEARED
+        if task.filename:
+            _tmdb_match_cache.pop(_match_cache_key(task.filename), None)
+    update_queue_display()
+    print(f"✖ Cleared TMDB match for {len(indices)} item(s) — will use filename parsing")
+
+# --- MANUAL QUEUE OVERRIDES (season / episode / name / route) ---
+# Mirror the TMDB Fix-Match pattern: overrides live on the task (so they persist
+# with the session across Stop/Resume) and are mirrored into filename-keyed caches
+# that determine_destination_path can read from any thread. Force Season solves
+# multi-season batches whose filenames carry no season marker; Renumber solves
+# absolute-numbered batches whose real season split TMDB can't provide (select the
+# season's files, Force Season, then Renumber from 1).
+_season_override_cache: Dict[str, int] = {}  # stripped filename -> forced season (per batch)
+_episode_override_cache: Dict[str, int] = {}  # stripped filename -> forced episode (per batch)
+_episode_end_override_cache: Dict[str, int] = {}  # stripped filename -> forced range end (per batch)
+_name_override_cache: Dict[str, Tuple[str, str]] = {}  # stripped filename -> (forced name, year)
+_route_override_cache: Dict[str, str] = {}  # stripped filename -> forced route category
+_part_override_cache: Dict[str, int] = {}  # stripped filename -> forced part (N = -ptN, 0 = none)
+
+def get_season_override(filename: str) -> Optional[int]:
+    """Manual season for a filename (None when not overridden)."""
+    return _season_override_cache.get(_match_cache_key(filename))
+
+def get_episode_override(filename: str) -> Optional[int]:
+    """Manual episode for a filename (None when not overridden)."""
+    return _episode_override_cache.get(_match_cache_key(filename))
+
+def get_episode_end_override(filename: str) -> Optional[int]:
+    """Manual multi-episode range end for a filename (None = single episode)."""
+    return _episode_end_override_cache.get(_match_cache_key(filename))
+
+def get_name_override(filename: str) -> Optional[Tuple[str, str]]:
+    """Manual (name, year) for a filename (None when not overridden)."""
+    return _name_override_cache.get(_match_cache_key(filename))
+
+def get_route_override(filename: str) -> Optional[str]:
+    """Manual route category for a filename (None when not overridden):
+    'tv' | 'anime_series' | 'movie' | 'anime_movie' | 'downloads'."""
+    return _route_override_cache.get(_match_cache_key(filename))
+
+def get_part_override(filename: str) -> Optional[int]:
+    """Manual part suffix for a filename: None = auto-detect, 0 = force no
+    suffix, N >= 1 = force -ptN."""
+    return _part_override_cache.get(_match_cache_key(filename))
+
+def _apply_queue_overrides(tasks: List[DownloadTask], merge: bool = False):
+    """Rebuild the season/episode/name/route override caches from the tasks'
+    persisted overrides. Called at every entry point (queue preview, start, quick,
+    resume); clearing first means overrides never leak across batches with
+    colliding filenames."""
+    if not merge:
+        _season_override_cache.clear()
+        _episode_override_cache.clear()
+        _episode_end_override_cache.clear()
+        _name_override_cache.clear()
+        _route_override_cache.clear()
+        _part_override_cache.clear()
+    for t in tasks:
+        if not t.filename:
+            continue
+        key = _match_cache_key(t.filename)
+        sov = getattr(t, 'season_override', None)
+        if sov is not None:
+            _season_override_cache[key] = int(sov)
+        eov = getattr(t, 'episode_override', None)
+        if eov is not None:
+            _episode_override_cache[key] = int(eov)
+        eev = getattr(t, 'episode_end_override', None)
+        if eev is not None:
+            _episode_end_override_cache[key] = int(eev)
+        nov = getattr(t, 'name_override', None)
+        if nov:
+            _name_override_cache[key] = (nov, getattr(t, 'year_override', None) or '')
+        rov = getattr(t, 'route_override', None)
+        if rov:
+            _route_override_cache[key] = rov
+        pov = getattr(t, 'part_override', None)
+        if pov is not None:
+            _part_override_cache[key] = int(pov)
+
+
+def apply_season_override(b=None):
+    """Set Season: force a season number for the selected queue rows."""
+    text = season_override_input.value.strip()
+    if not text.isdigit():
+        print("⚠️ Enter a season number first (e.g. 2 — use 0 for Specials)")
+        return
+    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
+    if not indices:
+        print("⚠️ Select the queue item(s) to set the season for first")
+        return
+    season = int(text)
+    for i in indices:
+        task = pending_queue[i]
+        task.season_override = season
+        if task.filename:
+            _season_override_cache[_match_cache_key(task.filename)] = season
+    season_override_input.value = ""
+    update_queue_display()
+    print(f"✅ Season {season:02d} forced for {len(indices)} item(s)")
+
+def clear_season_override(b=None):
+    """Clear Season: drop the forced season for the selected rows."""
+    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
+    if not indices:
+        print("⚠️ Select the queue item(s) to clear first")
+        return
+    for i in indices:
+        task = pending_queue[i]
+        task.season_override = None
+        if task.filename:
+            _season_override_cache.pop(_match_cache_key(task.filename), None)
+    update_queue_display()
+    print(f"✖ Cleared forced season for {len(indices)} item(s) — will use filename/TMDB detection")
+
+def _number_rows_sequentially(rows: List[DownloadTask], start: int) -> Dict[str, int]:
+    """Assign sequential numbers to the rows in queue order, returned as
+    {task.id: number}. Subtitles never consume numbers: each inherits the number
+    of the video its name extends — matched by stem, so the pairing works no
+    matter how the release spells the language tag (Eng, big5, zh-Hant, …).
+    Subtitles with no video in the selection number themselves."""
+    def key_stem(task):
+        return os.path.splitext(_match_cache_key(task.filename))[0]
+
+    # Pass 1: number the videos (every non-subtitle row) by stem, in queue order
+    assigned: Dict[str, int] = {}  # stem -> number (deduped, so a re-run is stable)
+    numbers: Dict[str, int] = {}
+    subs, video_stems = [], []
+    for task in rows:
+        if os.path.splitext(_strip_size_suffix(task.filename))[1].lower() in KEEP_EXTENSIONS:
+            subs.append(task)
+            continue
+        stem = key_stem(task)
+        if stem not in assigned:
+            assigned[stem] = start + len(assigned)
+            video_stems.append(stem)
+        numbers[task.id] = assigned[stem]
+
+    # Pass 2: subtitles pair with the video whose stem equals theirs or is a
+    # dot-boundary prefix of it ('Show - 28.big5.ass' → 'Show - 28.mkv'), longest
+    # match winning; unmatched subtitles get their own numbers like any other row
+    for task in subs:
+        stem = key_stem(task)
+        match = max((v for v in video_stems if stem == v or stem.startswith(v + '.')),
+                    key=len, default=None)
+        pair = match if match is not None else stem
+        if pair not in assigned:
+            assigned[pair] = start + len(assigned)
+        numbers[task.id] = assigned[pair]
+    return numbers
+
+def _parse_episode_range(text):
+    """Validate an episode number or span before changing any selected tasks."""
+    match = re.fullmatch(r'(\d{1,4})(?:\s*[-~–—]\s*(\d{1,4}))?', text)
+    if not match:
+        raise ValueError('Enter an episode number (e.g. 7), or a range (e.g. 7-9)')
+    start = int(match.group(1))
+    end = int(match.group(2)) if match.group(2) else None
+    if end is not None and end <= start:
+        raise ValueError('The range end must be greater than the start (e.g. 7-9)')
+    return start, end
+
+
+def _set_episode_overrides(rows, start, span_end):
+    """Apply one numbering scheme, including subtitle pairing and range offsets."""
+    numbers = _number_rows_sequentially(rows, start)
+    offset = (span_end - start) if span_end is not None else 0
+    for task in rows:
+        key = _match_cache_key(task.filename)
+        if span_end is not None and numbers[task.id] == start:
+            task.episode_override, task.episode_end_override = start, span_end
+            _episode_override_cache[key], _episode_end_override_cache[key] = start, span_end
+        else:
+            task.episode_override = numbers[task.id] + offset
+            task.episode_end_override = None
+            _episode_override_cache[key] = task.episode_override
+            _episode_end_override_cache.pop(key, None)
+    return numbers
+
+
+def apply_renumber(b=None):
+    """Renumber: rewrite the selected rows' episode numbers sequentially, in queue
+    order, starting from the 🔢 field (default 1). A video and its subtitle share
+    one number (see _number_rows_sequentially). A range like 7-9 makes the FIRST
+    file a multi-episode span (S01E07-E09); the rest continue as single episodes
+    from the end of the range (E10, E11, …)."""
+    text = renumber_start_input.value.strip() or '1'
+    try:
+        start, span_end = _parse_episode_range(text)
+    except ValueError as exc:
+        print(f"⚠️ {exc}")
+        return
+    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
+    if not indices:
+        print("⚠️ Select the queue item(s) to renumber first")
+        return
+    rows = [pending_queue[i] for i in sorted(indices) if pending_queue[i].filename]
+    skipped = len(indices) - len(rows)
+    numbers = _set_episode_overrides(rows, start, span_end)
+    offset = (span_end - start) if span_end else 0
+
+    renumber_start_input.value = ""
+    update_queue_display()
+    if numbers:
+        last = max(numbers.values()) + offset
+        note = f" ({skipped} without filenames skipped)" if skipped else ""
+        first = f"E{start:02d}-E{span_end:02d}" if span_end else f"E{start:02d}"
+        tail = ""
+        if span_end and last > span_end:
+            tail = f", then E{span_end + 1:02d}" + (f"–E{last:02d}" if last > span_end + 1 else "")
+        elif not span_end and last > start:
+            tail = f"–E{last:02d}"
+        print(f"✅ Renumbered {len(rows)} item(s) → {first}{tail}{note}")
+    else:
+        print("⚠️ Selected item(s) have no filenames yet — resolve them first")
+
+
+def clear_renumber(b=None):
+    """Clear Renumber: drop the forced episode numbers for the selected rows."""
+    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
+    if not indices:
+        print("⚠️ Select the queue item(s) to clear first")
+        return
+    for i in indices:
+        task = pending_queue[i]
+        task.episode_override = None
+        task.episode_end_override = None
+        if task.filename:
+            _episode_override_cache.pop(_match_cache_key(task.filename), None)
+            _episode_end_override_cache.pop(_match_cache_key(task.filename), None)
+    update_queue_display()
+    print(f"✖ Cleared forced episode numbers for {len(indices)} item(s) — will use filename/TMDB detection")
+
+def apply_part_override(b=None):
+    """Set Part: append -ptN suffixes to the selected rows sequentially, in queue
+    order, starting from the 📎 field (default 1) — e.g. 1 with three files
+    selected → -pt1, -pt2, -pt3. A video and its subtitle share one part number.
+    Wins over Part X / 上篇 filename detection."""
+    text = part_override_input.value.strip() or '1'
+    if not text.isdigit() or int(text) < 1:
+        print("⚠️ Enter the part number to start from (e.g. 1 → -pt1)")
+        return
+    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
+    if not indices:
+        print("⚠️ Select the queue item(s) to set the part for first")
+        return
+    start = int(text)
+    rows = [pending_queue[i] for i in sorted(indices) if pending_queue[i].filename]
+    skipped = len(indices) - len(rows)
+    numbers = _number_rows_sequentially(rows, start)
+    for task in rows:
+        task.part_override = numbers[task.id]
+        _part_override_cache[_match_cache_key(task.filename)] = numbers[task.id]
+
+    part_override_input.value = ""
+    update_queue_display()
+    if numbers:
+        last = max(numbers.values())
+        note = f" ({skipped} without filenames skipped)" if skipped else ""
+        label = f"-pt{start}" if last == start else f"-pt{start}…-pt{last}"
+        print(f"✅ Part suffix {label} set for {len(rows)} item(s){note}")
+    else:
+        print("⚠️ Selected item(s) have no filenames yet — resolve them first")
+
+def remove_part_override(b=None):
+    """No Part: strip any part suffix (detected or forced) from the selected rows."""
+    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
+    if not indices:
+        print("⚠️ Select the queue item(s) to strip the part suffix from first")
+        return
+    for i in indices:
+        task = pending_queue[i]
+        task.part_override = 0
+        if task.filename:
+            _part_override_cache[_match_cache_key(task.filename)] = 0
+    update_queue_display()
+    print(f"✖ Part suffix removed for {len(indices)} item(s)")
+
+def apply_name_override(b=None):
+    """Set Name: force a show/movie name (and optional year) for the selected rows —
+    the manual counterpart of a TMDB match, and it wins over one."""
+    name = sanitize_filename(queue_name_input.value.strip())
+    year = queue_year_input.value.strip()
+    if not name:
+        print("⚠️ Enter the name to force first")
+        return
+    if year and not re.fullmatch(r'(19|20)\d{2}', year):
+        print("⚠️ Year should look like 2025 (leave it empty to omit)")
+        return
+    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
+    if not indices:
+        print("⚠️ Select the queue item(s) to name first")
+        return
+    for i in indices:
+        task = pending_queue[i]
+        task.name_override = name
+        task.year_override = year or None
+        if task.filename:
+            _name_override_cache[_match_cache_key(task.filename)] = (name, year)
+    queue_name_input.value = ""
+    queue_year_input.value = ""
+    update_queue_display()
+    label = f"{name} ({year})" if year else name
+    print(f"✅ Name forced for {len(indices)} item(s) → {label}")
+
+def clear_name_override(b=None):
+    """Clear Name: drop the forced name/year for the selected rows."""
+    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
+    if not indices:
+        print("⚠️ Select the queue item(s) to clear first")
+        return
+    for i in indices:
+        task = pending_queue[i]
+        task.name_override = None
+        task.year_override = None
+        if task.filename:
+            _name_override_cache.pop(_match_cache_key(task.filename), None)
+    update_queue_display()
+    print(f"✖ Cleared forced name for {len(indices)} item(s) — will use TMDB/filename detection")
+
+def apply_route_override(b=None):
+    """Apply Route: send the selected rows to a specific library folder. Selecting
+    'Auto' clears the override (same as ✖ Clear Route)."""
+    route = route_dropdown.value
+    if not route:
+        clear_route_override()
+        return
+    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
+    if not indices:
+        print("⚠️ Select the queue item(s) to route first")
+        return
+    for i in indices:
+        task = pending_queue[i]
+        task.route_override = route
+        if task.filename:
+            _route_override_cache[_match_cache_key(task.filename)] = route
+    update_queue_display()
+    label = next(l for l, v in route_dropdown.options if v == route)
+    print(f"✅ Routed {len(indices)} item(s) → {label}")
+
+def clear_route_override(b=None):
+    """Clear Route: drop the forced route for the selected rows."""
+    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
+    if not indices:
+        print("⚠️ Select the queue item(s) to clear first")
+        return
+    for i in indices:
+        task = pending_queue[i]
+        task.route_override = None
+        if task.filename:
+            _route_override_cache.pop(_match_cache_key(task.filename), None)
+    update_queue_display()
+    print(f"✖ Cleared forced route for {len(indices)} item(s) — will detect the category again")
+
+
+
+def apply_queue_changes(b=None):
+    """Validate every filled text field, then commit one edit to the selection.
+
+    Blank fields leave existing overrides untouched. Routing and clearing retain
+    their explicit buttons, so default values never silently remove overrides.
+    """
+    rows = [pending_queue[i] for i in sorted(_selected_queue_indices())
+            if 0 <= i < len(pending_queue)]
+    if not rows:
+        print('⚠️ Select the queue item(s) to edit first')
+        return
+    inputs = {
+        'match': tmdb_override_input, 'name': queue_name_input,
+        'year': queue_year_input, 'season': season_override_input,
+        'episode': renumber_start_input, 'part': part_override_input,
+    }
+    values = {key: widget.value.strip() for key, widget in inputs.items()}
+    # A hidden TMDB input must not apply a stale draft after matching is disabled.
+    if not tmdb_enabled_checkbox.value:
+        values['match'] = ''
+    if not any(values.values()):
+        print('⚠️ Fill in the fields you want to change first')
+        return
+    updates = {}
+    try:
+        if values['name'] or values['year']:
+            name = sanitize_filename(values['name'])
+            if not name:
+                raise ValueError('Enter a name with the year')
+            if values['year'] and not re.fullmatch(r'(19|20)\d{2}', values['year']):
+                raise ValueError('Year should look like 2025 (leave it empty to keep the current year)')
+            updates['name_override'] = name
+            if values['year']:
+                updates['year_override'] = values['year']
+        if values['season']:
+            if not re.fullmatch(r'\d+', values['season']):
+                raise ValueError('Enter a season number (0 = Specials)')
+            updates['season_override'] = int(values['season'])
+        episode_range = _parse_episode_range(values['episode']) if values['episode'] else None
+        if values['part'] and not re.fullmatch(r'[0-9]+', values['part']):
+            raise ValueError('Enter a part number starting from 1')
+        part = int(values['part']) if values['part'] else None
+        if part is not None and part < 1:
+            raise ValueError('Enter a part number starting from 1')
+        if (episode_range is not None or part is not None) and any(not t.filename for t in rows):
+            raise ValueError('Resolve all selected filenames before changing episode or part numbers')
+        if values['match']:
+            if not tmdb_is_enabled():
+                raise ValueError('Enable TMDB matching (Settings) and set an API key first')
+            match = _resolve_tmdb_override(values['match'])
+            if not match:
+                raise ValueError(f"No TMDB result for '{values['match']}'")
+            updates['tmdb_override'] = match
+    except ValueError as exc:
+        print(f'⚠️ {exc} — no changes applied')
+        return
+
+    # Prepare numbering before touching any tasks, then refresh the preview once.
+    parts = _number_rows_sequentially(rows, part) if part is not None else {}
+    if episode_range is not None:
+        _set_episode_overrides(rows, *episode_range)
+    for task in rows:
+        for attr, value in updates.items():
+            setattr(task, attr, value)
+        if part is not None:
+            task.part_override = parts[task.id]
+        if 'tmdb_override' in updates and task.filename:
+            _tmdb_match_cache[_match_cache_key(task.filename)] = updates['tmdb_override']
+    _apply_queue_overrides(pending_queue, merge=_running_live_batch() is not None)
+    for key, widget in inputs.items():
+        if values[key]:
+            widget.value = ''
+    update_queue_display()
+    print(f'✅ Applied changes to {len(rows)} item(s) — selection kept')
+
+
+def _map_absolute_episode(episode: int, seasons: Dict[str, int]) -> Tuple[int, int]:
+    """Convert an absolute episode number to (season, episode) using per-season
+    counts. Returns (1, episode) unchanged when mapping doesn't apply — including
+    episodes beyond TMDB's known total (a season TMDB hasn't listed yet)."""
+    if not seasons:
+        return (1, episode)
+    order = sorted(seasons, key=lambda k: int(k))
+    total = sum(seasons[k] for k in order)
+    if episode <= seasons.get('1', 0) or episode > total:
+        return (1, episode)
+    remaining = episode
+    for k in order:
+        if remaining <= seasons[k]:
+            return (int(k), remaining)
+        remaining -= seasons[k]
+    return (1, episode)
+
+def get_tmdb_match(filename: str) -> Optional[dict]:
+    """Batch-cached TMDB match for a filename (None when disabled or unmatched)."""
+    if not tmdb_is_enabled():
+        return None
+    return _tmdb_match_cache.get(_match_cache_key(filename))
+
+def analyze_batch_metadata(filenames: List[str], merge: bool = False) -> int:
+    """Match a batch of filenames against TMDB. Populates _tmdb_match_cache keyed
+    by _match_cache_key (size-suffix and subtitle-language stripped). One search per
+    distinct (kind, query, year). Returns the number of files matched."""
+    if not merge:
+        _tmdb_match_cache.clear()
+    if not tmdb_is_enabled() or not filenames:
+        return 0
+    queries: Dict[Tuple[str, str, Optional[str]], List[str]] = {}
+    for fname in filenames:
+        key = _match_cache_key(fname)  # subtitle-lang stripped so subs key like their video
+        info = detect_episode_info(key)
+        kind = 'tv' if info['episode_detected'] else 'movie'
+        year_m = re.search(r'\b(19|20)\d{2}\b', key)
+        year = year_m.group(0) if year_m else None
+        if kind == 'tv':
+            query = info['show_name']
+        else:
+            query = clean_show_name(key[:year_m.start()]) if year_m else clean_show_name(os.path.splitext(key)[0])
+        if not query or query == 'Unknown Show':
+            continue
+        queries.setdefault((kind, query, year), []).append(key)
+
+    matched = 0
+    had_error = False
+    for (kind, query, year), keys in queries.items():
+        try:
+            match = _tmdb_search(kind, query, year)
+        except Exception:
+            had_error = True
+            match = None
+        if match:
+            for key in keys:
+                if not merge or key not in _tmdb_match_cache:
+                    _tmdb_match_cache[key] = match
+                matched += 1
+    _save_tmdb_query_cache()
+    if had_error:
+        print("   ⚠️ TMDB: some lookups failed — falling back to filename parsing")
+    return matched
+
+def check_duplicate_in_drive(filename: str, source: str = "generic", playlist_index: Optional[int] = None) -> bool:
+    """Check if file already exists in Drive to avoid re-downloading"""
+    dest_path, category = determine_destination_path(filename, source, dry_run=True, playlist_index=playlist_index)
+    if os.path.exists(dest_path):
+        file_size = os.path.getsize(dest_path) / (1024 * 1024)
+        print(f"   ⏭️  SKIPPED (Already exists): {os.path.basename(dest_path)} ({file_size:.1f} MB)")
+        return True
+    # Uploaded by the API earlier this session: really in Drive, but the mount has
+    # not polled for remote changes yet, so os.path.exists above cannot see it.
+    if _drive_path_exists(dest_path):
+        print(f"   ⏭️  SKIPPED (uploaded earlier this session): {os.path.basename(dest_path)}")
+        return True
+    return False
+
+# Multi-episode continuation glued directly to a strict/NxN match: '-E03',
+# '-S01E03', 'E02' (S01E01E02), '-03', '-1x03'. Anchored — a space before the
+# tail means an episode title ('S01E05 - 12 Angry Men'), not a range.
+_MULTI_EP_TAIL = re.compile(r'(?i)^(?:[-~–—]\s*(?:S(\d{1,2})\s*)?(?:\d{1,2}x)?EP?(\d{1,4})|EP?(\d{1,4})|[-~–—]\s*(\d{1,4}))\b')
+
+def _multi_ep_end(filename: str, m, season_num: int) -> Optional[int]:
+    """End episode of a multi-episode file ('S01E01-E03', 'S01E01E02',
+    'S01E01-03', '1x01-02') read from the text directly after the strict/NxN
+    match m. None when absent or implausible: resolution/year tails, a
+    different season on the end marker, or end <= start."""
+    tail_m = _MULTI_EP_TAIL.match(filename[m.end():])
+    if not tail_m:
+        return None
+    if tail_m.group(1) is not None and int(tail_m.group(1)) != season_num:
+        return None
+    end = int(next(g for g in tail_m.groups()[1:] if g))
+    if end <= int(m.group(2)):
+        return None
+    if end in (360, 480, 540, 720, 1080, 1440, 2160, 4320) or 1900 <= end <= 2099:
+        return None
+    return end
+
+def detect_episode_info(filename: str, use_batch: bool = True) -> Dict[str, Any]:
+    """Parse a filename for episode/season/show-name markers.
+
+    Pure function (no widget/UI access) so the detection logic can be
+    unit-tested directly. Returns a dict with keys: episode_detected,
+    is_tv, season, episode, show_name, part_suffix (CJK multi-part),
+    english_part_suffix ("Part X"), has_sxe (strict SxxExx/NxN present),
+    episode_end (end of a multi-episode range, None for single episodes).
+    use_batch=False ignores prior queue analysis when resolving a new basename.
+    """
+    # CJK multi-part markers always apply (these genuinely split one episode into parts)
+    part_suffix = ""
+    if "上篇" in filename: part_suffix = "-pt1"
+    elif "下篇" in filename: part_suffix = "-pt2"
+    elif "中篇" in filename: part_suffix = "-pt2"
+    # English "Part X" detected separately — only applied when no SxxExx/NxN pattern exists
+    # (e.g. "S01E25 - The Real Folk Blues (Part 1)" → Part 2 is S01E26, not S01E25-pt2)
+    english_part_suffix = ""
+    if re.search(r'(?i)(?:Part|Pt)\.?\s*1\b', filename): english_part_suffix = "-pt1"
+    elif re.search(r'(?i)(?:Part|Pt)\.?\s*2\b', filename): english_part_suffix = "-pt2"
+
+    # Episode RANGE markers (EP01-70, E01-E24) name batch packs, not one episode —
+    # without this, 'Show.EP01-70.../01.mp4' reads as episode 1 for every file.
+    # Mask the range with same-length spaces (indices stay aligned) so per-file
+    # numbers elsewhere drive detection, and keep its start as a show-name boundary.
+    range_m = re.search(r'(?i)\b(?:Ep?|Episode)[ ._-]?(\d{1,4})\s*[-~–—]\s*(?:Ep?|Episode)?[ ._]?(\d{1,4})\b', filename)
+    if range_m and int(range_m.group(2)) > int(range_m.group(1)):
+        filename = filename[:range_m.start()] + ' ' * (range_m.end() - range_m.start()) + filename[range_m.end():]
+    else:
+        range_m = None
+    def _name_cut(idx: int) -> int:
+        """Show name ends at the first marker — episode match or masked range."""
+        return min(idx, range_m.start()) if range_m else idx
+
+    f_ext = os.path.splitext(filename)[1]
+    def _name_after(marker_end: int) -> str:
+        """Show name read from AFTER the episode marker — for marker-first names
+        ('1x02 - Chernobyl [x265].mkv') where nothing usable precedes it."""
+        tail = filename[marker_end:]
+        if f_ext and tail.lower().endswith(f_ext.lower()):
+            tail = tail[:-len(f_ext)]
+        return clean_show_name(tail) if len(tail.strip(' ._-')) > 2 else "Unknown Show"
+
+    show_name = "Unknown Show"
+    
+    # Optional 'P' after the E covers the SxxEPyy style (e.g. S02EP05 = S02E05); the
+    # glued 'EP' otherwise breaks both this and the loose \bEP pattern, so the episode
+    # goes undetected and every file in a season collapses to E01 (skipped as dupes).
+    # The (?=EP?\d) alternative lets glued double-episode names (S01E01E02) match
+    # their first episode — \b alone fails between the digits and the second E.
+    sxe_strict = re.search(r'(?i)\bS(\d{1,2})EP?(\d{1,4})(?:v\d+)?(?:\b|(?=EP?\d))', filename)
+    # NNxNN pattern: matches 01x05, 1x03, 02x15, etc. (common TV naming convention)
+    sxe_nxn = re.search(r'(?i)\b(\d{1,2})x(\d{1,4})\b', filename)
+    # Added Vietnamese "Tập", Korean "화", Portuguese "Episodio", and more flexible episode patterns
+    sxe_loose = re.search(r'(?i)(?:\b(?:Ep?|Episode|Episodio|Tập|Tập phim|Folge|Capitulo|Cap)[ .\-_]?(\d{1,4})\b|[|\-–—]\s*(?:Ep?|Episode|Tập)?\s*(\d{1,4})\s*[|\]]?)', filename)
+    sxe_asian = re.search(r'(?:第(\d+)[集話]|(\d+)화)', filename)
+    
+    # Bracketed episode pattern: matches [01], [02], [0724], etc. common in fansub releases
+    # Filters out resolution tags [1080P/720P/etc], codec tags [HEVC-10b/x265/etc], and source tags
+    sxe_bracket = None
+    bracket_matches = list(re.finditer(r'\[(\d{1,4})\]', filename))
+    for bm in bracket_matches:
+        num = int(bm.group(1))
+        # Skip if it looks like a resolution (360, 480, 720, 1080, 2160, etc.) 
+        # or a year (1900-2099) or a bit depth suffix like "10b" in [HEVC-10b]
+        if num in (360, 480, 540, 720, 1080, 1440, 2160, 4320):
+            continue
+        if 1900 <= num <= 2099:
+            continue
+        # Check if this bracket is part of a codec tag like [HEVC-10b] or [x264-10bit]
+        # Look for pattern where number is preceded by hyphen inside the bracket context
+        bracket_content_before = filename[max(0, bm.start()-20):bm.start()]
+        if re.search(r'\[[^\]]*-$', bracket_content_before):
+            continue  # Skip, it's likely a suffix like -10b
+        # This looks like a valid episode number
+        sxe_bracket = bm
+        break
+    
+    # Trailing number pattern: catches "HD 01", "Show Name 05", "filename - 03" before extension
+    # Uses negative lookbehind to avoid matching years (19xx, 20xx) and resolutions (1080, 720, etc.)
+    base_name = os.path.splitext(filename)[0]  # Remove extension for cleaner matching
+    sxe_trailing = re.search(r'(?<![12]\d{2})(?<!x)\b(\d{1,4})\s*$', base_name)
+    # Filter out likely years or resolutions captured by trailing pattern
+    if sxe_trailing:
+        num = int(sxe_trailing.group(1))
+        # Reject if it looks like a year (1900-2099) or resolution (360, 480, 720, 1080, 2160, etc.)
+        if 1900 <= num <= 2099 or num in (360, 480, 540, 720, 1080, 1440, 2160, 4320):
+            sxe_trailing = None
+    
+    # Underscore-dash pattern: handles _-_01_ or - 1042 format (common in high-episode anime)
+    # Negative lookahead (?![xX]\d) prevents matching the season part of NNxNN patterns
+    sxe_underscore = re.search(r'[-–—]_?(\d{1,4})(?![xX]\d)(?:_|\(|\s|$)', filename)
+    
+    # Space-separated pattern: handles "Show Name 01 Title" or "Show Name 0724 [Tag]" format
+    # Exclude "Part X" which indicates movie sequels, not episodes
+    sxe_space = re.search(r'(?:^|[\s_])(\d{1,4})(?=\s+[A-Za-z\[])', filename)
+    if sxe_space:
+        num = int(sxe_space.group(1))
+        # Check if preceded by "Part" - indicates movie, not episode
+        pre_match = filename[:sxe_space.start() + 1]
+        if re.search(r'(?i)\bPart\s*$', pre_match):
+            sxe_space = None
+        elif num in (360, 480, 540, 720, 1080, 1440, 2160, 4320) or 1900 <= num <= 2099:
+            sxe_space = None
+
+    season_num, episode_num = 1, 1
+    is_tv = False
+    episode_detected = False
+
+    # PRIORITY 1: Use batch-detected episode if available (most reliable)
+    batch_ep = get_batch_episode(filename) if use_batch else None
+    if batch_ep is not None:
+        episode_num = batch_ep
+        is_tv = True
+        episode_detected = True
+        # For show name, find the episode marker position
+        # Handle: [01], " 01 ", "0724 [Tag]", "- 01", "_-_01_", "01x05" (NNxNN)
+        # Try NNxNN pattern first (extracts both season and episode marker position)
+        nxn_marker = re.search(r'(?i)\b(\d{1,2})x0*' + str(batch_ep) + r'\b', filename)
+        ep_marker = None
+        if nxn_marker:
+            season_num = int(nxn_marker.group(1))
+            show_name = clean_show_name(filename[:_name_cut(nxn_marker.start())])
+        else:
+            ep_marker = re.search(r'\[0*' + str(batch_ep) + r'\]|(?:^|\s)0*' + str(batch_ep) + r'(?=\s+[A-Za-z\[])|[-–—]_?0*' + str(batch_ep) + r'(?:[_\s\.\(\[]|$)', filename)
+            if ep_marker:
+                show_name = clean_show_name(filename[:_name_cut(ep_marker.start())])
+            else:
+                show_name = clean_show_name(filename[:_name_cut(len(filename))])
+        # Marker-first names: nothing usable before the marker — look after it
+        marker = nxn_marker or ep_marker
+        if marker is not None and (show_name == 'Unknown Show' or len(show_name) < 2):
+            show_name = _name_after(marker.end())
+    
+    # PRIORITY 2: Fall back to regex pattern matching if batch detection didn't find it
+    if not episode_detected:
+        # Collect all valid matches and find the earliest one to split correctly
+        matches = []
+        if sxe_strict: matches.append({'m': sxe_strict, 'type': 'strict', 'idx': sxe_strict.start(), 'priority': 1})
+        if sxe_nxn: matches.append({'m': sxe_nxn, 'type': 'nxn', 'idx': sxe_nxn.start(), 'priority': 1})
+        # Bracketed episode numbers have high priority (common in fansub releases)
+        if sxe_bracket: matches.append({'m': sxe_bracket, 'type': 'bracket', 'idx': sxe_bracket.start(), 'priority': 1})
+        if sxe_loose: matches.append({'m': sxe_loose, 'type': 'loose', 'idx': sxe_loose.start(), 'priority': 2})
+        if sxe_asian: matches.append({'m': sxe_asian, 'type': 'asian', 'idx': sxe_asian.start(), 'priority': 2})
+        # Underscore pattern: use if higher priority patterns not found
+        if sxe_underscore and not matches: 
+            matches.append({'m': sxe_underscore, 'type': 'underscore', 'idx': sxe_underscore.start(), 'priority': 3})
+        # Space pattern: use if higher priority patterns not found
+        if sxe_space and not matches: 
+            matches.append({'m': sxe_space, 'type': 'space', 'idx': sxe_space.start(), 'priority': 3})
+        # Trailing pattern is lowest priority - only use if no other patterns found
+        if sxe_trailing and not matches: 
+            matches.append({'m': sxe_trailing, 'type': 'trailing', 'idx': sxe_trailing.start(), 'priority': 4})
+    
+        if matches:
+            # Sort by start index to find the FIRST occurrence (splitting show name from episode info)
+            best = min(matches, key=lambda x: x['idx'])
+            match, m_type = best['m'], best['type']
+            
+            if m_type == 'strict':
+                season_num, episode_num = int(match.group(1)), int(match.group(2))
+            elif m_type == 'nxn':
+                season_num, episode_num = int(match.group(1)), int(match.group(2))
+            elif m_type == 'bracket':
+                episode_num = int(match.group(1))
+            elif m_type == 'loose':
+                ep_num = match.group(1) or match.group(2)
+                episode_num = int(ep_num) if ep_num else 1
+            elif m_type == 'asian':
+                ep_num = match.group(1) or match.group(2)
+                episode_num = int(ep_num) if ep_num else 1
+            elif m_type == 'underscore':
+                episode_num = int(match.group(1))
+            elif m_type == 'space':
+                episode_num = int(match.group(1))
+            elif m_type == 'trailing':
+                episode_num = int(match.group(1))
+                
+            # An explicit SxxEyy/NxN anywhere in the name outranks the value read
+            # from an earlier loose/absolute number ('Show - 28 - S02E01v2' is
+            # S02E01, not E28) — the earliest match still splits the show name.
+            if m_type not in ('strict', 'nxn'):
+                if sxe_strict:
+                    season_num, episode_num = int(sxe_strict.group(1)), int(sxe_strict.group(2))
+                elif sxe_nxn:
+                    season_num, episode_num = int(sxe_nxn.group(1)), int(sxe_nxn.group(2))
+
+            # For trailing pattern, use base_name (without extension) for show name extraction
+            name_source = base_name if m_type == 'trailing' else filename
+            show_name = clean_show_name(name_source[:_name_cut(match.start())])
+            # Marker-first names ('1x02 - Chernobyl [x265].mkv') have nothing usable
+            # before the marker — read the show name from the text after it instead
+            if show_name == 'Unknown Show' or len(show_name) < 2:
+                show_name = _name_after(match.end())
+                
+            is_tv = True
+            episode_detected = True
+
+    # Multi-episode range (S01E01-E03 → 3): only when the strict/NxN marker is
+    # what actually set the episode — a batch-detected number means the marker
+    # was a pack label, so its glued range is not this file's span
+    episode_end = None
+    span_src = sxe_strict or sxe_nxn
+    if episode_detected and span_src is not None and episode_num == int(span_src.group(2)):
+        episode_end = _multi_ep_end(filename, span_src, season_num)
+
+    return {
+        'episode_detected': episode_detected,
+        'is_tv': is_tv,
+        'season': season_num,
+        'episode': episode_num,
+        'show_name': show_name,
+        'part_suffix': part_suffix,
+        'english_part_suffix': english_part_suffix,
+        'has_sxe': bool(sxe_strict or sxe_nxn),
+        'episode_end': episode_end,
+    }
+
+def determine_destination_path(filename: str, source: str = "generic", dry_run: bool = False, playlist_index: Optional[int] = None) -> Tuple[str, str]:
+    filename = sanitize_filename(filename)
+    
+    # If auto-organise is disabled, just return Downloads folder with original filename
+    if not is_auto_organize_enabled():
+        downloads_dir = os.path.join(DRIVE_BASE, get_downloads_path())
+        if not dry_run: _ensure_dest_dir(downloads_dir)  # API path owns folder creation
+        return os.path.join(downloads_dir, filename), "Downloads"
+
+    # 🎯 Route as 'Downloads (as-is)': keep the original name, skip organising —
+    # the per-file version of switching auto-organise off
+    route_ov = get_route_override(filename)
+    if route_ov == 'downloads':
+        downloads_dir = os.path.join(DRIVE_BASE, get_downloads_path())
+        if not dry_run: _ensure_dest_dir(downloads_dir)  # API path owns folder creation
+        return os.path.join(downloads_dir, filename), "Downloads"
+    # Parse episode/show info from the filename (pure logic, unit-testable)
+    info = detect_episode_info(filename)
+    part_suffix = info['part_suffix']
+    english_part_suffix = info['english_part_suffix']
+    show_name = info['show_name']
+    season_num, episode_num = info['season'], info['episode']
+    episode_end = info['episode_end']  # multi-episode file (S01E01-E03), else None
+    is_tv = info['is_tv']
+    episode_detected = info['episode_detected']
+
+    # Manual name/year (queue ✏️ Force Name) — the manual counterpart of a TMDB match
+    name_ov = get_name_override(filename)
+    manual_show_name = name_ov[0] if name_ov else ''
+    manual_year = name_ov[1] if name_ov else ''
+
+    # 🎯 Route override decides movie-vs-series regardless of filename detection
+    if route_ov in ('movie', 'anime_movie'):
+        is_tv = False
+        episode_detected = False  # Treat as movie, ignore detected episode
+    elif route_ov in ('tv', 'anime_series'):
+        is_tv = True
+        if not episode_detected:
+            episode_num = 1  # Default to E01 if no episode detected
+
+    # Manual season override (queue 🗂️ Force Season) wins over filename parsing and
+    # TMDB mapping — the parsed number stays the episode, only the season is forced
+    season_ov = get_season_override(filename)
+    if season_ov is not None:
+        season_num = season_ov
+
+    # Manual renumbering (queue 🔢 Renumber) wins over every episode source, and
+    # marks the file as an episode even when detection found none
+    episode_ov = get_episode_override(filename)
+    if episode_ov is not None:
+        episode_num = episode_ov
+        # A renumber replaces the episode identity outright: a plain number makes
+        # the file a single episode, a range (🔢 7-9) makes it span E07-E09
+        episode_end = get_episode_end_override(filename)
+        is_tv = True
+        if not episode_detected:
+            episode_detected = True
+            # Nothing was parsed from the name, so 'Unknown Show' would become the
+            # folder — use the cleaned filename stem instead (Force Name still wins)
+            if show_name == 'Unknown Show':
+                show_name = clean_show_name(os.path.splitext(filename)[0]) or show_name
+
+    # TMDB metadata (populated by analyze_batch_metadata at queue/quick/resume time).
+    # Library family is a separate axis from naming: Force Name replaces the display
+    # identity but keeps a confident anime classification. An explicit Route always
+    # wins, including TV/Movie routes that deliberately force the standard libraries.
+    metadata_match = get_tmdb_match(filename)
+    effective_kind = 'tv' if (is_tv or episode_detected) else 'movie'
+    is_anime = resolve_library_is_anime(route_ov, metadata_match, effective_kind)
+    tmdb_match = None if manual_show_name else metadata_match
+    tmdb_tv_year = ''
+    if tmdb_match and tmdb_match['type'] == 'tv' and (is_tv or episode_detected):
+        show_name = tmdb_match['name']
+        tmdb_tv_year = tmdb_match['year']
+        # Absolute-numbering conversion (e.g. "One Piece - 1085" → S19Exx) applies only
+        # when the filename carried no explicit SxxExx/NxN season marker, no season is
+        # manually forced, and Numbering is 'Season match' (not 'Absolute')
+        if (episode_detected and not info['has_sxe'] and season_num == 1
+                and season_ov is None and episode_ov is None
+                and episode_numbering_toggle.value == 'Season match'):
+            season_num, episode_num = _map_absolute_episode(episode_num, tmdb_match.get('seasons') or {})
+
+    # Apply Force Name override - affects both TV shows and movies
+    if manual_show_name:
+        if is_tv or episode_detected:
+            # TV show: use forced name as show name
+            show_name = manual_show_name
+            if not episode_detected and playlist_index is not None:
+                episode_num = playlist_index
+        else:
+            # Movie: use forced name as folder/file name
+            folder_name = f"{manual_show_name} ({manual_year})" if manual_year else manual_show_name
+            _, ext = os.path.splitext(filename)
+            new_filename = f"{manual_show_name}{ext}"
+            if is_anime:
+                full_dir = os.path.join(f"{DRIVE_BASE}{get_anime_movies_path()}", folder_name)
+                if not dry_run: _ensure_dest_dir(full_dir)  # API path owns folder creation
+                return os.path.join(full_dir, new_filename), "Anime Movies"
+            else:
+                full_dir = os.path.join(f"{DRIVE_BASE}{get_movie_path()}", folder_name)
+                if not dry_run: _ensure_dest_dir(full_dir)  # API path owns folder creation
+                return os.path.join(full_dir, new_filename), "Movies"
+    elif is_tv:
+        pass  # Continue to TV show path generation below
+    else:
+        # No Force Name, not TV - detect movie (TMDB match wins over filename parsing)
+        if tmdb_match and tmdb_match['type'] == 'movie':
+            movie_name = tmdb_match['name']
+            folder_name = f"{movie_name} ({tmdb_match['year']})" if tmdb_match['year'] else movie_name
+        else:
+            year_match = re.search(r'\b(19|20)\d{2}\b', filename)
+            if year_match:
+                movie_name = clean_show_name(filename[:year_match.start()])
+                year = year_match.group(0)
+                folder_name = f"{movie_name} ({year})"
+            elif source == "youtube":
+                return os.path.join(f"{DRIVE_BASE}{get_youtube_path()}", filename), "YouTube"
+            else:
+                movie_name = clean_show_name(os.path.splitext(filename)[0])
+                folder_name = movie_name
+        _, ext = os.path.splitext(filename)
+        # Year goes on the folder only — the file keeps just the movie name
+        new_filename = f"{movie_name}{ext}"
+        # Pick the library family resolved from TMDB metadata or the manual route
+        if is_anime:
+            full_dir = os.path.join(f"{DRIVE_BASE}{get_anime_movies_path()}", folder_name)
+            if not dry_run: _ensure_dest_dir(full_dir)  # API path owns folder creation
+            return os.path.join(full_dir, new_filename), "Anime Movies"
+        else:
+            full_dir = os.path.join(f"{DRIVE_BASE}{get_movie_path()}", folder_name)
+            if not dry_run: _ensure_dest_dir(full_dir)  # API path owns folder creation
+            return os.path.join(full_dir, new_filename), "Movies"
+
+    _, ext = os.path.splitext(filename)
+    # Apply English part suffix only when no SxxExx/NxN pattern was detected and the
+    # episode wasn't manually renumbered — either one already uniquely identifies the
+    # episode (Part 2 is typically the next episode, or the user assigned it a number)
+    if english_part_suffix and not info['has_sxe'] and episode_ov is None:
+        part_suffix = part_suffix or english_part_suffix
+    # Manual part override (queue 📎 Set Part / ✖ No Part) wins over all detection
+    part_ov = get_part_override(filename)
+    if part_ov is not None:
+        part_suffix = f"-pt{part_ov}" if part_ov else ""
+    # Multi-episode files keep their span in the Plex convention (S01E01-E03)
+    ep_span = f"-E{episode_end:02d}" if episode_end and episode_end > episode_num else ""
+    new_filename = f"{show_name} - S{season_num:02d}E{episode_num:02d}{ep_span}{part_suffix}{ext}"
+    season_folder = "Specials" if season_num == 0 else f"Season {season_num:02d}"
+    # Append year to show folder name only (file name stays without year)
+    folder_year = manual_year or tmdb_tv_year
+    show_folder = f"{show_name} ({folder_year})" if folder_year else show_name
+    
+    # Pick the library family resolved from TMDB metadata or the manual route
+    if is_anime:
+        base_path = f"{DRIVE_BASE}{get_anime_series_path()}"
+        full_dir = os.path.join(base_path, show_folder, season_folder)
+        if not dry_run: _ensure_dest_dir(full_dir)  # API path owns folder creation
+        return os.path.join(full_dir, new_filename), "Anime Series"
+    else:
+        base_path = f"{DRIVE_BASE}{get_tv_path()}"
+        full_dir = os.path.join(base_path, show_folder, season_folder)
+        if not dry_run: _ensure_dest_dir(full_dir)  # API path owns folder creation
+        return os.path.join(full_dir, new_filename), "TV"
+
+# --- CORE LOGIC ---
+def setup_environment(needs_mega, needs_ytdlp, needs_aria, during_active=False):
+    drive_path = f"{COLAB_ROOT}drive"
+    if drive is not None and not os.path.exists(drive_path): drive.mount(drive_path)
+    
+    # Try to load secrets again (may not have been accessible on initial load)
+    if not during_active:
+        check_and_load_secrets()
+    
+    # Restore saved settings now that Drive (and settings.json) is finally readable —
+    # the startup load ran before the mount and found nothing. Widgets the user already
+    # changed this session keep their values; then save once so choices made before the
+    # mount (unsaveable at the time — no Drive) are persisted too.
+    if not during_active:
+        load_dir_settings()
+        save_dir_settings()
+
+    # Drive API auth happens here, on the main thread: Colab renders a consent
+    # prompt, and settings (which decide whether the API is wanted at all) have
+    # only just been restored above.
+    if drive_api_checkbox.value and not during_active:
+        _init_drive_api()
+    
+    # Create media folders and config folder
+    for p in [get_tv_path(), get_movie_path(), get_youtube_path()]:
+        full_p = f"{DRIVE_BASE}{p}"
+        _ensure_dest_dir(full_p)
+    if not os.path.exists(UD_CONFIG_PATH): os.makedirs(UD_CONFIG_PATH)
+    
+    if needs_ytdlp and (not during_active or not shutil.which('yt-dlp')):
+        # Always upgrade yt-dlp to latest version (YouTube changes frequently)
+        print("🛠️ Installing/updating yt-dlp...")
+        subprocess.run(["pip", "install", "-U", "yt-dlp"], check=True, stdout=subprocess.DEVNULL)
+    else:
+        print("⭐️ Skipping yt-dlp setup (already available or not needed)")
+
+    pkg_map = {
+        "unrar": "unrar", 
+        "p7zip-full": "7z", 
+        "megatools": "megadl", 
+        "aria2": "aria2c", 
+        "ffmpeg": "ffmpeg"
+    }
+    
+    needed_pkgs = ["unrar", "p7zip-full"]
+    if needs_mega: needed_pkgs.append("megatools")
+    if needs_aria: needed_pkgs.append("aria2")
+    if needs_ytdlp: needed_pkgs.append("ffmpeg")
+    
+    to_install = [pkg for pkg in needed_pkgs if not shutil.which(pkg_map[pkg])]
+
+    if to_install:
+        print(f"🛠️ Installing tools: {', '.join(to_install)}...")
+        subprocess.run(["apt-get", "update", "-qq"], check=False)
+        subprocess.run(["apt-get", "install", "-y"] + to_install, 
+                       check=True, stdout=subprocess.DEVNULL)
+    else:
+        print("✅ Required tools already present.")
+    
+    check_resume_available()
+
+def ytdl_hook(d):
+    if d['status'] == 'downloading':
+        try:
+            p = d.get('_percent_str', '0%').replace('%','')
+            speed = d.get('_speed_str', 'N/A')
+            with progress_lock:
+                progress_bar.value = float(p)
+                progress_bar.description = f"YT: {p}% ({speed})"
+        except Exception: pass
+    elif d['status'] == 'finished':
+        with progress_lock:
+            progress_bar.value = 100
+            progress_bar.description = "Done!"
+
+def get_youtube_title(url: str) -> str:
+    """Quickly fetch video/playlist title for queue display."""
+    try:
+        import yt_dlp
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': True,  # Don't download, just get metadata
+            'skip_download': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info:
+                title = info.get('title', '')
+                # For playlists, show playlist name + count
+                if info.get('_type') == 'playlist':
+                    count = len(info.get('entries', []))
+                    return f"📋 {title} ({count} videos)"
+                return title[:60] + "..." if len(title) > 60 else title
+    except Exception:
+        pass
+    return ""  # Fall back to showing URL
+
+def resolve_youtube_playlist(url: str) -> List[DownloadTask]:
+    """Expand a YouTube playlist URL into individual video DownloadTasks for queue display.
+    For single videos, returns a single-element list.
+    Uses extract_flat for fast metadata-only extraction.
+    """
+    try:
+        import yt_dlp
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': True,  # Fast: get metadata without full extraction
+            'skip_download': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info and info.get('_type') == 'playlist':
+                entries = [e for e in info.get('entries', []) if e is not None]
+                playlist_title = info.get('title', 'Playlist')
+                tasks = []
+                for i, entry in enumerate(entries, 1):
+                    video_title = entry.get('title', f'Video {i}')
+                    video_url = entry.get('url') or entry.get('webpage_url') or entry.get('id', '')
+                    if video_url and not video_url.startswith('http'):
+                        video_url = f"https://www.youtube.com/watch?v={video_url}"
+                    display = f"[{i}/{len(entries)}] {video_title}"
+                    if len(display) > 60:
+                        display = display[:57] + "..."
+                    tasks.append(DownloadTask(
+                        url=video_url, filename=display,
+                        source="youtube", link_type="youtube",
+                        original_url=url  # Store original playlist URL
+                    ))
+                if tasks:
+                    print(f"   📋 Expanded playlist '{playlist_title}': {len(tasks)} videos")
+                return tasks
+            elif info:
+                # Single video — return as-is
+                title = info.get('title', '')
+                display = title[:60] + "..." if len(title) > 60 else title
+                return [DownloadTask(
+                    url=url, filename=display or url[:50] + "...",
+                    source="youtube", link_type="youtube"
+                )]
+    except Exception as e:
+        print(f"   ⚠️ Could not expand YouTube link: {e}")
+    # Fallback: return single task with URL
+    return [DownloadTask(url=url, filename=url[:50] + "...", source="youtube", link_type="youtube")]
+
+
+def get_youtube_subtitles(url: str) -> dict:
+    """Fetch available manual subtitles (not auto-generated) from YouTube video.
+    Returns dict of {lang_code: lang_name} or empty dict if none available.
+    """
+    try:
+        import yt_dlp
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+            'writesubtitles': True,
+            'listsubtitles': False,  # We'll get them from info dict
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info:
+                # For playlists, get subs from first available entry
+                if info.get('_type') == 'playlist':
+                    entries = info.get('entries', [])
+                    for entry in entries:
+                        if entry and entry.get('subtitles'):
+                            info = entry
+                            break
+                    else:
+                        return {}
+                
+                # Get manual subtitles only (not automatic_captions)
+                subtitles = info.get('subtitles', {})
+                if not subtitles:
+                    return {}
+                
+                # Build {code: name} dict
+                result = {}
+                for lang_code, formats in subtitles.items():
+                    # Skip if it's a weird format or live_chat
+                    if lang_code.startswith('live_chat'):
+                        continue
+                    # Get language name from first format or use code
+                    lang_name = formats[0].get('name', lang_code) if formats else lang_code
+                    # Clean up: "English" not "English - en"
+                    if ' - ' in lang_name:
+                        lang_name = lang_name.split(' - ')[0]
+                    result[lang_code] = lang_name
+                return result
+    except Exception:
+        pass
+    return {}
+
+def process_youtube_link(url, mode="video", apply_playlist_range=True) -> Tuple[int, int, int]:
+    """Process YouTube link. Returns (success_count, fail_count, total_count).
+    
+    Args:
+        url: YouTube URL to process
+        mode: 'video' or 'subtitles'
+        apply_playlist_range: If False, download all items (ignore playlist_selection)
+    """
+    import yt_dlp
+    print(f"   ▶️ Processing Video: {url}")
+    if not _wait_for_disk_space(DISK_START_GB, label="YouTube download"):
+        return (0, 1, 1)
+    with progress_lock:
+        progress_bar.value = 0
+        progress_bar.description = "Starting..."
+    
+    success_count = 0
+    fail_count = 0
+    skip_count = 0
+    
+    archive_path = f"{UD_CONFIG_PATH}yt_history.txt"
+    # Only apply playlist range if flag is True and user provided a range
+    playlist_items = normalize_playlist_range(playlist_selection.value) if apply_playlist_range else None
+    
+    ydl_opts = {
+        'outtmpl': {
+            'default': f'{COLAB_ROOT}%(title)s.%(ext)s',
+            'subtitle': f'{COLAB_ROOT}%(title)s.%(ext)s',  # Match video naming for subtitles
+        },
+        'quiet': True, 'no_warnings': True, 
+        'restrictfilenames': False, 
+        'ignoreerrors': True, 
+        'writesubtitles': True, 
+        'subtitleslangs': [f'{lang}.*' if lang == 'en' else lang for lang in subtitle_langs.value] or ['en'],  # Use selected languages 
+        'subtitlesformat': 'srt', 
+        'progress_hooks': [ytdl_hook], 
+        'noprogress': True,
+        'download_archive': archive_path,
+    }
+    
+    if playlist_items:
+        ydl_opts['playlist_items'] = playlist_items
+        print(f"   🎯 Playlist filter: {playlist_items}")
+    
+    # Experimental: Use cookies if available (may cause issues - use Clear Cookies if errors occur)
+    if os.path.exists(COOKIE_PATH): 
+        print(f"      🍪 Cookies detected (experimental)")
+        ydl_opts['cookiefile'] = COOKIE_PATH
+    
+    if mode == "video":
+        # Best quality available (including 4K), with fallback to combined formats
+        ydl_opts['format'] = 'bestvideo+bestaudio/best'
+        ydl_opts['merge_output_format'] = 'mkv'
+    else:
+        ydl_opts['skip_download'] = True
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            try: 
+                info = ydl.extract_info(url, download=False)
+            except Exception as e:
+                print(f"   ❌ YouTube Error: {str(e)[:100]}")
+                return (0, 1, 1)
+            if not info: 
+                return (0, 1, 1)
+            
+            # Get entries, filtering out None values (unavailable videos)
+            if 'entries' in info:
+                raw_entries = list(info['entries'])
+                entries = [e for e in raw_entries if e is not None]
+                none_count = len(raw_entries) - len(entries)
+                if none_count > 0:
+                    print(f"   ⚠️ {none_count} videos unavailable in playlist")
+                    fail_count += none_count
+            else:
+                entries = [info]
+            
+            total_items = len(entries)
+            print(f"   📜 Processing {total_items} item(s)...")
+            
+            for i, entry in enumerate(entries, 1):
+                if _cancel_requested:
+                    print(f"      🛑 Stopped — skipping remaining {total_items - i + 1} item(s)")
+                    break
+                if not entry:
+                    fail_count += 1
+                    continue
+                
+                # For playlists, entries may have shallow metadata - extract full info per video
+                video_url = entry.get('webpage_url') or entry.get('url') or entry.get('id')
+                if not video_url:
+                    print(f"      [{i}/{total_items}] ⚠️ Skipped: No valid URL found")
+                    fail_count += 1
+                    continue
+                
+                # If entry looks like shallow metadata (no formats), fetch full info
+                if 'formats' not in entry and 'id' in entry:
+                    try:
+                        entry = ydl.extract_info(video_url, download=False) or entry
+                    except Exception:
+                        pass  # Fall back to shallow entry if extraction fails
+                
+                title = entry.get('title', 'Unknown')
+                ext = 'mkv' if mode == "video" else 'srt'
+                temp_filename = f"{title}.{ext}"
+                if check_duplicate_in_drive(temp_filename, source="youtube", playlist_index=i):
+                    skip_count += 1
+                    continue
+                
+                print(f"      [{i}/{total_items}] Downloading: {title}")
+                
+                try:
+                    before = set(os.listdir(COLAB_ROOT))
+                    ydl.download([entry.get('webpage_url', entry.get('url'))])
+                    after = set(os.listdir(COLAB_ROOT))
+                    new_files = list(after - before)
+                    
+                    if not new_files:
+                        fail_count += 1
+                        continue
+                    for f in new_files:
+                        if f.endswith(('.part', '.ytdl')): continue
+                        handle_file_processing(os.path.join(COLAB_ROOT, f), source="youtube")
+                    success_count += 1
+                except Exception as e:
+                    print(f"      ❌ Failed to download {title}: {str(e)[:80]}")
+                    fail_count += 1
+    except Exception as e:
+        print(f"   ❌ YouTube processing failed: {str(e)[:100]}")
+        return (success_count, fail_count + 1, success_count + fail_count + skip_count + 1)
+    
+    with progress_lock:
+        progress_bar.description = "Idle"
+    
+    total = success_count + fail_count + skip_count
+    return (success_count, fail_count, total)
+
+def process_mega_link(url) -> bool:
+    """Process Mega.nz download. Returns True on success, False on failure."""
+    print(f"   ☁️ Processing Mega: {url}")
+    if not _wait_for_disk_space(DISK_START_GB, label="Mega download"):
+        return False
+    with progress_lock:
+        progress_bar.description = "Mega DL..."
+        progress_bar.value = 0
+        progress_bar.bar_style = 'info'
+    # megadl can't handle /folder/.../file/... URLs — strip /file/ID to download entire folder
+    dl_url = url
+    folder_file_match = re.match(r'(https?://mega\.nz/folder/[^/]+#[^/]+)/file/.+', url)
+    if folder_file_match:
+        dl_url = folder_file_match.group(1)
+        print(f"   📦 Folder/file link detected — downloading entire folder")
+    
+    cmd = ['megadl', '--path', COLAB_ROOT, dl_url]
+    success = False
+    # Snapshot files before download to detect silent failures
+    skip_names = {'sample_data', '.config', 'drive', 'temp_extract', 'cookies.txt'}
+    try:
+        files_before = set(os.listdir(COLAB_ROOT))
+    except Exception:
+        files_before = set()
+    try:
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
+        mega_proc_key = f"mega_{str(uuid4())[:8]}"
+        _register_proc(mega_proc_key, process)
+        last_speed = ""
+        for line in process.stdout:
+            match = re.search(r'(\d+\.\d+)%', line)
+            speed_match = re.search(r'(\d+\.?\d*\s*[KMG]B/s)', line)
+            if match:
+                try:
+                    val = float(match.group(1))
+                    speed_str = speed_match.group(1) if speed_match else last_speed
+                    if speed_match: last_speed = speed_str
+                    with progress_lock:
+                        progress_bar.value = val
+                        progress_bar.description = f"Mega: {int(val)}% ({speed_str})"
+                except Exception: pass
+        process.wait()
+        _unregister_proc(mega_proc_key)
+        if _cancel_requested:
+            return False  # Terminated by Stop
+        if process.returncode == 0:
+            # Verify files were actually downloaded (megadl can exit 0 for unsupported folder/file URLs)
+            try:
+                files_after = set(os.listdir(COLAB_ROOT))
+            except Exception:
+                files_after = set()
+            new_files = [f for f in (files_after - files_before) if f not in skip_names]
+            if new_files:
+                print("   ✅ Mega Download Complete")
+                with progress_lock:
+                    progress_bar.value = 100
+                for f in new_files:
+                    handle_file_processing(os.path.join(COLAB_ROOT, f), source="mega")
+                success = True
+            else:
+                print("   ❌ Mega: megadl exited OK but no files were downloaded")
+                print("   💡 Tip: Folder/file links may not be supported by megadl. Try using Real-Debrid.")
+        else: 
+            print(f"   ❌ Mega Error (Code {process.returncode}) - Possible causes: Invalid link, auth required, or file not found")
+    except Exception as e: 
+        print(f"   ❌ Mega Execution Error: {e}")
+    with progress_lock:
+        progress_bar.bar_style = 'info'
+    return success
+
+def _speed_to_mbs(value: float, unit: str) -> float:
+    """Convert a speed value with a K/M/G unit prefix to MB/s."""
+    if unit == 'K': return value / 1024
+    if unit == 'G': return value * 1024
+    return value
+
+def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optional[str] = None,
+                        task_id: Optional[str] = None, update_bar: bool = True,
+                        url_refresh: Optional[Callable[[], str]] = None) -> Optional[str]:
+    """Thread-safe aria2 download with progress tracking.
+
+    update_bar=False leaves the shared progress bar to the batch monitor thread
+    (parallel downloads); sequential callers keep direct bar updates.
+
+    url_refresh re-mints time-limited debrid URLs between attempts. Retrying the
+    same expired URL can never succeed, so callers that retain a stable item/file
+    reference pass this and each retry gets a live link.
+    """
+    filename = sanitize_filename(filename)
+
+    # Safeguard: if filename is empty, extract from URL
+    if not filename or not filename.strip():
+        filename = os.path.basename(unquote(urlparse(url).path)) or "download"
+        filename = sanitize_filename(filename)
+        if not filename or not filename.strip():
+            filename = f"download_{int(time.time())}"
+
+    if check_duplicate_in_drive(filename):
+        return DUPLICATE_SKIP
+
+    final_path = os.path.join(dest_folder, filename)
+    # A file already sitting at final_path is only genuinely complete if aria2 left
+    # NO .aria2 control file beside it. A large partial WITH a control file — the disk
+    # guard terminating aria2, a give-up, or a runtime restart mid-download — must not
+    # be treated as done, or a truncated video moves to Drive as if complete. Fall
+    # through so the aria2 command below resumes it via -c and finishes the pieces.
+    if (os.path.exists(final_path) and os.path.getsize(final_path) > 1024*1024
+            and not os.path.exists(final_path + '.aria2')):
+        return final_path
+    with print_lock:
+        print(f"   ⬇️ Downloading: {filename}")
+
+    with progress_lock:
+        if task_id:
+            download_stats[task_id] = {'pct': 0.0, 'speed_mbs': 0.0}
+        if update_bar:
+            progress_bar.value = 0
+            progress_bar.bar_style = 'info'
+            progress_bar.description = "Starting..."
+
+    # Disk-space guard: don't start writing into a nearly-full disk — wait for
+    # queued Drive moves to drain first (Colab terminates the session when the
+    # local disk fills). Bails out if nothing is freeing space.
+    if not _wait_for_disk_space(DISK_START_GB, label=filename[:40], task_id=task_id):
+        _mark_disk_gave_up(task_id)
+        return None
+
+    # Request-metered hosts get fewer connections and aria2's stock 20M split
+    # floor, so a near-complete file can't spray Range requests at the limiter.
+    rate_limited = url_matches_host(url, RATE_LIMITED_HOSTS)
+    conn_args = ['-x', '2', '-s', '2'] if rate_limited else ['-x', '16', '-s', '16']
+    retry_wait = '30' if rate_limited else '2'
+    cmd = ['aria2c', url, '-d', dest_folder, '-o', filename, *conn_args, '-k', '20M',
+           '-c', '--file-allocation=none', '--user-agent', 'Mozilla/5.0',
+           '--connect-timeout=30', '--timeout=60', '--max-tries=3', f'--retry-wait={retry_wait}',
+           '--summary-interval=1', '--show-console-readout=true']
+    if cookie: cmd.extend(['--header', f'Cookie: accountToken={cookie}'])
+
+    proc_key = task_id or str(uuid4())
+    attempt = 0
+    throttle_waits = 0  # Reset when downloaded bytes advance, including within 99%
+    downloaded_high_water = None
+    while attempt < 3:
+        attempt += 1
+        if _cancel_requested:
+            return None
+        try:
+            dl_start = time.time()
+            completed_path = None  # Path reported by aria2's "Download complete:" line
+            last_error_line = ""  # aria2's own error text, surfaced when the attempt fails
+            saw_throttle = False
+            made_progress = False
+            disk_paused = False  # Set by the watchdog when it terminates aria2 on low disk
+            last_disk_check = time.time()
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
+            _register_proc(proc_key, process)
+            last_speed = ""
+            last_speed_mbs = 0.0
+            for line in process.stdout:
+                if 'status=429' in line:
+                    saw_throttle = True
+                # Use aria2's completed byte count, not file size (sparse files can
+                # already have their final size) or rounded integer percentages.
+                downloaded = re.search(r'\[#[\da-f]+\s+([\d.]+)([KMGT]?i?B)/', line, re.I)
+                if downloaded:
+                    unit = downloaded.group(2).upper().replace('I', '')
+                    count = float(downloaded.group(1)) * (1024 ** ('B', 'KB', 'MB', 'GB', 'TB').index(unit))
+                    if downloaded_high_water is not None and count > downloaded_high_water:
+                        made_progress = True
+                    downloaded_high_water = max(downloaded_high_water or 0, count)
+                complete_match = re.search(r'Download complete:\s*(\S.*)', line)
+                if complete_match:
+                    completed_path = complete_match.group(1).strip()
+                # Keep aria2's own diagnosis (status codes, "Timeout", "errorCode")
+                # — without it a failure only ever surfaced as a generic exit code
+                # and the real cause (403/429/expired link) was invisible.
+                err_match = re.search(r'(errorCode=\d+.*|status=\d{3}.*|Timeout\b.*|'
+                                      r'Authorization failed.*|Resource not found.*)', line)
+                if err_match:
+                    last_error_line = err_match.group(1).strip()[:120]
+                match = re.search(r'\((\d+)%\)', line)
+                # aria2 outputs speed as "DL:5.2MiB" or "DL: 5.2MiB/s" - capture various formats
+                speed_match = re.search(r'DL:\s*(\d+\.?\d*)\s*([KMG])i?B', line)
+                if match:
+                    try:
+                        val = float(match.group(1))
+                        if speed_match:
+                            last_speed = f"{speed_match.group(1)}{speed_match.group(2)}iB/s"
+                            last_speed_mbs = _speed_to_mbs(float(speed_match.group(1)), speed_match.group(2))
+                        with progress_lock:
+                            if task_id:
+                                download_stats[task_id] = {'pct': val, 'speed_mbs': last_speed_mbs}
+                            if update_bar:
+                                progress_bar.value = val
+                                progress_bar.description = f"DL: {int(val)}% ({last_speed})" if last_speed else f"DL: {int(val)}%"
+                    except Exception: pass
+                # Disk-space watchdog: pause before the disk actually fills —
+                # Colab kills the whole session at 0 bytes free. aria2 resumes
+                # the partial via its .aria2 control file when space returns.
+                if not disk_paused and time.time() - last_disk_check >= DISK_CHECK_SECS:
+                    last_disk_check = time.time()
+                    if _disk_free_gb() < DISK_FLOOR_GB and not _cancel_requested:
+                        disk_paused = True
+                        with print_lock:
+                            print(f"      ⏸️ Local disk nearly full — pausing {filename[:40]} until Drive moves free space")
+                        try:
+                            process.terminate()
+                        except Exception:
+                            pass
+            process.wait()
+            _unregister_proc(proc_key)
+            if _cancel_requested:
+                return None  # Terminated by Stop — no fallback scan, no retries
+            if disk_paused:
+                # A disk pause is not a failure — wait for space, then resume the
+                # partial (aria2 -c picks up the .aria2 control file) without
+                # consuming a retry attempt.
+                attempt -= 1
+                if _wait_for_disk_space(DISK_START_GB, label=filename[:40], task_id=task_id):
+                    continue
+                _mark_disk_gave_up(task_id)
+                return None
+            if process.returncode == 0 and os.path.exists(final_path):
+                return final_path
+            if process.returncode == 0:
+                # aria2 succeeded but saved under a different name (common with URL-encoded names).
+                # Most reliable: the path aria2 itself reported as complete.
+                if completed_path and os.path.isfile(completed_path):
+                    with print_lock:
+                        print(f"      ✓ Found downloaded file: {os.path.basename(completed_path)}")
+                    return completed_path
+                # Fallback: a matching file created by THIS attempt. Files with an .aria2
+                # control file belong to another still-running worker - never take those.
+                _, ext = os.path.splitext(filename)
+                for f in os.listdir(dest_folder):
+                    candidate = os.path.join(dest_folder, f)
+                    if not (f.endswith(ext) and os.path.isfile(candidate)):
+                        continue
+                    if os.path.exists(candidate + '.aria2'):
+                        continue  # in-progress download owned by another task
+                    if os.path.getmtime(candidate) < dl_start:
+                        continue  # existed before this attempt started
+                    with print_lock:
+                        print(f"      ✓ Found downloaded file: {f}")
+                    return candidate
+            detail = f" — {last_error_line}" if last_error_line else ""
+            with print_lock:
+                if not os.path.exists(final_path):
+                    print(f"      ⚠️ Retry {attempt}/3 - File not found at expected path{detail}")
+                    print(f"         Expected: {final_path}")
+                else:
+                    print(f"      ⚠️ Retry {attempt}/3 - aria2 returned code {process.returncode}{detail}")
+            # A 429 says the account is being throttled, not that the link died:
+            # the URL is still good and aria2 -c has a resumable partial on disk.
+            # Re-minting would only spend more of the rate budget on requestdl
+            # (TorBox's most rate-limited endpoint) and make the throttle worse.
+            throttled = saw_throttle
+            if url_refresh and attempt < 3 and not throttled:
+                # The debrid link may simply have expired — re-mint it so the
+                # retry has a live URL to use.
+                # aria2 -c still resumes whatever partial is already on disk.
+                try:
+                    fresh_url = url_refresh()
+                except Exception:
+                    fresh_url = ''
+                if fresh_url and fresh_url != cmd[1]:
+                    cmd[1] = fresh_url
+                    with print_lock:
+                        print(f"      🔄 Re-requested a fresh download link")
+            if made_progress:
+                throttle_waits = 0
+            if throttled and throttle_waits < MAX_THROTTLE_WAITS:
+                # Same treatment as a disk pause: the file is fine and -c resumes it,
+                # so a throttle must not burn a retry — otherwise a 99%-complete file
+                # exhausts its 3 attempts on the last few MB and can never land.
+                throttle_waits += 1
+                attempt -= 1
+                cool_off = min(THROTTLE_BACKOFF_SECS * (2 ** (throttle_waits - 1)),
+                               THROTTLE_MAX_BACKOFF_SECS)
+                # Resume with one stream after throttling instead of repeating
+                # the same burst of range requests on every retry.
+                cmd[cmd.index('-x') + 1] = '1'
+                cmd[cmd.index('-s') + 1] = '1'
+                with progress_lock:
+                    if task_id:
+                        download_stats[task_id]['speed_mbs'] = 0.0
+                    if update_bar:
+                        progress_bar.description = f"Rate limited: retry in {cool_off}s"
+                with print_lock:
+                    print(f"      ⏳ Rate limited (429) — cooling off {cool_off}s, then resuming from where it stopped")
+                for _ in range(cool_off):
+                    if _cancel_requested:
+                        return None
+                    time.sleep(1)
+                continue
+            time.sleep(2**attempt)
+        except Exception as e:
+            _unregister_proc(proc_key)
+            with print_lock:
+                print(f"      ❌ Download error (attempt {attempt}/3): {str(e)[:80]}")
+            break
+
+    if _cancel_requested:
+        return None
+    with print_lock:
+        print(f"   ❌ Download failed after 3 attempts - Check URL validity or network connection")
+    return None
+
+# --- EMBEDDED SUBTITLE EXTRACTION ---
+# Merged from the standalone Smart Subtitle Extractor. Containers worth probing
+# for embedded subtitle tracks (text subs live almost exclusively in mkv/mp4,
+# but probing the others is one cheap ffprobe call).
+SUB_EXTRACT_VIDEO_EXTS = {'.mkv', '.mp4', '.m4v', '.webm', '.avi', '.ts'}
+# Codecs ffmpeg can convert to .srt. Image-based tracks (PGS/VobSub/DVB) would
+# need OCR, so they are reported and skipped rather than failing the file.
+_TEXT_SUB_CODECS = {'subrip', 'srt', 'ass', 'ssa', 'mov_text', 'webvtt', 'text', 'sami', 'subviewer', 'mpl2', 'realtext', 'stl', 'vplayer'}
+
+def _ensure_ffmpeg() -> bool:
+    """ffmpeg/ffprobe come preinstalled on Colab images; install only when missing
+    (setup_environment installs ffmpeg only when yt-dlp is in play)."""
+    if shutil.which('ffmpeg') and shutil.which('ffprobe'):
+        return True
+    print("🛠️ Installing ffmpeg...")
+    subprocess.run(["apt-get", "install", "-y", "ffmpeg"], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return bool(shutil.which('ffmpeg') and shutil.which('ffprobe'))
+
+def _probe_subtitle_streams(video_path: str) -> List[dict]:
+    """List a video's subtitle streams as [{'rel', 'lang', 'codec'}]. 'rel' is the
+    index among subtitle streams (what ffmpeg's 0:s:N specifier counts); 'lang'
+    is the tag mapped through _normalize_sub_lang ('' when untagged/und)."""
+    try:
+        res = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 's',
+             '-show_entries', 'stream=index,codec_name:stream_tags=language',
+             '-of', 'json', video_path],
+            capture_output=True, text=True, timeout=300)
+        streams = json.loads(res.stdout or '{}').get('streams', []) if res.returncode == 0 else []
+    except Exception:
+        return []
+    out = []
+    for rel, s in enumerate(streams):
+        tag = ((s.get('tags') or {}).get('language') or '').strip()
+        lang = '' if tag.casefold() in ('', 'und') else _normalize_sub_lang(tag)
+        out.append({'rel': rel, 'lang': lang, 'codec': (s.get('codec_name') or '').lower()})
+    return out
+
+def extract_embedded_subs(video_path: str, langs: List[str], any_fallback: bool = False,
+                          quiet: bool = False) -> List[str]:
+    """Extract embedded subtitle tracks to .srt sidecars beside the video.
+
+    For each requested language (Plex-friendly codes, the _normalize_sub_lang
+    convention) the first matching text track becomes '{video base}.{lang}.srt'
+    — the exact naming handle_file_processing gives downloaded subtitles. A track
+    tagged more precisely than the request keeps its precision ('zh' request +
+    'cht' track → '.zh-Hant.srt'). With any_fallback, a video whose tracks match
+    no requested language at all yields its first text track as '{base}.srt'.
+    Existing sidecars are never overwritten; results under 100 bytes (track
+    exists but is empty) are deleted. Returns the sidecar paths written."""
+    if not (langs or any_fallback) or not _ensure_ffmpeg():
+        return []
+    streams = _probe_subtitle_streams(video_path)
+    if not streams:
+        return []
+    base = os.path.splitext(video_path)[0]
+    targets = []          # (subtitle-relative stream index, sidecar path)
+    lang_matched = False  # a request matched SOME track, even an unconvertible one
+    for want in langs:
+        pick = next((s for s in streams if s['lang'] and
+                     (s['lang'] == want or s['lang'].split('-')[0] == want)), None)
+        if pick is None:
+            continue
+        lang_matched = True
+        if pick['codec'] not in _TEXT_SUB_CODECS:
+            if not quiet:
+                print(f"      ⚠️ '{want}' track is image-based ({pick['codec']}) — can't convert to .srt: {os.path.basename(video_path)}")
+            continue
+        targets.append((pick['rel'], f"{base}.{pick['lang']}.srt"))
+    if not targets and any_fallback and not lang_matched:
+        pick = next((s for s in streams if s['codec'] in _TEXT_SUB_CODECS), None)
+        if pick is not None:
+            targets.append((pick['rel'], f"{base}.srt"))
+    written = []
+    for rel, srt_path in targets:
+        if os.path.exists(srt_path):
+            continue
+        if cancel_requested():
+            break  # batch cancelled mid-file — stop starting new track extractions
+        try:
+            res = subprocess.run(
+                ['ffmpeg', '-nostdin', '-v', 'error', '-i', video_path,
+                 '-map', f'0:s:{rel}', '-c:s', 'srt', srt_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1800)
+            ok = res.returncode == 0 and os.path.exists(srt_path) and os.path.getsize(srt_path) > 100
+        except KeyboardInterrupt:
+            # Runtime → Interrupt mid-track: subprocess.run has already killed the
+            # ffmpeg child — drop the partial sidecar so a rescan doesn't mistake
+            # it for a finished subtitle, then let the caller handle the stop.
+            try:
+                if os.path.exists(srt_path): os.remove(srt_path)
+            except Exception:
+                pass
+            raise
+        except Exception:
+            ok = False
+        if ok:
+            written.append(srt_path)
+            if not quiet:
+                print(f"      ✅ Extracted: {os.path.basename(srt_path)}")
+        elif os.path.exists(srt_path):
+            try: os.remove(srt_path)
+            except Exception: pass
+    return written
+
+def _sidecar_exists(f_base: str, lang: str, fset: set) -> bool:
+    """True when '{f_base}' already has a sidecar satisfying a request for 'lang'.
+
+    extract_embedded_subs names sidecars after the TRACK's tag, which can be more
+    precise than the request: a 'cht' track under a 'zh' request is written as
+    '.zh-Hant.srt'. Matching only '.zh.srt' here would leave those files looking
+    permanently unextracted, so every rescan would re-probe them over the Drive
+    FUSE mount — the whole cost this listing check exists to avoid."""
+    if f"{f_base}.{lang}.srt" in fset:
+        return True
+    prefix = f"{f_base}.{lang}-"
+    return any(n.startswith(prefix) and n.endswith('.srt') for n in fset)
+
+def run_library_extract(b=None):
+    """Retroactive counterpart of the auto-extract checkbox: walk a Drive folder
+    and write missing .srt sidecars from embedded tracks. Synchronous like every
+    download (Runtime → Interrupt execution to stop a long scan). Probing reads
+    each video over the Drive FUSE mount, so files whose requested sidecars all
+    exist are skipped straight from the directory listing without touching the
+    video at all."""
+    folder = extract_dir_input.value.strip().strip('/')
+    langs = list(extract_sub_langs.value)
+    any_fb = extract_any_track_checkbox.value
+    if not langs and not any_fb:
+        print("❌ Select at least one subtitle language (or the first-track fallback).")
+        return
+    if drive is not None and not os.path.exists(DRIVE_BASE):
+        print("📂 Mounting Google Drive...")
+        drive.mount(f"{COLAB_ROOT}drive")
+    target = os.path.join(DRIVE_BASE, folder) if folder else DRIVE_BASE
+    if not os.path.isdir(target):
+        print(f"❌ Folder not found: {target}")
+        return
+    if not _ensure_ffmpeg():
+        print("❌ ffmpeg unavailable — cannot extract subtitles.")
+        return
+    btn_extract_library.disabled = True
+    _reset_cancel_state()  # a stale cancel flag from an interrupted batch must not mute extraction
+    probed = extracted = 0
+    try:
+        label = ', '.join(langs) if langs else 'first text track'
+        print(f"🚀 Scanning '{folder or 'My Drive'}' for embedded subtitle tracks ({label})...")
+        for root, dirs, files in os.walk(target):
+            fset = set(files)
+            for f in sorted(files):
+                f_base, f_ext = os.path.splitext(f)
+                if f_ext.lower() not in SUB_EXTRACT_VIDEO_EXTS:
+                    continue
+                if langs:
+                    needed = [l for l in langs if not _sidecar_exists(f_base, l, fset)]
+                    if not needed:
+                        continue  # every requested sidecar already exists
+                else:
+                    needed = []
+                    if f"{f_base}.srt" in fset:
+                        continue
+                probed += 1
+                print(f"   🔎 {f[:70]}...", end='\r')
+                # Fallback only when NOTHING pre-existed for this file — if some
+                # languages already have sidecars, the missing ones are genuinely
+                # absent from the file, and a first-track grab would just
+                # duplicate an existing language under no name.
+                extracted += len(extract_embedded_subs(
+                    os.path.join(root, f), needed,
+                    any_fallback=any_fb and len(needed) == len(langs)))
+        print(f"\n✨ Finished: {extracted} subtitle file(s) extracted ({probed} video(s) probed).")
+    except KeyboardInterrupt:
+        # Same contract as a download batch: kernel interrupt stops cleanly.
+        # Every sidecar written so far is complete (the interrupted track's
+        # partial file was already removed), so running the scan again simply
+        # continues from where this one stopped.
+        print(f"\n🛑 Stopped by user (kernel interrupt) — {extracted} subtitle file(s) extracted ({probed} video(s) probed). Run again to continue.")
+    finally:
+        btn_extract_library.disabled = False
+
+# --- DRIVE API UPLOAD ---
+# Writing through the drivefs FUSE mount is a write-back cache: the copy returns as
+# soon as the bytes are staged locally and drivefs's own background uploader pushes
+# them to Google afterwards. Two consequences, both bad. "Transfer complete" is a
+# lie — files keep uploading after a batch ends, and a terminated runtime loses
+# whatever is still queued even though the local copy was already deleted and the
+# history says it landed. And throughput is capped by that one background uploader,
+# so no amount of writer concurrency changes it (measured: 6 concurrent writers gave
+# no improvement at all). Uploading through the Drive REST API instead makes
+# completion mean completion and puts the transfer under our own control.
+DRIVE_API_CHUNK_MB = 64      # Resumable upload chunk; must be a multiple of 256 KB
+DRIVE_API_MAX_ATTEMPTS = 4   # Per-file retries on transient (429/5xx) errors
+DRIVE_FOLDER_RECHECK_SECS = 3  # Re-look-up before creating a folder (search index lag)
+
+_drive_api_ready = False               # Auth succeeded and the client imports cleanly
+_drive_api_warned = False              # One-shot notice when a file falls back to the mount
+_drive_api_local = local()             # googleapiclient is NOT thread-safe; one client per thread
+_drive_folder_ids = {}                 # Drive-relative dir -> folder ID (resolved once)
+_drive_folder_lock = RLock()           # Reentrant: _drive_folder_id recurses under it
+_drive_uploaded_paths = set()          # Landed via API, not yet visible through the mount
+_drive_uploaded_lock = Lock()
+
+def _init_drive_api() -> bool:
+    """Authenticate for the Drive REST API. Main thread only — Colab renders a
+    consent prompt, which does not work reliably from a worker thread. Never fatal:
+    on failure uploads keep using the mount exactly as before."""
+    global _drive_api_ready
+    if _drive_api_ready:
+        return True
+    try:
+        from google.colab import auth
+        from googleapiclient.discovery import build
+        import logging
+        # google_auth_httplib2 warns that httplib2 has no per-request timeout on every
+        # single request — several lines per uploaded file, which buries the real output.
+        logging.getLogger('google_auth_httplib2').setLevel(logging.ERROR)
+        auth.authenticate_user()
+        build('drive', 'v3', cache_discovery=False)  # Fail here, not mid-batch
+        _drive_api_ready = True
+        print("🔐 Drive API ready — uploads bypass the Drive mount")
+    except Exception as e:
+        _drive_api_ready = False
+        print(f"⚠️ Drive API unavailable ({str(e)[:70]}) — uploads will use the Drive mount")
+    return _drive_api_ready
+
+def _use_drive_api() -> bool:
+    return bool(drive_api_checkbox.value) and _drive_api_ready
+
+def _ensure_dest_dir(path: str):
+    """Create a Drive destination directory — unless the API owns folder creation.
+
+    Two creators is one too many. A mkdir through the mount makes a real Drive
+    folder, but Drive's search index lags behind it, so _drive_folder_id's own
+    lookup can miss it and create a second folder with the same name. That is what
+    produced the duplicate 'Rome (2005)' and 'Deadwood (2004)' folders, and it needs
+    no thread race at all — one file on one thread is enough.
+
+    With the API on, _drive_folder_id is the single creator and builds the whole path
+    itself. The mount fallback in _move_with_progress_impl creates what it needs at
+    copy time instead."""
+    if _use_drive_api():
+        return
+    os.makedirs(path, exist_ok=True)
+
+def _warn_api_fallback(err: Exception):
+    """Announce the first API failure of the session, then stay quiet."""
+    global _drive_api_warned
+    with print_lock:
+        if not _drive_api_warned:
+            _drive_api_warned = True
+            print(f"   ⚠️ Drive API upload failed ({str(err)[:80]}) — falling back to the Drive mount")
+
+def _drive_service():
+    """Per-thread Drive client. googleapiclient sits on httplib2, which is not
+    thread-safe — one shared service across parallel workers corrupts responses."""
+    svc = getattr(_drive_api_local, 'svc', None)
+    if svc is None:
+        from googleapiclient.discovery import build
+        svc = build('drive', 'v3', cache_discovery=False)
+        _drive_api_local.svc = svc
+    return svc
+
+def _drive_escape(name: str) -> str:
+    """Escape a name for use inside a Drive API query string literal."""
+    return name.replace('\\', '\\\\').replace("'", "\\'")
+
+def _drive_folder_id(rel_dir: str) -> str:
+    """Resolve a Drive-relative directory to a folder ID, creating what is missing.
+
+    Memoised, so a folder costs one lookup per session.
+
+    The whole lookup-then-create runs under the lock, and that is load-bearing:
+    Drive allows duplicate sibling names, so when several uploads raced to resolve a
+    brand-new show folder they each saw "not found" and each created it — three
+    identical 'Rome (2005)' folders with the episodes scattered across them. Checking
+    and creating has to be one atomic step. The lock is an RLock because this
+    recurses up the path, and resolution is memoised, so serialising it costs a
+    couple of API calls per new folder and nothing per file."""
+    rel_dir = rel_dir.strip('/')
+    if not rel_dir:
+        return 'root'
+    with _drive_folder_lock:
+        cached = _drive_folder_ids.get(rel_dir)
+        if cached:
+            return cached
+        parent_rel, _, leaf = rel_dir.rpartition('/')
+        parent_id = _drive_folder_id(parent_rel) if parent_rel else 'root'
+        svc = _drive_service()
+        q = ("'%s' in parents and name='%s' and mimeType='application/vnd.google-apps.folder'"
+             " and trashed=false" % (parent_id, _drive_escape(leaf)))
+        found = svc.files().list(q=q, fields='files(id)', pageSize=1,
+                                 supportsAllDrives=True, includeItemsFromAllDrives=True
+                                 ).execute().get('files', [])
+        if not found:
+            # Drive's search index lags creates by a few seconds. Re-check once before
+            # adding a folder, so one that exists but is not yet indexed (created by an
+            # earlier session, or through the mount) is found instead of duplicated.
+            time.sleep(DRIVE_FOLDER_RECHECK_SECS)
+            found = svc.files().list(q=q, fields='files(id)', pageSize=1,
+                                     supportsAllDrives=True, includeItemsFromAllDrives=True
+                                     ).execute().get('files', [])
+        if found:
+            fid = found[0]['id']
+        else:
+            meta = {'name': leaf, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [parent_id]}
+            fid = svc.files().create(body=meta, fields='id', supportsAllDrives=True).execute()['id']
+        _drive_folder_ids[rel_dir] = fid
+        return fid
+
+def _drive_clear_existing(folder_id: str, name: str):
+    """Trash any same-named file already in the target folder.
+
+    The caller's duplicate check reads the mount, which lags behind API uploads, so
+    it can miss a file that really is there — and Drive would happily keep both
+    copies under one name."""
+    svc = _drive_service()
+    q = "'%s' in parents and name='%s' and trashed=false" % (folder_id, _drive_escape(name))
+    for f in svc.files().list(q=q, fields='files(id)', pageSize=10,
+                              supportsAllDrives=True, includeItemsFromAllDrives=True
+                              ).execute().get('files', []):
+        try:
+            svc.files().delete(fileId=f['id'], supportsAllDrives=True).execute()
+        except Exception:
+            pass  # A file we cannot replace is not worth failing the download over
+
+def _mark_drive_uploaded(dest: str):
+    with _drive_uploaded_lock:
+        _drive_uploaded_paths.add(os.path.normpath(dest))
+
+def _drive_path_exists(dest: str) -> bool:
+    """True if the path is in Drive — through the mount, or uploaded by the API this
+    session. API uploads are invisible to the mount until drivefs next polls for
+    remote changes, so the mount alone would report a file we just wrote as absent."""
+    if os.path.exists(dest):
+        return True
+    with _drive_uploaded_lock:
+        return os.path.normpath(dest) in _drive_uploaded_paths
+
+def _drive_api_upload(src: str, dest: str):
+    """Upload src to the Drive path dest over the REST API.
+
+    Returns only once Drive holds the whole file, so the caller can safely delete
+    the local copy and log the download as complete."""
+    from googleapiclient.http import MediaFileUpload
+    rel = os.path.relpath(dest, DRIVE_BASE).replace(os.sep, '/')
+    rel_dir, _, name = rel.rpartition('/')
+    folder_id = _drive_folder_id(rel_dir)
+    file_size = os.path.getsize(src)
+    size_mb = file_size / (1024 * 1024)
+    _drive_clear_existing(folder_id, name)
+
+    chunk = DRIVE_API_CHUNK_MB * 1024 * 1024
+    report_interval = 500 * 1024 * 1024
+    last_error = None
+    for attempt in range(1, DRIVE_API_MAX_ATTEMPTS + 1):
+        media = MediaFileUpload(src, chunksize=chunk, resumable=True)
+        request = _drive_service().files().create(
+            body={'name': name, 'parents': [folder_id]},
+            media_body=media, fields='id,size', supportsAllDrives=True)
+        start_time = time.time()
+        last_report = 0
+        if size_mb >= 100:
+            with print_lock:
+                print(f"      📤 Uploading to Drive: {size_mb:.0f} MB..."
+                      + (f" (attempt {attempt})" if attempt > 1 else ""))
+        try:
+            response = None
+            while response is None:
+                if cancel_requested():
+                    raise KeyboardInterrupt("cancelled during Drive upload")
+                status, response = request.next_chunk()
+                if status is None or size_mb < 100:
+                    continue
+                sent = status.resumable_progress
+                if sent - last_report >= report_interval:
+                    elapsed = time.time() - start_time
+                    speed = (sent / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                    with print_lock:
+                        print(f"         {(sent / file_size) * 100:.0f}% "
+                              f"({sent / (1024*1024):.0f}/{size_mb:.0f} MB) @ {speed:.1f} MB/s")
+                    last_report = sent
+            uploaded = int(response.get('size') or 0)
+            if uploaded and uploaded != file_size:
+                # Drive disagreeing on size means a truncated upload — never accept it,
+                # the caller is about to delete the only complete copy.
+                raise IOError(f"Drive reported {uploaded} bytes, expected {file_size}")
+            if size_mb >= 100:
+                elapsed = time.time() - start_time
+                speed = size_mb / elapsed if elapsed > 0 else 0
+                with print_lock:
+                    print(f"      ✅ Upload complete: {size_mb:.0f} MB in {elapsed:.0f}s ({speed:.1f} MB/s)")
+            return
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            last_error = e
+            if attempt >= DRIVE_API_MAX_ATTEMPTS:
+                break
+            # Clear the partial before retrying so a failed attempt cannot leave a
+            # half-uploaded file sitting under the final name.
+            try:
+                _drive_clear_existing(folder_id, name)
+            except Exception:
+                pass
+            wait = min(60, 5 * (2 ** (attempt - 1)))
+            for _ in range(wait):
+                if cancel_requested():
+                    raise KeyboardInterrupt("cancelled during Drive upload backoff")
+                time.sleep(1)
+        finally:
+            try:
+                media.stream().close()
+            except Exception:
+                pass
+    raise last_error if last_error else IOError("Drive upload failed")
+
+def move_with_progress(src: str, dest: str):
+    """Move a file to Drive, tracking the transfer for the disk-space guard —
+    paused downloads keep waiting while any move is in flight, since each
+    completed move frees that file's local space all at once.
+
+    Completed transfers also feed the end-of-batch throughput summary, which is
+    what says whether the current mover count is buying anything. Both are only
+    truthful on the API path: a write to the mount returns before Drive has the
+    bytes, so it neither frees the space nor measures the upload."""
+    global _moves_in_flight
+    with _disk_guard_lock:
+        _moves_in_flight += 1
+    started = time.time()
+    try:
+        copied = _move_with_progress_impl(src, dest)
+    finally:
+        with _disk_guard_lock:
+            _moves_in_flight -= 1
+    # Only reached on success — a raising move records nothing.
+    if copied:
+        _record_drive_transfer(copied, started, time.time())
+
+def _move_with_progress_impl(src: str, dest: str):
+    """Move a file, with progress output for large cross-filesystem transfers.
+    
+    When moving across filesystems (e.g. local disk → Google Drive FUSE),
+    shutil.move does a full copy+delete. This wrapper uses buffered copy
+    with periodic progress prints so the user can see the transfer happening.
+    For same-filesystem moves, falls back to os.rename (instant).
+
+    Returns the bytes actually pushed to Drive — 0 for a rename or a small-file
+    shutil.move, so the batch throughput summary only counts real transfers.
+    """
+    # Prefer the Drive API. A write through the mount only reaches a local
+    # write-back cache — see the DRIVE API UPLOAD notes above — so it returns long
+    # before Drive has the bytes. The API upload returns when the file is really
+    # there, which is what makes the os.remove(src) below safe.
+    if _use_drive_api() and dest.startswith(DRIVE_BASE):
+        try:
+            api_bytes = os.path.getsize(src)
+            _drive_api_upload(src, dest)
+            _mark_drive_uploaded(dest)
+            os.remove(src)
+            return api_bytes
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            _warn_api_fallback(e)  # Fall through to the mount rather than fail the file
+    # Reached only when the API is off or its upload failed, so the destination
+    # directory may not exist yet — _ensure_dest_dir deliberately skips creating it
+    # while the API owns folder creation.
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    try:
+        # Try rename first (instant for same filesystem)
+        os.rename(src, dest)
+        return 0
+    except OSError:
+        pass  # Different filesystems — need to copy+delete
+    
+    file_size = os.path.getsize(src)
+    size_mb = file_size / (1024 * 1024)
+    
+    # For small files (<100MB), just use shutil.move silently
+    if size_mb < 100:
+        shutil.move(src, dest)
+        return 0
+    
+    # Large file: buffered copy with progress
+    chunk_size = 8 * 1024 * 1024  # 8MB chunks
+    copied = 0
+    last_report = 0
+    report_interval = 500 * 1024 * 1024  # Print every 500MB
+    start_time = time.time()
+    
+    with print_lock:
+        print(f"      📤 Transferring to Drive: {size_mb:.0f} MB...")
+    
+    try:
+        with open(src, 'rb') as fsrc, open(dest, 'wb') as fdst:
+            while True:
+                buf = fsrc.read(chunk_size)
+                if not buf:
+                    break
+                fdst.write(buf)
+                copied += len(buf)
+                
+                if copied - last_report >= report_interval:
+                    elapsed = time.time() - start_time
+                    speed = (copied / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                    pct = (copied / file_size) * 100
+                    with print_lock:
+                        print(f"         {pct:.0f}% ({copied / (1024*1024):.0f}/{size_mb:.0f} MB) @ {speed:.1f} MB/s")
+                    last_report = copied
+        
+        elapsed = time.time() - start_time
+        speed = size_mb / elapsed if elapsed > 0 else 0
+        with print_lock:
+            print(f"      ✅ Transfer complete: {size_mb:.0f} MB in {elapsed:.0f}s ({speed:.1f} MB/s)")
+        
+        os.remove(src)
+        return file_size
+    except Exception as e:
+        # If copy failed, clean up partial destination and re-raise
+        if os.path.exists(dest):
+            try:
+                os.remove(dest)
+            except Exception:
+                pass
+        raise
+
+def handle_file_processing(file_path, source="generic"):
+    if not file_path or not os.path.exists(file_path): return
+    filename = os.path.basename(file_path)
+    _, ext = os.path.splitext(filename)
+
+    if ext not in ['.rar', '.zip', '.7z']:
+        # Strip a subtitle's language tag before routing (so 'Show.EP01.Eng.srt' matches
+        # its video's TMDB/season entry) and re-attach it to the final name afterwards.
+        processing_name, lang = _split_subtitle_lang(filename)
+
+        final_dest, cat = determine_destination_path(processing_name, source)
+
+        if lang:  # re-attach a Plex-friendly language code before the subtitle extension
+            base, sub_ext = os.path.splitext(final_dest)
+            final_dest = f"{base}.{_normalize_sub_lang(lang)}{sub_ext}"
+
+        if _drive_path_exists(final_dest):
+            # Subtitles are cheap and re-downloading them is an explicit user action - refresh.
+            # Anything else: keep the existing Drive copy, consistent with duplicate skipping.
+            if ext in KEEP_EXTENSIONS:
+                # Guarded: an API-uploaded file counts as present before the mount can see
+                # it, and the uploader clears same-named files server-side anyway.
+                if os.path.exists(final_dest): os.remove(final_dest)
+            else:
+                size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                print(f"   ⏭️  Already in Drive (kept existing): {os.path.basename(final_dest)}")
+                os.remove(file_path)
+                log_download(os.path.basename(final_dest), source, size_mb, final_dest, status="skipped")
+                return
+
+        _ensure_dest_dir(os.path.dirname(final_dest))
+        size_mb = os.path.getsize(file_path) / (1024 * 1024)
+
+        # Auto-extract embedded subs while the video is still on fast local disk —
+        # the library scan tool has to read videos back over the Drive FUSE mount,
+        # which costs a full download's worth of I/O per file. Sidecars are named
+        # off final_dest directly (no re-routing: they belong to this video).
+        extracted_subs = []
+        if auto_extract_subs_checkbox.value and not cancel_requested() and ext.lower() in SUB_EXTRACT_VIDEO_EXTS:
+            extracted_subs = extract_embedded_subs(file_path, list(extract_sub_langs.value),
+                                                   any_fallback=extract_any_track_checkbox.value, quiet=True)
+        local_base = os.path.splitext(file_path)[0]
+
+        move_with_progress(file_path, final_dest)
+        print(f"   ✨ Moved to {cat}: {os.path.basename(final_dest)}")
+        log_download(os.path.basename(final_dest), source, size_mb, final_dest)
+
+        dest_base = os.path.splitext(final_dest)[0]
+        for sub_path in extracted_subs:
+            sub_dest = dest_base + sub_path[len(local_base):]  # carries the '.en.srt' tail
+            try:
+                sub_size_mb = os.path.getsize(sub_path) / (1024 * 1024)
+                if os.path.exists(sub_dest): os.remove(sub_dest)  # refresh, like downloaded subs
+                move_with_progress(sub_path, sub_dest)
+                print(f"   📑 Extracted sub: {os.path.basename(sub_dest)}")
+                log_download(os.path.basename(sub_dest), source, sub_size_mb, sub_dest)
+            except Exception as e:
+                print(f"   ⚠️ Could not move extracted sub {os.path.basename(sub_path)}: {str(e)[:80]}")
+        return
+
+    print(f"   📦 Archive Detected: {filename}")
+    # Extraction needs roughly the archive's size again on local disk
+    archive_gb = os.path.getsize(file_path) / (1024 ** 3)
+    if not _wait_for_disk_space(archive_gb + DISK_FLOOR_GB, label=f"extracting {filename[:40]}"):
+        raise OSError(f"Not enough local disk space to extract {filename} (archive kept for Retry)")
+    # Per-archive temp dir. This used to be one shared path that was rmtree'd on entry,
+    # so two archives extracting at once (the download pool runs several workers) deleted
+    # each other's files mid-extraction and silently lost one of them.
+    extract_temp = os.path.join(COLAB_ROOT, f"temp_extract_{uuid4().hex[:8]}")
+    if os.path.exists(extract_temp): shutil.rmtree(extract_temp)
+    os.makedirs(extract_temp)
+
+    archive_files = []
+    try:
+        if '.rar' in ext:
+            res = subprocess.run(['unrar', 'lb', file_path], capture_output=True, text=True)
+            if res.returncode == 0: archive_files = res.stdout.strip().splitlines()
+        else:
+            res = subprocess.run(['7z', 'l', '-ba', '-slt', file_path], capture_output=True, text=True)
+            if res.returncode == 0:
+                for line in res.stdout.splitlines():
+                    if line.strip().startswith('Path = '): archive_files.append(line.split(' = ', 1)[1])
+    except Exception as e:
+        print(f"   ❌ Failed to read archive: {str(e)[:80]}")
+        return
+
+    # Filter the listing to extractable, safe entries
+    wanted = []
+    excluded = False
+    for f_path in archive_files:
+        if f_path.endswith(('/', '\\')) or '__MACOSX' in f_path:
+            excluded = True
+            continue
+        if not is_safe_path(extract_temp, f_path):
+            print(f"      ⚠️ SKIPPING UNSAFE PATH: {f_path}")
+            excluded = True
+            continue
+        wanted.append(f_path)
+
+    if not wanted:
+        print("   ⚠️ No extractable files found in archive")
+        shutil.rmtree(extract_temp, ignore_errors=True)
+        return
+
+    # Extract in a single pass - per-file extraction re-decompresses solid RAR archives
+    # from the start each time (O(N^2)). Pass an explicit file list only when some
+    # entries were excluded above; otherwise extract everything.
+    total_files = len(wanted)
+    print(f"   📄 Extracting {total_files} files...")
+    with progress_lock:
+        progress_bar.description = f"Extracting {total_files} files..."
+        progress_bar.value = 0
+    if '.rar' in ext:
+        cmd = ['unrar', 'x', '-o+', file_path] + (wanted if excluded else []) + [extract_temp + '/']
+    else:
+        cmd = ['7z', 'x', '-y', file_path, f'-o{extract_temp}'] + (wanted if excluded else [])
+    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if res.returncode != 0:
+        print(f"      ⚠️ Extractor exited with code {res.returncode} - some files may be missing")
+
+    processed_count = 0
+    for idx, f_path in enumerate(wanted, 1):
+        with progress_lock:
+            progress_bar.description = f"Organise: {idx}/{total_files}"
+            progress_bar.value = (idx / total_files) * 100
+
+        extracted_full = os.path.join(extract_temp, f_path)
+        if not os.path.exists(extracted_full) or os.path.isdir(extracted_full):
+            continue
+        if os.path.getsize(extracted_full) < MIN_FILE_SIZE_MB * 1024 * 1024 and not f_path.endswith(tuple(KEEP_EXTENSIONS)):
+            os.remove(extracted_full)
+            continue
+        # Same subtitle-language handling as handle_file_processing: route on the
+        # language-stripped name, then re-attach a Plex-friendly code before the ext.
+        processing_name, lang = _split_subtitle_lang(f_path)
+        final_dest, cat = determine_destination_path(processing_name, source)
+        if lang:
+            base, sub_ext = os.path.splitext(final_dest)
+            final_dest = f"{base}.{_normalize_sub_lang(lang)}{sub_ext}"
+
+        if _drive_path_exists(final_dest):
+            print(f"      -> ⚠️ Duplicate in Drive (kept existing): {os.path.basename(final_dest)}")
+            os.remove(extracted_full)
+            continue
+
+        _ensure_dest_dir(os.path.dirname(final_dest))
+        size_mb = os.path.getsize(extracted_full) / (1024 * 1024)
+        move_with_progress(extracted_full, final_dest)
+        print(f"      [{idx}/{total_files}] -> {os.path.basename(final_dest)}")
+        log_download(os.path.basename(final_dest), source, size_mb, final_dest)
+        processed_count += 1
+
+    shutil.rmtree(extract_temp, ignore_errors=True)
+    if processed_count == 0 and res.returncode != 0:
+        print(f"   ❌ Extraction failed - archive kept for manual retry: {file_path}")
+    else:
+        os.remove(file_path)
+        print(f"   ✅ Extraction complete: {processed_count} files processed")
+    with progress_lock:
+        progress_bar.description = "Idle"
+
+def get_gofile_session(token: Optional[str]) -> Tuple[requests.Session, dict]:
+    """Create authenticated Gofile session."""
+    s = requests.Session()
+    s.headers.update({'User-Agent': 'Mozilla/5.0'})
+    t = {'token': token, 'wt': GOFILE_WEBSITE_TOKEN}
+    if not token:
+        try: 
+            r = s.post("https://api.gofile.io/accounts", json={}, timeout=REQUEST_TIMEOUT)
+            t['token'] = r.json()['data']['token'] if r.status_code == 200 else None
+        except Exception: pass
+    return s, t
+
+def resolve_gofile(url, s, t) -> List[Tuple[str, str]]:
+    try:
+        match = re.search(r'gofile\.io/d/([a-zA-Z0-9]+)', url)
+        if not match: return []
+        r = s.get(f"https://api.gofile.io/contents/{match.group(1)}", 
+                  params={'wt': t['wt']}, headers={'Authorization': f"Bearer {t['token']}"}, timeout=30)
+        data = r.json()
+        if data['status'] == 'ok': return [(c['link'], c['name']) for c in data['data']['children'].values() if c.get('link')]
+        else:
+            print(f"   ❌ Gofile Error: {data.get('status', 'unknown')} - Check if link is valid or requires authentication")
+    except Exception as e:
+        print(f"   ❌ Gofile API Error: {str(e)[:80]}")
+    return [] 
+
+def resolve_pixeldrain(url, s) -> List[Tuple[str, str]]:
+    """Resolve Pixeldrain URL to direct download link."""
+    try:
+        match = re.search(r'pixeldrain\.com/u/([a-zA-Z0-9]+)', url)
+        if not match:
+            print(f"   ⚠️ Pixeldrain: Could not extract file ID from URL")
+            return []
+        fid = match.group(1)
+        name = s.get(f"https://pixeldrain.com/api/file/{fid}/info", timeout=REQUEST_TIMEOUT).json().get('name', f"pixeldrain_{fid}")
+        return [(f"https://pixeldrain.com/api/file/{fid}?download", sanitize_filename(name))]
+    except Exception as e:
+        print(f"   ❌ Pixeldrain Error: {str(e)[:80]} - File may not exist or be private")
+    return []
+
+def process_rd_link(link, key) -> bool:
+    """Download an RD link or magnet. Returns True on success (or duplicate skip),
+    False on any error/timeout/failed download so the caller can mark it for retry."""
+    h = {"Authorization": f"Bearer {key}"}
+    if "magnet:?" in link:
+        print("   🧲 Resolving Magnet...")
+        try:
+            r = requests.post("https://api.real-debrid.com/rest/1.0/torrents/addMagnet", data={"magnet": link}, headers=h, timeout=30).json()
+            if 'error' in r:
+                print(f"   ❌ RD Magnet Error: {r.get('error', 'Unknown')} - Check token or magnet validity")
+                return False
+            requests.post(f"https://api.real-debrid.com/rest/1.0/torrents/selectFiles/{r['id']}", data={"files": "all"}, headers=h, timeout=30)
+
+            # Poll for torrent status with progress updates
+            with progress_lock:
+                progress_bar.value = 0
+                progress_bar.bar_style = 'info'
+                progress_bar.description = "RD: Caching..."
+
+            for poll_count in range(60):  # 2 minutes max (60 * 2s)
+                i = requests.get(f"https://api.real-debrid.com/rest/1.0/torrents/info/{r['id']}", headers=h, timeout=30).json()
+
+                # Update progress bar with RD caching progress
+                progress_pct = i.get('progress', 0)
+                status = i.get('status', 'unknown')
+                _update_torrent_progress("RD", status, progress_pct,
+                                         state_labels={'waiting_files_selection': 'Selecting files...'})
+
+                if status == 'downloaded':
+                    with progress_lock:
+                        progress_bar.value = 100
+                        progress_bar.description = "RD: Cached ✓"
+                    print(f"   ✅ Torrent cached - {len(i.get('links', []))} file(s)")
+                    all_ok = True
+                    for idx, l in enumerate(i['links'], 1):
+                        print(f"   📥 Downloading file {idx}/{len(i['links'])}...")
+                        if not process_rd_link(l, key):
+                            all_ok = False  # One failed file fails the magnet; retry re-skips the done ones
+                    return all_ok
+                time.sleep(2)
+
+            print("   ❌ RD Timeout - Torrent took too long to cache (2 min limit)")
+        except Exception as e:
+            print(f"   ❌ RD Magnet Error: {str(e)[:80]}")
+        finally:
+            _reset_progress_bar()
+        return False
+
+    # Regular RD link (unrestrict and download)
+    try:
+        d = requests.post("https://api.real-debrid.com/rest/1.0/unrestrict/link", data={"link": link}, headers=h, timeout=30).json()
+        if 'error' in d:
+            print(f"   ❌ RD Unrestrict Error: {d.get('error', 'Unknown')} - Check if link is supported")
+            return False
+
+        # Generate a task_id for progress tracking
+        task_id = f"rd_{str(uuid4())[:8]}"
+        with progress_lock:
+            progress_bar.value = 0
+            progress_bar.bar_style = 'info'
+
+        f = download_with_aria2(d['download'], d['filename'], COLAB_ROOT, task_id=task_id)
+        if f is DUPLICATE_SKIP:
+            return True  # Already in Drive
+        if f:
+            handle_file_processing(f)
+            return True
+        return False
+    except Exception as e:
+        print(f"   ❌ RD Error: {str(e)[:80]}")
+        return False
+
+def resolve_rd_link(url: str, rd_key: str) -> List[Tuple[str, str]]:
+    """Unrestrict a Real-Debrid link and return (download_url, filename) tuple."""
+    if not rd_key:
+        print(f"   ❌ RD Token required for: {url}")
+        return []
+    try:
+        h = {"Authorization": f"Bearer {rd_key}"}
+        d = requests.post("https://api.real-debrid.com/rest/1.0/unrestrict/link", 
+                         data={"link": url}, headers=h, timeout=30).json()
+        if 'error' in d:
+            print(f"   ❌ RD Unrestrict Error: {d.get('error', 'Unknown')}")
+            return []
+        return [(d['download'], d['filename'])]
+    except Exception as e:
+        print(f"   ❌ RD Resolve Error: {str(e)[:80]}")
+        return []
+
+def resolve_magnet_files(magnet_url: str, rd_key: str) -> List[DownloadTask]:
+    """
+    Add magnet to RD and wait for file list to be available.
+    Returns list of DownloadTask objects for each file in the torrent.
+    """
+    if not rd_key:
+        print(f"   ❌ RD Token required for magnets")
+        return []
+    
+    h = {"Authorization": f"Bearer {rd_key}"}
+    
+    try:
+        print("   🧲 Adding magnet to Real-Debrid...")
+        
+        # Add magnet to RD (with retry on rate-limit)
+        global _rd_magnet_delay
+        r = None
+        for attempt in range(4):  # Up to 4 attempts (0, 1, 2, 3)
+            r = requests.post("https://api.real-debrid.com/rest/1.0/torrents/addMagnet", 
+                             data={"magnet": magnet_url}, headers=h, timeout=30).json()
+            if 'error' not in r:
+                break  # Success
+            # Check if rate-limited — retry with exponential backoff
+            err_msg = r.get('error', '').lower().replace('_', ' ')
+            if attempt < 3 and any(kw in err_msg for kw in ['too many', 'limit', 'flood', 'action already done']):
+                _rd_magnet_delay = 2  # Enable pacing for all subsequent magnets
+                wait = 5 * (2 ** attempt)  # 5s, 10s, 20s
+                print(f"   ⏳ RD rate limit hit, retrying in {wait}s (attempt {attempt + 2}/4)...")
+                time.sleep(wait)
+            else:
+                print(f"   ❌ RD Magnet Error: {r.get('error', 'Unknown')}")
+                return []
+        
+        torrent_id = r['id']
+        
+        # Wait for file list to become available (magnet_conversion -> waiting_files_selection)
+        print("   ⏳ Waiting for torrent metadata...")
+        for _ in range(30):  # 60 seconds max
+            info = requests.get(f"https://api.real-debrid.com/rest/1.0/torrents/info/{torrent_id}", 
+                               headers=h, timeout=30).json()
+            status = info.get('status', '')
+            
+            if status == 'waiting_files_selection':
+                # Files are available for selection
+                files = info.get('files', [])
+                if not files:
+                    print("   ⚠️ No files found in torrent")
+                    return []
+                
+                torrent_name = info.get('filename', 'Unknown Torrent')
+                print(f"   ✅ Found {len(files)} file(s) in: {torrent_name[:50]}")
+                
+                # Create DownloadTask for each file
+                tasks = []
+                for f in files:
+                    file_id = f.get('id')
+                    file_path = f.get('path', '').lstrip('/')
+                    file_name = os.path.basename(file_path) if file_path else f"file_{file_id}"
+                    task = _make_torrent_file_task(magnet_url, "magnet_file", torrent_id,
+                                                   file_id, file_name, f.get('bytes', 0))
+                    if task:
+                        tasks.append(task)
+
+                return tasks
+            
+            elif status == 'downloaded':
+                # Already cached - get links directly
+                links = info.get('links', [])
+                torrent_name = info.get('filename', 'Unknown Torrent')
+                print(f"   ✅ Already cached: {torrent_name[:50]} ({len(links)} files)")
+                
+                tasks = []
+                for link_idx, link in enumerate(links):
+                    # Rate limit: delay between unrestrict calls to avoid RD fair-use blocks
+                    if link_idx > 0:
+                        time.sleep(2)
+                    # Unrestrict to get filename
+                    try:
+                        d = requests.post("https://api.real-debrid.com/rest/1.0/unrestrict/link",
+                                         data={"link": link}, headers=h, timeout=30).json()
+                        if 'download' in d:
+                            tasks.append(DownloadTask(
+                                url=d['download'],
+                                filename=d.get('filename', 'unknown'),
+                                source="magnet",
+                                link_type="rd",  # Already unrestricted, can download directly
+                                original_url=link,
+                            ))
+                    except Exception:
+                        pass
+                
+                return tasks
+            
+            elif status == 'magnet_error':
+                print(f"   ❌ Magnet error - invalid or dead torrent")
+                # Clean up the failed torrent
+                try:
+                    requests.delete(f"https://api.real-debrid.com/rest/1.0/torrents/delete/{torrent_id}", 
+                                   headers=h, timeout=30)
+                except Exception:
+                    pass
+                return []
+            
+            time.sleep(2)
+        
+        print("   ❌ Timeout waiting for torrent metadata (60s)")
+        return []
+        
+    except Exception as e:
+        print(f"   ❌ RD Magnet Resolve Error: {str(e)[:80]}")
+        return []
+
+def process_magnet_file_tasks(tasks: List[DownloadTask], rd_key: str) -> int:
+    """
+    Process magnet_file tasks - select files in RD, wait for cache, download.
+    Returns number of successfully downloaded files.
+    """
+    if not tasks or not rd_key:
+        return 0
+    
+    h = {"Authorization": f"Bearer {rd_key}"}
+    success_count = 0
+
+    # Process each torrent (tasks grouped by torrent_id from original_url)
+    for torrent_id, file_list in _group_tasks_by_torrent(tasks).items():
+        # Default to failed; upgraded to done/skipped per file below. This way a
+        # torrent error or cache timeout leaves the tasks failed (retryable on resume).
+        for _fid, task in file_list:
+            task.status = "failed"
+            task.error = "Not downloaded"
+        try:
+            file_ids = [fid for fid, _ in file_list]
+            print(f"\n   🧲 Processing torrent with {len(file_ids)} selected file(s)...")
+            
+            # Select only the chosen files
+            file_selection = ','.join(file_ids)
+            select_resp = requests.post(
+                f"https://api.real-debrid.com/rest/1.0/torrents/selectFiles/{torrent_id}",
+                data={"files": file_selection}, headers=h, timeout=30
+            )
+            
+            if select_resp.status_code != 204:
+                print(f"   ⚠️ File selection may have failed (status {select_resp.status_code})")
+            
+            # Wait for caching with progress
+            with progress_lock:
+                progress_bar.value = 0
+                progress_bar.bar_style = 'info'
+                progress_bar.description = "RD: Caching..."
+            
+            for poll_count in range(120):  # 4 minutes max
+                if _cancel_requested:
+                    break
+                info = requests.get(
+                    f"https://api.real-debrid.com/rest/1.0/torrents/info/{torrent_id}",
+                    headers=h, timeout=30
+                ).json()
+                
+                status = info.get('status', '')
+                progress_pct = info.get('progress', 0)
+
+                _update_torrent_progress("RD", status, progress_pct)
+
+                if status == 'downloaded':
+                    links = info.get('links', [])
+                    print(f"   ✅ Cached! Downloading {len(links)} file(s)...")
+                    
+                    with progress_lock:
+                        progress_bar.value = 100
+                        progress_bar.description = "RD: Cached ✓"
+                    
+                    # Download each link. RD returns links in selected-file order,
+                    # so links[k] maps to file_list[k].
+                    for idx, link in enumerate(links, 1):
+                        if _cancel_requested:
+                            break
+                        # Rate limit: delay between unrestrict calls to avoid RD fair-use blocks
+                        if idx > 1:
+                            time.sleep(2)
+                        task = file_list[idx-1][1] if idx-1 < len(file_list) else None
+                        try:
+                            d = requests.post(
+                                "https://api.real-debrid.com/rest/1.0/unrestrict/link",
+                                data={"link": link}, headers=h, timeout=30
+                            ).json()
+
+                            if 'download' in d:
+                                print(f"   📥 [{idx}/{len(links)}] {d.get('filename', 'file')[:50]}")
+                                task_id = task.id if task else f"rd_{str(uuid4())[:8]}"
+                                if task:
+                                    task.status = "downloading"
+                                f = download_with_aria2(d['download'], d['filename'], COLAB_ROOT, task_id=task_id)
+                                if f is DUPLICATE_SKIP:
+                                    if task: task.status, task.error = "skipped", None
+                                    success_count += 1
+                                elif f:
+                                    if task: task.status = "moving"
+                                    handle_file_processing(f, source="magnet")
+                                    if task: task.status, task.error = "done", None
+                                    success_count += 1
+                                else:
+                                    if task: task.status, task.error = "failed", "Download failed"
+                            else:
+                                if task: task.error = f"Unrestrict error: {d.get('error', 'unknown')}"
+                        except Exception as e:
+                            print(f"   ❌ Failed to download: {str(e)[:60]}")
+                            if task: task.status, task.error = "failed", str(e)[:100]
+
+                    break
+                
+                elif status in ['magnet_error', 'error', 'dead']:
+                    print(f"   ❌ Torrent error: {status}")
+                    break
+                
+                time.sleep(2)
+            else:
+                print("   ❌ Timeout waiting for torrent to cache (4 min)")
+                
+        except Exception as e:
+            print(f"   ❌ Error processing torrent: {str(e)[:80]}")
+        finally:
+            _reset_progress_bar()
+
+    return success_count
+
+# --- DEBRID SERVICE HELPERS ---
+# Shared building blocks for the Real-Debrid and TorBox flows. Both services follow
+# the same shape (add magnet → poll until cached → request per-file links), so the
+# structural pieces live here and only the API specifics stay per-service.
+
+def _reset_progress_bar():
+    """Reset the shared progress bar to idle (used in debrid finally blocks)."""
+    with progress_lock:
+        progress_bar.description = "Idle"
+        progress_bar.bar_style = 'info'
+
+def _update_torrent_progress(prefix: str, status: str, progress_pct: float,
+                             downloading_states=('downloading',), state_labels=None):
+    """Update the shared progress bar while a debrid service caches a torrent."""
+    with progress_lock:
+        progress_bar.value = progress_pct
+        if status in downloading_states:
+            progress_bar.description = f"{prefix}: {int(progress_pct)}% cached"
+        elif state_labels and status in state_labels:
+            progress_bar.description = f"{prefix}: {state_labels[status]}"
+        elif status == 'queued':
+            progress_bar.description = f"{prefix}: Queued..."
+        else:
+            progress_bar.description = f"{prefix}: {status}"
+
+def _make_torrent_file_task(magnet_url: str, link_type: str, torrent_id, file_id,
+                            file_name: str, size_bytes: int,
+                            allow_small: bool = False) -> Optional[DownloadTask]:
+    """Build a queue task for one file inside a debrid torrent.
+    Returns None for tiny files (samples/NFOs) unless they are subtitles or
+    live in an extras folder, where the user can opt into them in the queue."""
+    size_mb = size_bytes / (1024 * 1024)
+    if not allow_small and size_mb < 1 and not file_name.lower().endswith(tuple(KEEP_EXTENSIONS)):
+        return None
+    return DownloadTask(
+        url=magnet_url,
+        filename=f"{file_name} ({size_mb:.1f} MB)" if size_mb > 0 else file_name,
+        source="magnet",
+        link_type=link_type,
+        original_url=f"{torrent_id}:{file_id}",  # torrent_id:file_id for later selection
+    )
+
+def _group_tasks_by_torrent(tasks: List[DownloadTask]) -> Dict[str, List[Tuple[str, DownloadTask]]]:
+    """Group magnet-file tasks by torrent id (original_url stores 'torrent_id:file_id')."""
+    grouped: Dict[str, List[Tuple[str, DownloadTask]]] = {}
+    for task in tasks:
+        if task.original_url and ':' in task.original_url:
+            torrent_id, file_id = task.original_url.split(':', 1)
+            grouped.setdefault(torrent_id, []).append((file_id, task))
+    return grouped
+
+def get_active_debrid() -> Tuple[str, str, str]:
+    """Return (service_name, rd_key, tb_key) based on debrid toggle selection.
+    service_name: 'rd', 'tb', or 'none'
+    rd_key: Real-Debrid API key (empty if TorBox selected or None)
+    tb_key: TorBox API key (empty if Real-Debrid selected or None)
+    """
+    service = debrid_service_toggle.value
+    if service == 'TorBox':
+        return ('tb', '', token_tb.value.strip())
+    elif service == 'Real-Debrid':
+        return ('rd', token_rd.value.strip(), '')
+    return ('none', '', '')
+
+# --- TORBOX API FUNCTIONS ---
+def _get_tb_headers(tb_key: str) -> dict:
+    """Return authorization headers for TorBox API."""
+    return {"Authorization": f"Bearer {tb_key}"}
+
+def _tb_fetch_item(endpoint: str, item_id, tb_key: str) -> Optional[dict]:
+    """Fetch one entry from a TorBox mylist endpoint ('torrents' or 'webdl').
+    Returns the item dict, or None if not available yet (caller keeps polling)."""
+    try:
+        r = requests.get(f"{TORBOX_API_BASE}/{endpoint}/mylist",
+                         params={"id": item_id}, headers=_get_tb_headers(tb_key), timeout=30)
+        data = r.json()
+        if not data.get('success'):
+            return None
+        item = data.get('data')
+        if isinstance(item, list):
+            item = next((x for x in item if x.get('id') == item_id), None)
+        return item
+    except Exception:
+        return None  # Transient poll error — caller retries until its poll limit
+
+def _tb_progress_pct(item: dict) -> float:
+    """TorBox reports progress as 0-1 or 0-100 depending on endpoint — normalise to 0-100."""
+    progress = item.get('progress', 0)
+    return progress * 100 if progress <= 1 else progress
+
+def _tb_extract_download_url(dl_data: dict) -> str:
+    """Extract the download URL from a TorBox requestdl response ('' if missing)."""
+    if not (dl_data.get('success') and dl_data.get('data')):
+        return ''
+    data = dl_data['data']
+    if isinstance(data, str):
+        return data
+    return data.get('download_url', data.get('url', ''))
+
+# torbox.app/download share links carry ?type=<kind> — map to the API path segment
+_TB_ENDPOINT_BY_TYPE = {'torrents': 'torrents', 'torrent': 'torrents',
+                        'usenet': 'usenet', 'webdl': 'webdl', 'web': 'webdl'}
+# requestdl names its item-id parameter differently per endpoint
+_TB_REQUESTDL_ID_PARAM = {'torrents': 'torrent_id', 'usenet': 'usenet_id', 'webdl': 'web_id'}
+
+def _tb_err_is_throttle(err: str) -> bool:
+    """True when a _tb_requestdl error smells like rate limiting or an overloaded
+    edge rather than a per-file refusal, so transient responses are retried."""
+    e = err.lower()
+    return 'http' in e or 'rate' in e or 'limit' in e or 'many requests' in e
+
+def _tb_defer_requestdl(delay: float):
+    """Extend the shared requestdl cooldown without shortening an existing one."""
+    global _tb_requestdl_next_at
+    if delay <= 0:
+        return
+    with _tb_requestdl_rate_lock:
+        _tb_requestdl_next_at = max(_tb_requestdl_next_at, time.monotonic() + delay)
+
+def _tb_wait_requestdl_slot() -> bool:
+    """Wait cancelably for the next globally paced requestdl slot."""
+    global _tb_requestdl_next_at
+    while not cancel_requested():
+        with _tb_requestdl_rate_lock:
+            now = time.monotonic()
+            wait_for = _tb_requestdl_next_at - now
+            if wait_for <= 0:
+                _tb_requestdl_next_at = now + TB_REQUESTDL_MIN_INTERVAL_SECS
+                return True
+        time.sleep(min(wait_for, 1.0))
+    return False
+
+def _tb_requestdl(endpoint: str, id_param: str, item_id, file_id, tb_key: str,
+                  attempts: int = 4) -> Tuple[str, str]:
+    """Request one file's download URL from TorBox: (url, '') or ('', error).
+
+    requestdl is TorBox's most rate-limited endpoint, and throttled or overloaded
+    calls come back as 429/5xx with empty or HTML bodies — parsing those with a
+    bare .json() raised 'Expecting value: line 1 column 1 (char 0)' and failed
+    the file outright. Treat them (and rate-limit refusals inside valid JSON) as
+    transient: back off — honouring Retry-After when TorBox sends it — and retry;
+    only a clean JSON refusal (bad id, expired token) fails immediately."""
+    try:
+        item_id, file_id = int(item_id), int(file_id)
+    except (TypeError, ValueError):
+        pass  # non-numeric ids go through as-is
+    dl_params = {"token": tb_key, id_param: item_id, "file_id": file_id}
+    if id_param == 'web_id':
+        dl_params["web_download_id"] = item_id  # older param name, harmless
+    err = 'Could not get download URL'
+    retry_after = 0.0
+    for attempt in range(attempts):
+        if attempt:
+            delay = max(retry_after, 5 * (2 ** (attempt - 1)))  # 5s, 10s, 20s, 40s
+            print(f"      ⏳ TorBox throttled — retrying in {delay:.0f}s ({err[:60]})")
+            _tb_defer_requestdl(delay)
+        if not _tb_wait_requestdl_slot():
+            return '', 'Cancelled by user'
+        try:
+            dl_r = requests.get(f"{TORBOX_API_BASE}/{endpoint}/requestdl",
+                                params=dl_params, headers=_get_tb_headers(tb_key), timeout=30)
+        except Exception as e:
+            err = str(e)[:100]
+            retry_after = 0.0
+            continue
+        try:
+            retry_after = min(float(dl_r.headers.get('Retry-After', 0)), 60.0)
+        except (TypeError, ValueError):
+            retry_after = 0.0
+        try:
+            dl_data = dl_r.json()
+        except ValueError:
+            body = (dl_r.text or '').strip()
+            err = f"TorBox HTTP {dl_r.status_code}: {'non-JSON response' if body else 'empty response'}"
+            if dl_r.status_code == 429 and retry_after <= 0:
+                retry_after = TB_REQUESTDL_429_COOLDOWN_SECS
+            continue  # throttle or edge hiccup — worth retrying
+        download_url = _tb_extract_download_url(dl_data)
+        if download_url:
+            return download_url, ''
+        err = str(dl_data.get('detail') or dl_data.get('error') or err)[:120]
+        if dl_r.status_code < 429 and not _tb_err_is_throttle(err):
+            return '', err  # genuine refusal — retrying won't change the answer
+        if (dl_r.status_code == 429 or _tb_err_is_throttle(err)) and retry_after <= 0:
+            retry_after = TB_REQUESTDL_429_COOLDOWN_SECS
+    return '', err
+
+_TB_FOLDER_IGNORED_EXTENSIONS = {
+    '.aac', '.ac3', '.aiff', '.aif', '.alac', '.amr', '.ape', '.au', '.dts',
+    '.eac3', '.flac', '.m4a', '.m4b', '.mid', '.midi', '.mka', '.mp3',
+    '.oga', '.ogg', '.opus', '.pcm', '.wav', '.wma', '.wv',
+    '.avif', '.bmp', '.gif', '.heic', '.heif', '.ico', '.jpeg', '.jpg',
+    '.jxl', '.png', '.psd', '.raw', '.svg', '.tif', '.tiff', '.webp',
+}
+_TB_FOLDER_SAMPLE_MAX_BYTES = 100 * 1024 * 1024
+
+
+def _tb_folder_file_is_irrelevant(file_name: str, size_bytes: int) -> bool:
+    """Ignore audio, images, and named samples under 100 MiB; keep subtitles."""
+    stem, extension = os.path.splitext(file_name.lower())
+    if extension in KEEP_EXTENSIONS:
+        return False
+    if extension in _TB_FOLDER_IGNORED_EXTENSIONS:
+        return True
+    return (0 < size_bytes < _TB_FOLDER_SAMPLE_MAX_BYTES
+            and re.search(r'(?<![a-z0-9])sample(?![a-z0-9])', stem) is not None)
+
+
+def _tb_file_in_extras_folder(raw_name: str) -> bool:
+    """Recognize ancillary folders in a TorBox file's original relative path."""
+    parents = unquote(raw_name).replace('\\', '/').split('/')[:-1]
+    for parent in parents:
+        label = re.sub(r'[\s._-]+', ' ', parent).strip().casefold()
+        if re.fullmatch(
+            r'(?:extras?|bonus(?: features?| material| content)?|special features?|'
+            r'featurettes?|deleted scenes?|behind the scenes|trailers?|samples?|'
+            r'bloopers?|outtakes?|interviews?|making of)(?: \d+)?', label):
+            return True
+    return False
+
+
+def _tb_contextual_filename(raw_name: str, item_name: str = '') -> str:
+    """Fill missing episode identity from TorBox's nearest useful parent folders.
+
+    Produce one safe local filename so queue caches, downloads, duplicate checks
+    and saved sessions all use the same identity. Explicit file seasons and show
+    names win over folder hints; the original basename (including subtitle tags)
+    remains at the end. Never copy folder episode ranges into a single file.
+    """
+    parts = [part for part in unquote(raw_name).replace('\\', '/').split('/')
+             if part and part not in ('.', '..')]
+    if not parts:
+        return sanitize_filename(raw_name)
+    filename = sanitize_filename(parts[-1])
+    parse_name, _ = _split_subtitle_lang(filename)
+    info = detect_episode_info(parse_name, use_batch=False)
+    if not info['episode_detected']:
+        return filename
+
+    season = None
+    folder_show = None
+    # mylist sometimes supplies only short filenames; its item name is then the
+    # only show/season context. Paths take priority over that outermost fallback.
+    parents = ([item_name] if item_name else []) + parts[:-1]
+    for parent in reversed(parents):
+        parent = sanitize_filename(parent)
+        marker = re.search(r'(?i)\b(?:Season[ ._-]*|S)(\d{1,2})(?:\b|(?=EP?\d))', parent)
+        if marker and season is None:
+            season = int(marker.group(1))
+        candidate = clean_show_name(parent[:marker.start()] if marker else parent)
+        if candidate.casefold() in {
+            'unknown show', 'subs', 'subtitles', 'subtitle', 'video', 'videos',
+            'extras', 'bonus', 'samples', 'sample', 'complete', 'batch', 'collection',
+            'en', 'eng', 'vi', 'vie', 'zh', 'chi', 'zho', 'ja', 'jpn',
+            'english', 'vietnamese', 'chinese', 'japanese',
+        }:
+            continue
+        if folder_show is None:
+            folder_show = candidate
+
+    # A title after a leading episode marker is usually the episode's title,
+    # not the show's name, when a parent folder supplies a show identity.
+    marker_first = re.match(
+        r'(?i)^(?:\[[^\]]*\D[^\]]*\][ ._-]*)*(?:S\d{1,2}EP?\d|\d{1,2}x\d|'
+        r'(?:Episode|EP?|Episodio|Tập|Folge|Capitulo)[ ._-]*\d|\[\d{1,4}\]|\d{1,4}\b)',
+        parse_name) is not None
+    if info['has_sxe']:
+        strict_marker = re.search(r'(?i)\b(?:S\d{1,2}EP?\d|\d{1,2}x\d)', parse_name)
+        # Numeric show names (24) and bracketed titles are real identities when
+        # they precede an explicit marker; don't mistake them for bare episodes.
+        marker_first = clean_show_name(parse_name[:strict_marker.start()]) == 'Unknown Show'
+    needs_name = marker_first or info['show_name'] == 'Unknown Show'
+    title = folder_show if needs_name else info['show_name']
+    if not title or (info['has_sxe'] and not needs_name):
+        return filename
+    if not needs_name and season is None:
+        return filename
+    if season is None and not info['has_sxe']:
+        # A folder can supply only the show name (e.g. One Piece/1085.mkv).
+        # Do not invent an explicit S01 marker that would disable TMDB's
+        # absolute-episode mapping for such files.
+        return sanitize_filename(f"{title} - {filename}")
+    season = info['season'] if info['has_sxe'] or season is None else season
+    episode_marker = f"S{season:02d}E{info['episode']:02d}"
+    if info['episode_end'] is not None:
+        episode_marker += f"-E{info['episode_end']:02d}"
+    return sanitize_filename(f"{title} - {episode_marker} - {filename}")
+
+
+def resolve_tb_folder_files(url: str, tb_key: str) -> List[DownloadTask]:
+    """Resolve a torbox.app/download?id=X&type=Y share link (the site's
+    'Copy JDownloader Folder Links' button) into per-file queue tasks.
+    The id references an item already in the TorBox account, so this only
+    reads mylist — nothing new is queued on TorBox. Tasks carry the real
+    filenames (so episode/TMDB matching works) and reuse the tb_magnet_file
+    download pipeline.
+    """
+    if not tb_key:
+        print(f"   ❌ TorBox Token required for: {url[:60]}")
+        return []
+    params = parse_qs(urlparse(url).query)
+    item_id = (params.get('id') or [''])[0]
+    type_param = (params.get('type') or ['torrents'])[0].lower()
+    endpoint = _TB_ENDPOINT_BY_TYPE.get(type_param)
+    if not item_id.isdigit() or not endpoint:
+        print(f"   ❌ Unrecognised TorBox link: {url[:70]}")
+        return []
+
+    item = None
+    for attempt in range(3):  # mylist can hiccup — brief retry
+        item = _tb_fetch_item(endpoint, int(item_id), tb_key)
+        if item:
+            break
+        time.sleep(2)
+    if not item:
+        print(f"   ❌ TorBox: item {item_id} not found in your {endpoint} list (check account/API key)")
+        return []
+
+    name = item.get('name', f'torbox_{item_id}')
+    files = item.get('files') or []
+    if not files:
+        print(f"   ⚠️ No files listed for: {name[:50]} (still caching?)")
+        return []
+    print(f"   ✅ Found {len(files)} file(s) in: {name[:50]}")
+
+    # Torrents keep the bare id so original_url matches the magnet flow;
+    # usenet/webdl prefix the endpoint so requestdl later hits the right API.
+    group_id = item_id if endpoint == 'torrents' else f"{endpoint}/{item_id}"
+    tasks = []
+    for f in files:
+        file_id = f.get('id', 0)
+        # Keep useful folder identity before flattening into a local filename.
+        raw_name = f.get('name') or f.get('short_name') or f'file_{file_id}'
+        file_name = os.path.basename(raw_name.replace('\\', '/')) or raw_name
+        is_extra = _tb_file_in_extras_folder(raw_name)
+        if not is_extra and _tb_folder_file_is_irrelevant(file_name, f.get('size', 0)):
+            continue
+        file_name = _tb_contextual_filename(raw_name, name)
+        task = _make_torrent_file_task(url, "tb_magnet_file", group_id,
+                                       file_id, file_name, f.get('size', 0), allow_small=is_extra)
+        if task:
+            task.selected_by_default = not is_extra
+            tasks.append(task)
+    return tasks
+
+def _resolve_tb_cdn(url: str, session: requests.Session) -> List[Tuple[str, str]]:
+    """TorBox CDN links (store-*.tb-cdn.io/dld/<uuid>) have opaque UUID paths.
+    Read the real filename from Content-Disposition so episode matching works;
+    fall back to the URL basename. The link itself downloads directly."""
+    filename = ''
+    try:
+        r = session.head(url, allow_redirects=True, timeout=20)
+        cd = r.headers.get('content-disposition', '')
+        if not cd:  # some CDNs only send headers on GET
+            r = session.get(url, stream=True, allow_redirects=True, timeout=20)
+            cd = r.headers.get('content-disposition', '')
+            r.close()
+        m = re.search(r"filename\*\s*=\s*(?:UTF-8'')?([^;]+)", cd, re.I) or \
+            re.search(r'filename\s*=\s*"?([^";]+)', cd, re.I)
+        if m:
+            filename = sanitize_filename(unquote(m.group(1).strip().strip('"')))
+    except Exception:
+        pass  # naming is best-effort — the download itself still works
+    if not filename:
+        filename = os.path.basename(unquote(urlparse(url).path)) or "download"
+    return [(url, filename)]
+
+def resolve_tb_link(url: str, tb_key: str) -> List[Tuple[str, str]]:
+    """Unrestrict a link via TorBox Web Downloads.
+    Creates a web download, polls until completed, then gets download URL.
+    Returns [(download_url, filename)] list matching RD's return format.
+    """
+    if not tb_key:
+        print(f"   ❌ TorBox Token required for: {url}")
+        return []
+    
+    h = _get_tb_headers(tb_key)
+    
+    try:
+        # Step 1: Create web download
+        r = requests.post(f"{TORBOX_API_BASE}/webdl/createwebdownload",
+                         json={"url": url}, headers=h, timeout=30)
+        data = r.json()
+        
+        if not data.get('success'):
+            err = data.get('detail', data.get('error', 'Unknown error'))
+            print(f"   ❌ TorBox Web DL Error: {err}")
+            return []
+        
+        webdl_id = data['data'].get('webdownload_id') or data['data'].get('id')
+        if not webdl_id:
+            print(f"   ❌ TorBox: No download ID returned")
+            return []
+        
+        # Step 2: Poll for completion
+        print(f"   ⏳ TorBox: Processing download...")
+        with progress_lock:
+            progress_bar.value = 0
+            progress_bar.bar_style = 'info'
+            progress_bar.description = "TB: Processing..."
+        
+        for poll_count in range(90):  # 3 minutes max (90 * 2s)
+            item = _tb_fetch_item('webdl', webdl_id, tb_key)
+            if not item:
+                time.sleep(2)
+                continue
+
+            status = item.get('download_state', item.get('status', ''))
+            progress_pct = _tb_progress_pct(item)
+
+            with progress_lock:
+                progress_bar.value = progress_pct
+                progress_bar.description = f"TB: {int(progress_pct)}%"
+
+            if status in ['completed', 'cached', 'done']:
+                filename = item.get('name', item.get('filename', 'download'))
+
+                # Step 3: Get download URL (first/main file)
+                files = item.get('files', [])
+                file_id = files[0].get('id', 0) if files else 0
+
+                download_url, dl_err = _tb_requestdl('webdl', 'web_id', webdl_id, file_id, tb_key)
+                if download_url:
+                    with progress_lock:
+                        progress_bar.value = 100
+                        progress_bar.description = "TB: Ready ✓"
+                    return [(download_url, sanitize_filename(filename))]
+
+                print(f"   ❌ TorBox: {dl_err}")
+                return []
+            
+            elif status in ['error', 'failed']:
+                err = item.get('error', 'Unknown error')
+                print(f"   ❌ TorBox download error: {err}")
+                return []
+            
+            time.sleep(2)
+        
+        print("   ❌ TorBox: Timeout waiting for download (3 min)")
+        return []
+        
+    except Exception as e:
+        print(f"   ❌ TorBox Resolve Error: {str(e)[:80]}")
+        return []
+    finally:
+        _reset_progress_bar()
+
+def resolve_tb_magnet_files(magnet_url: str, tb_key: str) -> List[DownloadTask]:
+    """Add magnet to TorBox and wait for file list.
+    Returns list of DownloadTask objects for each file in the torrent.
+    """
+    if not tb_key:
+        print(f"   ❌ TorBox Token required for magnets")
+        return []
+    
+    h = _get_tb_headers(tb_key)
+    
+    try:
+        print("   🧲 Adding magnet to TorBox...")
+        
+        # Add magnet via createtorrent
+        r = requests.post(f"{TORBOX_API_BASE}/torrents/createtorrent",
+                         data={"magnet": magnet_url}, headers=h, timeout=30)
+        data = r.json()
+        
+        if not data.get('success'):
+            err = data.get('detail', data.get('error', 'Unknown error'))
+            print(f"   ❌ TorBox Magnet Error: {err}")
+            return []
+        
+        torrent_id = data['data'].get('torrent_id') or data['data'].get('id')
+        torrent_name = data['data'].get('name', 'Unknown Torrent')
+        
+        if not torrent_id:
+            print(f"   ❌ TorBox: No torrent ID returned")
+            return []
+        
+        # Poll for torrent to be ready
+        print(f"   ⏳ Waiting for torrent metadata...")
+        for _ in range(60):  # 2 minutes max
+            item = _tb_fetch_item('torrents', torrent_id, tb_key)
+            if not item:
+                time.sleep(2)
+                continue
+
+            status = item.get('download_state', item.get('status', ''))
+
+            if status in ['completed', 'cached', 'done', 'downloading', 'uploading', 'stalled']:
+                files = item.get('files', [])
+                torrent_name = item.get('name', torrent_name)
+
+                if not files:
+                    print(f"   ⚠️ No files found in torrent")
+                    return []
+
+                print(f"   ✅ Found {len(files)} file(s) in: {torrent_name[:50]}")
+
+                tasks = []
+                for f in files:
+                    file_id = f.get('id', 0)
+                    # Strip any leading folder from the torrent-relative path (see resolve_tb_folder_files)
+                    raw_name = f.get('name') or f.get('short_name') or f'file_{file_id}'
+                    file_name = os.path.basename(raw_name.replace('\\', '/')) or raw_name
+                    is_extra = _tb_file_in_extras_folder(raw_name)
+                    task = _make_torrent_file_task(magnet_url, "tb_magnet_file", torrent_id,
+                                                   file_id, file_name, f.get('size', 0),
+                                                   allow_small=is_extra)
+                    if task:
+                        task.selected_by_default = not is_extra
+                        tasks.append(task)
+
+                return tasks
+            
+            elif status in ['error', 'failed', 'magnet_error']:
+                print(f"   ❌ Torrent error: {status}")
+                # Try to clean up
+                try:
+                    requests.post(f"{TORBOX_API_BASE}/torrents/controltorrent",
+                                 json={"torrent_id": torrent_id, "operation": "delete"},
+                                 headers=h, timeout=30)
+                except Exception:
+                    pass
+                return []
+            
+            time.sleep(2)
+        
+        print("   ❌ Timeout waiting for torrent metadata (2 min)")
+        return []
+        
+    except Exception as e:
+        print(f"   ❌ TorBox Magnet Resolve Error: {str(e)[:80]}")
+        return []
+
+def convert_tb_tasks_to_parallel(tasks: List[DownloadTask], tb_key: str) -> Tuple[List[DownloadTask], List[DownloadTask]]:
+    """Move cached TorBox files into the parallel aria2 pool without minting URLs.
+
+    Each download worker requests its own direct URL immediately before starting.
+    This keeps link generation bounded by the worker count instead of pre-requesting
+    an entire large torrent, which can trip requestdl throttling and leaves later
+    files holding links that may expire before a worker reaches them.
+
+    Returns (parallel_ready, still_sequential). Uncached items (fresh magnets)
+    stay sequential — process_tb_magnet_file_tasks polls the caching there.
+    link_type stays 'tb_magnet_file' so a resumed session re-requests fresh URLs.
+    """
+    if not tasks or not tb_key:
+        return [], tasks or []
+    ready: List[DownloadTask] = []
+    sequential: List[DownloadTask] = []
+    for group_id, file_list in _group_tasks_by_torrent(tasks).items():
+        endpoint, _, item_id = group_id.rpartition('/')
+        endpoint = endpoint or 'torrents'
+        item = _tb_fetch_item(endpoint, int(item_id), tb_key)
+        status = (item or {}).get('download_state', (item or {}).get('status', ''))
+        if not item or status not in ('completed', 'cached', 'done'):
+            sequential.extend(t for _fid, t in file_list)
+            continue
+        print(f"   🔗 Queueing {len(file_list)} cached TorBox file(s) for just-in-time link resolution...")
+        for _file_id, task in file_list:
+            task.filename = _strip_size_suffix(task.filename)
+            ready.append(task)
+    return ready, sequential
+
+def process_tb_magnet_file_tasks(tasks: List[DownloadTask], tb_key: str) -> int:
+    """Process tb_magnet_file tasks - get download links from TorBox and download.
+    Returns number of successfully downloaded files.
+    """
+    if not tasks or not tb_key:
+        return 0
+    
+    success_count = 0
+
+    # Process each torrent (tasks grouped by torrent_id from original_url)
+    for torrent_id, file_list in _group_tasks_by_torrent(tasks).items():
+        # Folder links may reference usenet/webdl items ('endpoint/id');
+        # bare ids are torrents (the magnet flow's original format).
+        endpoint, _, item_id = torrent_id.rpartition('/')
+        endpoint = endpoint or 'torrents'
+        id_param = _TB_REQUESTDL_ID_PARAM.get(endpoint, 'torrent_id')
+        # Default to failed; upgraded to done/skipped per file below so a torrent
+        # error or cache timeout leaves the tasks failed (retryable on resume).
+        for _fid, task in file_list:
+            task.status = "failed"
+            task.error = "Not downloaded"
+        try:
+            print(f"\n   🧲 Downloading {len(file_list)} file(s) from TorBox torrent...")
+            
+            # Wait for torrent to be fully cached
+            with progress_lock:
+                progress_bar.value = 0
+                progress_bar.bar_style = 'info'
+                progress_bar.description = "TB: Caching..."
+            
+            for poll_count in range(120):  # 4 minutes max
+                if _cancel_requested:
+                    break
+                item = _tb_fetch_item(endpoint, int(item_id), tb_key)
+                if not item:
+                    time.sleep(2)
+                    continue
+
+                status = item.get('download_state', item.get('status', ''))
+                progress_pct = _tb_progress_pct(item)
+
+                _update_torrent_progress("TB", status, progress_pct,
+                                         downloading_states=('downloading', 'uploading'))
+
+                if status in ['completed', 'cached', 'done']:
+                    print(f"   ✅ Torrent ready! Downloading files...")
+                    
+                    with progress_lock:
+                        progress_bar.value = 100
+                        progress_bar.description = "TB: Cached ✓"
+                    
+                    # Download each selected file
+                    for idx, (file_id, task) in enumerate(file_list, 1):
+                        if _cancel_requested:
+                            break
+                        if idx > 1:
+                            time.sleep(1)  # Rate limiting
+                        try:
+                            # Request the file's download link — _tb_requestdl retries
+                            # with backoff when TorBox throttles the endpoint
+                            download_url, dl_err = _tb_requestdl(endpoint, id_param, item_id, file_id, tb_key)
+                            if download_url:
+                                # Clean filename (remove size suffix for actual download)
+                                clean_name = _strip_size_suffix(task.filename)
+                                print(f"   📥 [{idx}/{len(file_list)}] {clean_name[:50]}")
+                                task.status = "downloading"
+                                f = download_with_aria2(download_url, clean_name, COLAB_ROOT, task_id=task.id)
+                                if f is DUPLICATE_SKIP:
+                                    task.status, task.error = "skipped", None
+                                    success_count += 1
+                                elif f:
+                                    task.status = "moving"
+                                    handle_file_processing(f, source="magnet")
+                                    task.status, task.error = "done", None
+                                    success_count += 1
+                                else:
+                                    task.status = "failed"
+                                    task.error = "Download failed"
+                            else:
+                                print(f"   ❌ TorBox DL error: {dl_err}")
+                                task.error = dl_err[:100]
+                        except Exception as e:
+                            task.status = "failed"
+                            print(f"   ❌ Failed to download: {str(e)[:60]}")
+                            task.error = str(e)[:100]
+                    
+                    break
+                
+                elif status in ['error', 'failed', 'dead']:
+                    print(f"   ❌ Torrent error: {status}")
+                    break
+                
+                time.sleep(2)
+            else:
+                print("   ❌ Timeout waiting for torrent to cache (4 min)")
+                
+        except Exception as e:
+            print(f"   ❌ Error processing torrent: {str(e)[:80]}")
+        finally:
+            _reset_progress_bar()
+
+    return success_count
+
+def process_tb_link(link: str, tb_key: str) -> bool:
+    """Process a link through TorBox (both magnets and regular links).
+    Returns True on success (or duplicate skip), False on any failure."""
+    if "magnet:?" in link:
+        # For magnets, add to TorBox and download all files
+        print("   🧲 Processing magnet via TorBox...")
+        tasks = resolve_tb_magnet_files(link, tb_key)
+        if not tasks:
+            return False
+        success = process_tb_magnet_file_tasks(tasks, tb_key)
+        return success > 0  # At least one file downloaded
+
+    # Regular link - unrestrict via web download
+    resolved = resolve_tb_link(link, tb_key)
+    if not resolved:
+        return False
+    all_ok = True
+    for dl_url, filename in resolved:
+        task_id = f"tb_{str(uuid4())[:8]}"
+        with progress_lock:
+            progress_bar.value = 0
+            progress_bar.bar_style = 'info'
+        f = download_with_aria2(dl_url, filename, COLAB_ROOT, task_id=task_id)
+        if f is DUPLICATE_SKIP:
+            continue  # Already in Drive
+        if f:
+            handle_file_processing(f)
+        else:
+            all_ok = False
+    return all_ok
+
+def resolve_mediafire(url: str, session: requests.Session) -> List[Tuple[str, str]]:
+    """Resolve MediaFire link to direct download URL by parsing HTML."""
+    try:
+        resp = session.get(url, timeout=30)
+        # Look for the download button href
+        match = re.search(r'href="(https://download\d*\.mediafire\.com/[^"]+)"', resp.text)
+        if match:
+            download_url = match.group(1)
+            # Extract filename from URL or page title
+            filename_match = re.search(r'/([^/]+)$', download_url)
+            if filename_match:
+                filename = unquote(filename_match.group(1))
+                print(f"   📁 MediaFire: {filename}")
+                return [(download_url, sanitize_filename(filename))]
+        # Try alternate pattern for older MediaFire pages
+        match2 = re.search(r'aria-label="Download file"\s+href="([^"]+)"', resp.text)
+        if match2:
+            download_url = match2.group(1)
+            filename = re.search(r'/([^/]+)$', download_url).group(1)
+            return [(download_url, sanitize_filename(unquote(filename)))]
+        print(f"   ⚠️ MediaFire: Could not find download link")
+    except Exception as e:
+        print(f"   ❌ MediaFire Error: {str(e)[:80]}")
+    return []
+
+def resolve_1fichier(url: str, session: requests.Session) -> List[Tuple[str, str]]:
+    """Resolve 1fichier link to direct download URL."""
+    try:
+        # Get the page first to extract any needed info
+        resp = session.get(url, timeout=30)
+        
+        # Extract filename from page
+        filename_match = re.search(r'<title>([^<]+)</title>', resp.text)
+        filename = "1fichier_download"
+        if filename_match:
+            title = filename_match.group(1)
+            # Clean up title (remove "1fichier.com:" prefix if present)
+            filename = re.sub(r'^.*?:\s*', '', title).strip()
+            if not filename or filename == "1fichier.com":
+                filename = "1fichier_download"
+        
+        # 1fichier requires a POST to download
+        # Check if there's a waiting time (free downloads)
+        if 'You must wait' in resp.text or 'Please wait' in resp.text:
+            print(f"   ⚠️ 1fichier: Rate limited, try later or use premium")
+            return []
+        
+        # Try to get the download link via POST
+        # Note: 1fichier may require CAPTCHA for free downloads
+        post_resp = session.post(url, data={'dl_no_ssl': 'on', 'dlinline': 'on'}, timeout=30, allow_redirects=False)
+        
+        if post_resp.status_code == 302:
+            # Redirect to download URL
+            download_url = post_resp.headers.get('Location', '')
+            if download_url:
+                print(f"   📁 1fichier: {filename}")
+                return [(download_url, sanitize_filename(filename))]
+        
+        # Check response for direct link
+        dl_match = re.search(r'href="(https://[^"]*1fichier[^"]*)"[^>]*>Click here', post_resp.text, re.IGNORECASE)
+        if dl_match:
+            return [(dl_match.group(1), sanitize_filename(filename))]
+        
+        print(f"   ⚠️ 1fichier: Could not extract download link (may require premium or CAPTCHA)")
+    except Exception as e:
+        print(f"   ❌ 1fichier Error: {str(e)[:80]}")
+    return []
+
+# --- FSHARE RESOLVER ---
+# FShare API credentials (used by legacy API if it still works)
+FSHARE_APP_KEY = "L2S7R6ZMagggC5wWkQhX2+aDi467PPuftWUMRFSn"
+FSHARE_API_URL = "https://api.fshare.vn/api"
+
+def _fshare_api_login(email: str, password: str, session: requests.Session) -> Optional[Dict[str, str]]:
+    """Login to FShare via legacy API. Returns {'token': ..., 'session_id': ...} or None."""
+    try:
+        data = {
+            "user_email": email,
+            "password": password,
+            "app_key": FSHARE_APP_KEY,
+        }
+        resp = session.post(f"{FSHARE_API_URL}/user/login",
+                           json=data,
+                           headers={"User-Agent": "okhttp/3.6.0", "Content-Type": "application/json"},
+                           timeout=REQUEST_TIMEOUT)
+        result = resp.json()
+        if result.get("code") == 200 and result.get("token"):
+            return {"token": result["token"], "session_id": result.get("session_id", "")}
+        else:
+            return None
+    except Exception:
+        return None
+
+def _fshare_api_get_download_link(url: str, token: str, session: requests.Session) -> Optional[str]:
+    """Get direct download link from FShare API. Returns URL string or None."""
+    try:
+        data = {"token": token, "url": url}
+        resp = session.post(f"{FSHARE_API_URL}/session/download",
+                           json=data,
+                           headers={"User-Agent": "okhttp/3.6.0", "Content-Type": "application/json"},
+                           timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 200:
+            result = resp.json()
+            download_url = result.get("location") or result.get("url") or result.get("download")
+            if download_url and download_url.startswith("http"):
+                return download_url
+        return None
+    except Exception:
+        return None
+
+def _fshare_api_list_folder(url: str, token: str, session: requests.Session) -> List[Dict[str, Any]]:
+    """List files in an FShare folder via API. Returns list of file info dicts."""
+    try:
+        # Extract folder code from URL
+        match = re.search(r'fshare\.vn/folder/([a-zA-Z0-9]+)', url)
+        if not match:
+            return []
+        folder_code = match.group(1)
+        
+        # FShare API folder listing
+        page = 1
+        all_files = []
+        while True:
+            data = {"token": token, "url": url, "dirOnly": 0, "pageIndex": page}
+            resp = session.post(f"{FSHARE_API_URL}/fileops/listDir",
+                               json=data,
+                               headers={"User-Agent": "okhttp/3.6.0", "Content-Type": "application/json"},
+                               timeout=REQUEST_TIMEOUT)
+            if resp.status_code != 200:
+                break
+            result = resp.json()
+            items = result if isinstance(result, list) else result.get("items", result.get("data", []))
+            if not items:
+                break
+            for item in items:
+                if item.get("type") == 1:  # type 1 = file (not subfolder)
+                    all_files.append({
+                        "name": item.get("name", "unknown"),
+                        "url": f"https://www.fshare.vn/file/{item.get('linkcode', '')}",
+                        "size": item.get("size", 0),
+                    })
+            # Check if there are more pages
+            if len(items) < 50:  # Assume page size is ~50
+                break
+            page += 1
+        return all_files
+    except Exception:
+        return []
+
+def _fshare_extract_filename(url: str, session: requests.Session) -> str:
+    """Extract filename from an FShare file page by scraping the HTML."""
+    try:
+        resp = session.get(url, timeout=REQUEST_TIMEOUT,
+                          headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+        if resp.status_code == 200:
+            # Try to extract filename from the page title or file info section
+            title_match = re.search(r'<title>([^<]+)</title>', resp.text)
+            if title_match:
+                title = title_match.group(1).strip()
+                # FShare titles are typically "filename - Fshare" or just "filename"
+                title = re.sub(r'\s*[-|]\s*[Ff]share.*$', '', title).strip()
+                if title and title.lower() not in ['fshare', 'fshare.vn', '']:
+                    return sanitize_filename(title)
+            # Try data attribute or download button text
+            name_match = re.search(r'class="file-name[^"]*"[^>]*>([^<]+)<', resp.text)
+            if name_match:
+                return sanitize_filename(name_match.group(1).strip())
+    except Exception:
+        pass
+    # Fallback: extract from URL
+    match = re.search(r'fshare\.vn/file/([a-zA-Z0-9]+)', url)
+    return f"fshare_{match.group(1)}" if match else "fshare_download"
+
+def save_fshare_cookies(session: requests.Session):
+    """Save FShare session cookies to json file."""
+    try:
+        if not os.path.exists(UD_CONFIG_PATH):
+            os.makedirs(UD_CONFIG_PATH, exist_ok=True)
+        cookies = requests.utils.dict_from_cookiejar(session.cookies)
+        with open(FSHARE_COOKIE_FILE, 'w') as f:
+            json.dump(cookies, f)
+    except Exception as e:
+        print(f"   ⚠️ Could not save FShare cookies: {e}")
+
+def load_fshare_cookies(session: requests.Session) -> bool:
+    """Load FShare session cookies from json file if it exists."""
+    try:
+        if os.path.exists(FSHARE_COOKIE_FILE):
+            with open(FSHARE_COOKIE_FILE, 'r') as f:
+                cookies = json.load(f)
+            session.cookies.update(requests.utils.cookiejar_from_dict(cookies))
+            return True
+    except Exception as e:
+        print(f"   ⚠️ Could not load FShare cookies: {e}")
+    return False
+
+def _is_fshare_logged_in(session: requests.Session) -> bool:
+    """Verify if FShare session is active by requesting the login page."""
+    try:
+        resp = session.get("https://www.fshare.vn/site/login",
+                           headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                           timeout=10,
+                           allow_redirects=True)
+        return "/site/login" not in resp.url
+    except Exception:
+        return False
+
+def _fshare_web_login(email: str, password: str, session: requests.Session) -> bool:
+    """Login to FShare via web interface. Returns True on success."""
+    try:
+        # Get the login page to obtain CSRF token and session cookie
+        login_url = "https://www.fshare.vn/site/login"
+        login_page = session.get(login_url,
+                                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                                timeout=REQUEST_TIMEOUT)
+        
+        # Check if CAPTCHA is present on page load
+        if 'robot' in login_page.text or 'phép tính' in login_page.text:
+            print(f"   ⚠️ FShare: Robot verification (CAPTCHA) detected on login page. Please log in to fshare.vn in your web browser first to clear the challenge.")
+            return False
+            
+        # Extract CSRF token - FShare uses "_csrf-app" as the parameter name
+        # Method 1: From hidden input field (most reliable)
+        csrf_input = re.search(r'name="(_csrf-app)"\s+value="([^"]+)"', login_page.text)
+        if csrf_input:
+            csrf_param = csrf_input.group(1)
+            csrf_token = csrf_input.group(2)
+        else:
+            # Method 2: From meta tags
+            csrf_param_meta = re.search(r'name="csrf-param"\s+content="([^"]+)"', login_page.text)
+            csrf_token_meta = re.search(r'name="csrf-token"\s+content="([^"]+)"', login_page.text)
+            csrf_param = csrf_param_meta.group(1) if csrf_param_meta else "_csrf-app"
+            csrf_token = csrf_token_meta.group(1) if csrf_token_meta else ""
+        
+        if not csrf_token:
+            print(f"   ⚠️ FShare: Could not extract CSRF token from login page")
+            return False
+            
+        print(f"   ℹ️ FShare: Extracted CSRF token successfully ({csrf_param}={csrf_token[:15]}...)")
+        
+        # Submit login form
+        login_data = {
+            csrf_param: csrf_token,
+            "LoginForm[email]": email,
+            "LoginForm[password]": password,
+            "LoginForm[rememberMe]": "0",
+        }
+        
+        resp = session.post(login_url,
+                           data=login_data,
+                           headers={
+                               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                               "Referer": login_url,
+                               "Content-Type": "application/x-www-form-urlencoded",
+                           },
+                           timeout=REQUEST_TIMEOUT,
+                           allow_redirects=True)
+        
+        print(f"   ℹ️ FShare: Login POST status code: {resp.status_code}")
+        print(f"   ℹ️ FShare: Response URL after redirect: {resp.url}")
+        
+        # Check if login succeeded:
+        # - Failed login: stays on /site/login and contains LoginForm fields
+        # - Successful login: redirects away from /site/login (e.g. to homepage or dashboard)
+        if '/site/login' not in resp.url:
+            print(f"   ✅ FShare: Redirected away from login page to {resp.url}")
+            save_fshare_cookies(session)
+            return True
+        
+        # If still on login page, check if the login form is gone (another success indicator)
+        if 'LoginForm[email]' not in resp.text:
+            print(f"   ✅ FShare: LoginForm[email] not found in response text. Assuming logged in.")
+            save_fshare_cookies(session)
+            return True
+            
+        # Check if CAPTCHA is present in failed POST response
+        if 'robot' in resp.text or 'phép tính' in resp.text:
+            print(f"   ⚠️ FShare: Robot verification (CAPTCHA) detected. Please log in to fshare.vn in your web browser first to clear the challenge.")
+        
+        # Let's print out potential errors shown on the page (mdc-text-field-helper-line or error classes)
+        val_msg_match = re.search(r'class="[^"]*validation-msg[^"]*"[^>]*>([^<]+)', resp.text)
+        if val_msg_match:
+            print(f"   ⚠️ FShare login page error: {val_msg_match.group(1).strip()}")
+        else:
+            error_match = re.search(r'class="[^"]*error[^"]*"[^>]*>([^<]+)', resp.text, re.IGNORECASE)
+            if error_match and error_match.group(1).strip():
+                print(f"   ⚠️ FShare login page error: {error_match.group(1).strip()}")
+            else:
+                # Let's check for yii validation errors
+                yii_errors = re.findall(r'class="help-block"[^>]*>([^<]+)', resp.text)
+                if yii_errors:
+                    print(f"   ⚠️ FShare validation errors: {yii_errors}")
+                else:
+                    invalid_fields = re.findall(r'class="[^"]*mdc-text-field--invalid[^"]*"', resp.text)
+                    if invalid_fields:
+                        print(f"   ⚠️ FShare login page has invalid input fields indicator")
+        
+        # Delete cookies on failure
+        if os.path.exists(FSHARE_COOKIE_FILE):
+            try:
+                os.remove(FSHARE_COOKIE_FILE)
+            except Exception:
+                pass
+        return False
+    except Exception as e:
+        print(f"   ❌ FShare login exception: {str(e)}")
+        # Delete cookies on failure
+        if os.path.exists(FSHARE_COOKIE_FILE):
+            try:
+                os.remove(FSHARE_COOKIE_FILE)
+            except Exception:
+                pass
+        return False
+
+def _fshare_web_get_download_link(url: str, session: requests.Session) -> Optional[str]:
+    """Get direct download link from FShare file page (requires logged-in session).
+    
+    FShare's download mechanism works via an AJAX POST to /download/get with the
+    file's linkcode and CSRF token. The response is JSON: {url: "...", wait_time: N}.
+    For VIP users, wait_time is 0 and url is the direct download link.
+    """
+    try:
+        # Step 1: Visit the file page to get CSRF token and linkcode
+        resp = session.get(url,
+                          headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                          timeout=REQUEST_TIMEOUT)
+        
+        if resp.status_code != 200:
+            print(f"      🔍 File page returned status {resp.status_code}")
+            return None
+        
+        # Check for password protection
+        if 'password' in resp.text.lower() and 'FilePasswordForm' in resp.text:
+            print(f"   ⚠️ FShare: File is password-protected (not supported)")
+            return None
+        
+        # Extract CSRF token from the #form-download hidden input
+        csrf_input = re.search(r'name="(_csrf-app)"\s+value="([^"]+)"', resp.text)
+        if csrf_input:
+            csrf_param = csrf_input.group(1)
+            csrf_token = csrf_input.group(2)
+        else:
+            # Fallback to meta tags
+            csrf_param_meta = re.search(r'name="csrf-param"\s+content="([^"]+)"', resp.text)
+            csrf_token_meta = re.search(r'name="csrf-token"\s+content="([^"]+)"', resp.text)
+            csrf_param = csrf_param_meta.group(1) if csrf_param_meta else "_csrf-app"
+            csrf_token = csrf_token_meta.group(1) if csrf_token_meta else ""
+        
+        if not csrf_token:
+            print(f"      🔍 No CSRF token found on file page (may not be logged in)")
+            return None
+        
+        # Extract linkcode from the form or URL
+        linkcode_input = re.search(r'name="linkcode"\s+value="([^"]+)"', resp.text)
+        if linkcode_input:
+            linkcode = linkcode_input.group(1)
+        else:
+            # Fallback: extract from URL
+            linkcode_match = re.search(r'fshare\.vn/file/([a-zA-Z0-9]+)', url)
+            if not linkcode_match:
+                return None
+            linkcode = linkcode_match.group(1)
+        
+        # Step 2: POST to /download/get (the AJAX endpoint used by download.js)
+        download_data = {
+            csrf_param: csrf_token,
+            "linkcode": linkcode,
+            "withFcode5": "0",
+        }
+        
+        dl_resp = session.post("https://www.fshare.vn/download/get",
+                              data=download_data,
+                              headers={
+                                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                                  "Referer": url,
+                                  "X-Requested-With": "XMLHttpRequest",  # Mark as AJAX request
+                              },
+                              timeout=60)
+        
+        if dl_resp.status_code == 200:
+            try:
+                result = dl_resp.json()
+                if "url" in result and result["url"]:
+                    download_url = result["url"]
+                    wait_time = result.get("wait_time", 0)
+                    if wait_time > 0:
+                        print(f"      ⏳ Wait time {wait_time}s (free account speed limit)")
+                    return download_url
+                elif result.get("policydownload") or result.get("policydowload"):
+                    # FShare policy restriction (note: FShare API has a typo 'policydowload')
+                    print(f"      ❌ FShare download policy restriction")
+                    return "FSHARE_LIMIT_REACHED"
+                elif "errors" in result:
+                    errors = result["errors"]
+                    if "linkcode" in errors:
+                        print(f"      ❌ {errors['linkcode'][0]}")
+                    elif "fcode" in errors:
+                        print(f"      ❌ {errors['fcode'][0]}")
+                    else:
+                        print(f"      ❌ Errors: {errors}")
+                else:
+                    print(f"      🔍 Unexpected response: {str(result)[:200]}")
+            except (ValueError, KeyError):
+                print(f"      🔍 Non-JSON response from /download/get: {dl_resp.text[:200]}")
+        else:
+            print(f"      🔍 /download/get returned status {dl_resp.status_code}")
+        
+        return None
+    except Exception as e:
+        print(f"   ❌ FShare download error: {str(e)[:80]}")
+        return None
+
+# Cached FShare web session — reused across all links in a batch to avoid repeated logins
+_fshare_cached_session: Optional[requests.Session] = None
+_fshare_cached_session_email: str = ""
+_fshare_cached_session_time: float = 0  # time.time() when session was last verified
+
+def _get_fshare_web_session(email: str, password: str) -> Optional[requests.Session]:
+    """Get or create a cached FShare web session. Logs in only once per batch."""
+    global _fshare_cached_session, _fshare_cached_session_email, _fshare_cached_session_time
+    
+    # If we have a cached session for the same email, trust it if recently verified (<5 min)
+    if _fshare_cached_session and _fshare_cached_session_email == email:
+        elapsed = time.time() - _fshare_cached_session_time
+        if elapsed < 300:  # Trust cached session for 5 minutes without re-verifying
+            print(f"   ✅ FShare: Reusing active session (skipped login)")
+            return _fshare_cached_session
+        # Session is old, verify it's still active
+        if _is_fshare_logged_in(_fshare_cached_session):
+            print(f"   ✅ FShare: Reusing active session (skipped login)")
+            _fshare_cached_session_time = time.time()
+            return _fshare_cached_session
+        else:
+            print(f"   ℹ️ FShare: Cached session expired, logging in again...")
+            _fshare_cached_session = None
+    
+    # Create a new session
+    session = requests.Session()
+    
+    # Try to load saved cookies from disk
+    if load_fshare_cookies(session):
+        if _is_fshare_logged_in(session):
+            print(f"   ✅ FShare: Restored saved session (skipped login)")
+            _fshare_cached_session = session
+            _fshare_cached_session_email = email
+            _fshare_cached_session_time = time.time()
+            return session
+    
+    # Need a fresh login
+    if _fshare_web_login(email, password, session):
+        _fshare_cached_session = session
+        _fshare_cached_session_email = email
+        _fshare_cached_session_time = time.time()
+        return session
+    
+    # Login failed
+    _fshare_cached_session = None
+    return None
+
+def resolve_fshare(url: str, email: str, password: str) -> List[Tuple[str, str]]:
+    """Resolve FShare URL to direct download link(s) via web scraping.
+    
+    Supports both file URLs (fshare.vn/file/...) and folder URLs (fshare.vn/folder/...).
+    Uses a cached session to avoid repeated logins when resolving multiple links.
+    """
+    if not email or not password:
+        print(f"   ❌ FShare credentials required (set in Settings → FShare Account)")
+        return []
+    
+    # Determine if this is a folder or file URL
+    is_folder = '/folder/' in url
+    
+    results: List[Tuple[str, str]] = []
+    
+    print(f"   🇻🇳 Resolving FShare: {url[:60]}...")
+    session = _get_fshare_web_session(email, password)
+    if not session:
+        print(f"   ❌ FShare: Login failed — click Resolve Links again to retry")
+        return []
+    
+    if is_folder:
+        # Use FShare's internal web API to list folder contents
+        try:
+            # Extract linkcode from URL (e.g., /folder/ABC123XYZ -> ABC123XYZ)
+            linkcode_match = re.search(r'/folder/([a-zA-Z0-9]+)', url)
+            if not linkcode_match:
+                print(f"   ❌ FShare: Could not extract folder linkcode from URL")
+                return []
+            linkcode = linkcode_match.group(1)
+            
+            all_files = []
+            page = 1
+            per_page = 50
+            
+            while True:
+                api_url = f"https://www.fshare.vn/api/v3/files/folder?linkcode={linkcode}&sort=type,name&page={page}&per-page={per_page}"
+                resp = session.get(api_url,
+                                   headers={
+                                       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                                       "Accept": "application/json",
+                                       "X-Requested-With": "XMLHttpRequest",
+                                       "Referer": url,
+                                   },
+                                   timeout=REQUEST_TIMEOUT)
+                
+                if resp.status_code != 200:
+                    print(f"   ❌ FShare folder API returned status {resp.status_code}")
+                    break
+                
+                try:
+                    data = resp.json()
+                except ValueError:
+                    print(f"   ❌ FShare folder API returned non-JSON response")
+                    break
+                
+                items = data if isinstance(data, list) else data.get("items", data.get("data", []))
+                if not items:
+                    break
+                
+                for item in items:
+                    if isinstance(item, dict):
+                        # FShare: type=1 is file, type=0 is folder
+                        item_type = item.get("type")
+                        if item_type == 0:
+                            continue  # Skip sub-folders
+                        
+                        name = item.get("name", "")
+                        item_linkcode = item.get("linkcode", "")
+                        size = item.get("size", 0)
+                        
+                        if name and item_linkcode:
+                            file_url = f"https://www.fshare.vn/file/{item_linkcode}"
+                            all_files.append({"url": file_url, "name": name, "size": int(size) if size else 0})
+                
+                # Check pagination via 'links' dict
+                # links = {"self": "...?page=1", "first": "...?page=1", "last": "...?page=N"}
+                links = data.get("links", {}) if isinstance(data, dict) else {}
+                last_link = links.get("last", "")
+                has_more = False
+                
+                if last_link:
+                    last_page_match = re.search(r'page=(\d+)', last_link)
+                    if last_page_match:
+                        total_pages = int(last_page_match.group(1))
+                        has_more = page < total_pages
+                
+                # Fallback: if we got exactly per_page items, there are likely more pages
+                if not has_more and len(items) >= per_page:
+                    has_more = True
+                
+                if not has_more:
+                    break
+                page += 1
+                time.sleep(0.5)  # Rate limit between pages
+            
+            if all_files:
+                total = len(all_files)
+                print(f"   📁 FShare folder: {total} file(s) listed")
+                print(f"   💡 Download links will be resolved when you click 'Start Download'")
+                print(f"   💡 Remove unwanted files from the queue first to save your daily download limit")
+                for f_info in all_files:
+                    file_url = f_info["url"]
+                    filename = f_info["name"]
+                    results.append((file_url, sanitize_filename(filename)))
+                return results
+            else:
+                print(f"   ⚠️ FShare: No files found in folder (folder may be empty or require login)")
+        except Exception as e:
+            print(f"   ❌ FShare folder error: {str(e)[:80]}")
+        return []
+    else:
+        # Single file via web
+        filename = _fshare_extract_filename(url, session)
+        dl_link = _fshare_web_get_download_link(url, session)
+        if dl_link and dl_link != "FSHARE_LIMIT_REACHED":
+            print(f"   ✅ FShare (web): {filename}")
+            return [(dl_link, sanitize_filename(filename))]
+        elif dl_link == "FSHARE_LIMIT_REACHED":
+            print(f"   🛑 FShare daily download limit reached — try again tomorrow")
+            return []
+        else:
+            print(f"   ❌ FShare: Could not extract download link — VIP account may be required")
+            return []
+
+def _tb_task_requestdl_parts(task: DownloadTask) -> Optional[Tuple[str, str, str, str]]:
+    """Return requestdl routing fields for a TorBox file task."""
+    if task.link_type != 'tb_magnet_file' or not task.original_url or ':' not in task.original_url:
+        return None
+    # split(':', 1) — same convention _group_tasks_by_torrent uses to read this field
+    item_ref, file_id = task.original_url.split(':', 1)
+    endpoint, _, item_id = item_ref.rpartition('/')
+    endpoint = endpoint or 'torrents'
+    id_param = _TB_REQUESTDL_ID_PARAM.get(endpoint, 'torrent_id')
+    return endpoint, id_param, item_id, file_id
+
+def _tb_task_download_url(task: DownloadTask, tb_key: str = "", attempts: int = 5) -> Tuple[str, str]:
+    """Mint a direct URL for one TorBox file task just before it downloads."""
+    request_parts = _tb_task_requestdl_parts(task)
+    if not request_parts:
+        return '', 'Invalid TorBox file reference'
+    effective_key = tb_key or token_tb.value.strip()
+    if not effective_key:
+        return '', 'TorBox token required'
+    return _tb_requestdl(*request_parts, effective_key, attempts=attempts)
+
+def _tb_url_refresher(task: DownloadTask, tb_key: str = "") -> Optional[Callable[[], str]]:
+    """Build a fresh-link minter for a TorBox file task, or None for other types.
+
+    The parallel worker uses this both to mint the initial URL just in time and to
+    replace an expired URL between aria2 attempts. original_url keeps the stable
+    '{endpoint}/{item_id}:{file_id}' handle needed for either request."""
+    if not _tb_task_requestdl_parts(task):
+        return None
+
+    def _refresh() -> str:
+        url, _err = _tb_task_download_url(task, tb_key, attempts=2)
+        return url
+    return _refresh
+
+# --- PARALLEL DOWNLOAD WORKER ---
+def download_worker(task: DownloadTask, gofile_token: str, move_queue: Optional[queue.Queue] = None,
+                    tb_key: str = "") -> DownloadTask:
+    """Worker function for parallel downloads. Returns updated task.
+
+    With move_queue (the "Overlap Drive moves" setting), a finished download is
+    handed to the mover thread and this worker frees its pool slot for the next
+    download; the mover owns the task's done/failed transition from there."""
+    if _cancel_requested:
+        return task  # Never started — stays "pending" so resume picks it up untouched
+    task.status = "downloading"
+    try:
+        download_url = task.url
+        url_refresh = _tb_url_refresher(task, tb_key)
+        if task.link_type == 'tb_magnet_file':
+            # Resolve only when this worker has a real download slot. A 153-file
+            # torrent with three workers therefore holds at most three newly-minted
+            # links rather than requesting all 153 before the first transfer starts.
+            download_url, dl_err = _tb_task_download_url(task, tb_key)
+            if not download_url:
+                task.status = "failed"
+                task.error = f"TorBox link resolution failed: {dl_err}"[:100]
+                with print_lock:
+                    print(f"   ❌ {task.filename[:50]}: {task.error}")
+                return task
+            task.filename = _strip_size_suffix(task.filename)
+        # update_bar=False: the batch monitor thread owns the shared progress bar
+        f = download_with_aria2(download_url, task.filename, COLAB_ROOT, task.cookie, task_id=task.id,
+                                update_bar=False, url_refresh=url_refresh)
+        if f is DUPLICATE_SKIP:
+            task.status = "skipped"  # Already in Drive — not a failure, don't retry on resume
+        elif f and move_queue is not None:
+            task.status = "moving"
+            while True:  # Bounded queue caps the local-disk backlog — block here until the mover catches up
+                try:
+                    move_queue.put((task, f), timeout=1)
+                    break
+                except queue.Full:
+                    if _cancel_requested:
+                        task.status = "failed"
+                        task.error = "Interrupted before Drive move (file kept locally)"
+                        break
+        elif f:
+            # Same "moving" state the overlapped path uses. Without it the task stays
+            # "downloading" for the whole (blocking) Drive transfer and keeps rendering
+            # at its last aria2 percentage — which reads as a download stuck at 99%.
+            task.status = "moving"
+            handle_file_processing(f, source=task.source)
+            task.status = "done"
+        elif _cancel_requested:
+            task.status = "failed"
+            task.error = "Cancelled by user"
+        else:
+            task.status = "failed"
+            if download_stats.get(task.id, {}).get('disk_gave_up'):
+                task.error = "Local disk full — Drive moves couldn't free space in time"
+            else:
+                task.error = "Download returned None"
+    except KeyboardInterrupt:
+        if not cancel_requested():
+            raise
+        task.status = "failed"
+        task.error = "Cancelled by user"
+    except Exception as e:
+        task.status = "failed"
+        task.error = str(e)[:100]
+    return task
+
+def _drive_mover(move_queue: queue.Queue, save_progress):
+    """Consume (task, file_path) items from the download pool and move each file to Drive.
+
+    Several of these run at once (drive_movers_slider). With the Drive API path these
+    threads do the uploading themselves, so their count sets real upload concurrency —
+    unlike a write to the FUSE mount, which only fills a local cache that drivefs's
+    own single background uploader then drains (adding writers there measurably bought
+    nothing). The download pool's size is dictated by debrid concurrency limits, so
+    mover count has to scale separately from it.
+
+    Each thread consumes exactly one None sentinel and exits; the shutdown path
+    puts one per thread."""
+    while True:
+        item = move_queue.get()
+        if item is None:
+            move_queue.task_done()
+            return
+        task, path = item
+        try:
+            if cancel_requested():
+                raise KeyboardInterrupt("cancelled before Drive move")
+            handle_file_processing(path, source=task.source)
+            task.status = "done"
+        except KeyboardInterrupt:
+            if not cancel_requested():
+                raise
+            # Upload cancellation uses KeyboardInterrupt to bypass the API-to-mount
+            # fallback. Consume it at the worker boundary, save the retryable task,
+            # and keep draining the queue until this mover receives its sentinel.
+            task.status = "failed"
+            task.error = "Cancelled by user"
+        except Exception as e:
+            task.status = "failed"
+            task.error = str(e)[:100]
+        finally:
+            move_queue.task_done()
+        save_progress()
+
+# --- URL CLASSIFICATION ---
+STREAMING_HOSTS = ('youtube.com', 'youtu.be', 'vimeo.com', 'twitch.tv', 'ok.ru')
+
+def _url_host(url: str) -> str:
+    """Return the lowercased hostname of a URL ('' if unparseable)."""
+    try:
+        return (urlparse(url).hostname or '').lower()
+    except Exception:
+        return ''
+
+def url_matches_host(url: str, hosts) -> bool:
+    """True if the URL's hostname equals one of `hosts` or is a subdomain of one.
+    Hostname-based (not substring) so 'evil.com/?x=mega.nz' does not match."""
+    host = _url_host(url)
+    if not host:
+        return False
+    return any(host == h or host.endswith('.' + h) for h in hosts)
+
+def _classify_url(url: str, has_debrid: bool) -> str:
+    """Map a URL to a resolver kind (mirrors the historical routing order)."""
+    if url_matches_host(url, ('transfer.it',)):
+        return 'transfer'
+    if url_matches_host(url, ('mega.nz',)):
+        return 'mega'
+    if url_matches_host(url, STREAMING_HOSTS):
+        return 'stream'
+    if url_matches_host(url, ('archive.org',)) and '/details/' in urlparse(url).path:
+        return 'stream'
+    if url_matches_host(url, ('gofile.io',)):
+        return 'gofile'
+    if url_matches_host(url, ('pixeldrain.com',)):
+        return 'pixeldrain'
+    if url_matches_host(url, ('mediafire.com',)):
+        return 'mediafire'
+    if url_matches_host(url, ('1fichier.com',)):
+        return '1fichier'
+    if url.startswith('magnet:'):
+        return 'magnet'
+    if url_matches_host(url, ('real-debrid.com',)) and '/d/' in urlparse(url).path:
+        return 'rd_direct'
+    if url_matches_host(url, ('fshare.vn',)):
+        return 'fshare'
+    if url_matches_host(url, ('torbox.app',)) and 'id=' in (urlparse(url).query or ''):
+        return 'tb_folder'
+    if url_matches_host(url, ('tb-cdn.io',)):
+        return 'tb_cdn'
+    if has_debrid and url_matches_host(url, DEBRID_SUPPORTED_HOSTS):
+        return 'debrid_host'
+    if has_debrid and url.startswith('http') and not url_matches_host(url, ('archive.org',)):
+        return 'debrid_generic'
+    return 'direct'
+
+def resolve_all_links(urls: List[str], session: requests.Session, tokens: dict, rd_key: str, tb_key: str = "", debrid_service: str = "rd") -> Tuple[List[DownloadTask], List[str], List[str], List[str]]:
+    """
+    Pre-resolve all links into DownloadTasks.
+    Returns: (parallel_tasks, youtube_urls, mega_urls, debrid_urls)
+    debrid_service: 'rd', 'tb', or 'none'
+
+    Independent HTTP resolvers (Gofile/Pixeldrain/TorBox-CDN and, when no debrid
+    service is active, MediaFire/1fichier) run concurrently. Rate-limited services
+    (debrid APIs, FShare) stay sequential. Results keep the original URL order.
+    """
+    global _rd_magnet_delay
+    _rd_magnet_delay = 0  # Reset adaptive pacing for each new batch
+    parallel_tasks: List[DownloadTask] = []
+    youtube_urls: List[str] = []
+    mega_urls: List[str] = []
+    debrid_urls: List[str] = []
+
+    # Determine which debrid key is active
+    has_debrid = bool((debrid_service == 'rd' and rd_key) or (debrid_service == 'tb' and tb_key))
+
+    classified = [(url, _classify_url(url, has_debrid)) for url in urls]
+
+    # Kick off independent resolvers concurrently (keyed by position - URLs may repeat)
+    futures = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for i, (url, kind) in enumerate(classified):
+            if kind == 'gofile':
+                futures[i] = executor.submit(resolve_gofile, url, session, tokens)
+            elif kind == 'pixeldrain':
+                futures[i] = executor.submit(resolve_pixeldrain, url, session)
+            elif kind == 'mediafire' and not has_debrid:
+                futures[i] = executor.submit(resolve_mediafire, url, session)
+            elif kind == '1fichier' and not has_debrid:
+                futures[i] = executor.submit(resolve_1fichier, url, session)
+            elif kind == 'tb_cdn':
+                futures[i] = executor.submit(_resolve_tb_cdn, url, session)
+
+        for i, (url, kind) in enumerate(classified):
+            if kind == 'transfer':
+                mega_urls.append(url)
+            elif kind == 'mega':
+                if debrid_service == 'rd' and rd_key:
+                    # Try RD for MEGA (handles all URL formats)
+                    resolved = resolve_rd_link(url, rd_key)
+                    if resolved:
+                        for u, n in resolved:
+                            parallel_tasks.append(DownloadTask(
+                                url=u, filename=n, source="mega", link_type="rd",
+                                original_url=url
+                            ))
+                    else:
+                        # RD failed (e.g. ip_not_allowed from Colab) - fall back to megadl
+                        print(f"   ⤴️ Falling back to megadl for: {url[:60]}...")
+                        mega_urls.append(url)
+                elif debrid_service == 'tb' and tb_key:
+                    # Try TorBox for MEGA via web download
+                    resolved = resolve_tb_link(url, tb_key)
+                    if resolved:
+                        for u, n in resolved:
+                            parallel_tasks.append(DownloadTask(
+                                url=u, filename=n, source="mega", link_type="tb",
+                                original_url=url
+                            ))
+                    else:
+                        print(f"   ⤴️ Falling back to megadl for: {url[:60]}...")
+                        mega_urls.append(url)
+                else:
+                    mega_urls.append(url)
+            elif kind == 'stream':
+                youtube_urls.append(url)
+            elif kind == 'gofile':
+                for u, n in futures[i].result():
+                    parallel_tasks.append(DownloadTask(
+                        url=u, filename=n, source="gofile", link_type="gofile",
+                        cookie=tokens.get('token'), original_url=url  # Store original for re-resolve
+                    ))
+            elif kind == 'pixeldrain':
+                for u, n in futures[i].result():
+                    parallel_tasks.append(DownloadTask(
+                        url=u, filename=n, source="pixeldrain", link_type="pixeldrain",
+                        original_url=url  # Store original for re-resolve
+                    ))
+            elif kind in ('mediafire', '1fichier'):
+                # Prefer active debrid service, fall back to the direct resolver
+                if debrid_service == 'rd' and rd_key:
+                    resolved = resolve_rd_link(url, rd_key)
+                    link_type = "rd"
+                elif debrid_service == 'tb' and tb_key:
+                    resolved = resolve_tb_link(url, tb_key)
+                    link_type = "tb"
+                else:
+                    resolved = futures[i].result()
+                    link_type = kind
+                for u, n in resolved:
+                    parallel_tasks.append(DownloadTask(
+                        url=u, filename=n, source=kind, link_type=link_type,
+                        original_url=url
+                    ))
+            elif kind == 'magnet':
+                # Resolve magnet to individual files via active debrid service
+                if debrid_service == 'rd' and rd_key:
+                    # Adaptive pacing: delay only after a rate-limit has been hit
+                    if _rd_magnet_delay > 0:
+                        time.sleep(_rd_magnet_delay)
+                    parallel_tasks.extend(resolve_magnet_files(url, rd_key))
+                elif debrid_service == 'tb' and tb_key:
+                    parallel_tasks.extend(resolve_tb_magnet_files(url, tb_key))
+                else:
+                    print(f"   ❌ Debrid token required for magnet links (select Real-Debrid or TorBox)")
+            elif kind == 'tb_folder':
+                # torbox.app share links always resolve via TorBox regardless of toggle
+                tb_key_for_tb_links = tb_key or token_tb.value.strip()
+                parallel_tasks.extend(resolve_tb_folder_files(url, tb_key_for_tb_links))
+            elif kind == 'tb_cdn':
+                for u, n in futures[i].result():
+                    parallel_tasks.append(DownloadTask(
+                        url=u, filename=n, source="torbox", link_type="direct",
+                        original_url=url
+                    ))
+            elif kind == 'rd_direct':
+                # RD direct links - always use RD regardless of toggle
+                rd_key_for_rd_links = rd_key or token_rd.value.strip()
+                resolved = resolve_rd_link(url, rd_key_for_rd_links)
+                for u, n in resolved:
+                    parallel_tasks.append(DownloadTask(
+                        url=u, filename=n, source="rd", link_type="rd",
+                        original_url=url  # Store original for re-resolve
+                    ))
+            elif kind == 'fshare':
+                # FShare file or folder links - resolve with VIP account
+                fshare_email = token_fshare_email.value.strip()
+                fshare_password = token_fshare_password.value.strip()
+                resolved = resolve_fshare(url, fshare_email, fshare_password)
+                for u, n in resolved:
+                    parallel_tasks.append(DownloadTask(
+                        url=u, filename=n, source="fshare", link_type="fshare",
+                        original_url=url
+                    ))
+                if resolved:
+                    time.sleep(1)  # Rate limit between FShare link resolutions
+            elif kind == 'debrid_host':
+                # Route through active debrid service for supported premium hosts
+                if debrid_service == 'rd' and rd_key:
+                    resolved = resolve_rd_link(url, rd_key)
+                    for u, n in resolved:
+                        parallel_tasks.append(DownloadTask(
+                            url=u, filename=n, source="rd_host", link_type="rd",
+                            original_url=url
+                        ))
+                elif debrid_service == 'tb' and tb_key:
+                    resolved = resolve_tb_link(url, tb_key)
+                    for u, n in resolved:
+                        parallel_tasks.append(DownloadTask(
+                            url=u, filename=n, source="tb_host", link_type="tb",
+                            original_url=url
+                        ))
+            elif kind == 'debrid_generic':
+                # Other links through debrid - try unrestricting
+                debrid_urls.append(url)
+            else:
+                # Direct URL (including archive.org/download/ links)
+                filename = os.path.basename(unquote(urlparse(url).path)) or "download"
+                source = "archive" if url_matches_host(url, ('archive.org',)) else "direct"
+                parallel_tasks.append(DownloadTask(
+                    url=url, filename=filename, source=source, link_type="direct"
+                ))
+
+    return parallel_tasks, youtube_urls, mega_urls, debrid_urls
+
+
+def update_progress_display(tasks: List[DownloadTask]):
+    """Update overall progress bar and per-download progress bars."""
+    global last_display_speed
+    
+    active = [t for t in tasks if t.status == "downloading"]
+    moving = sum(1 for t in tasks if t.status == "moving")  # downloaded, Drive move pending (overlap mode)
+    done = sum(1 for t in tasks if t.status in ["done", "skipped"])
+    failed = sum(1 for t in tasks if t.status == "failed")
+    total = len(tasks)
+    now = time.time()
+    
+    # Collect aggregate speed and per-task progress from active downloads
+    total_speed_mbs = 0.0
+    active_pct_sum = 0.0
+    for t in active:
+        stats = download_stats.get(t.id)
+        if stats:
+            total_speed_mbs += stats['speed_mbs']
+            active_pct_sum += stats['pct'] / 100.0  # 0.0 – 1.0 contribution
+    
+    # Use current speed if available, otherwise keep last known speed
+    if total_speed_mbs > 0:
+        last_display_speed = total_speed_mbs
+    display_speed = last_display_speed if last_display_speed > 0 else total_speed_mbs
+    
+    # Disk-space guard readout (Colab local disk; inf when unmeasurable locally)
+    disk_free = _disk_free_gb()
+    if disk_free == float('inf'):
+        disk_part = ""
+    elif disk_free < DISK_START_GB:
+        disk_part = f" | <b style='color:orange'>💾 {disk_free:.1f} GB free</b>"
+    else:
+        disk_part = f" | 💾 {disk_free:.0f} GB free"
+
+    # --- OVERALL PROGRESS BAR ---
+    # Fractional progress: completed tasks + fractional progress of active tasks.
+    # Gives smooth continuous movement instead of staircase jumps.
+    display_progress = ((done + moving + active_pct_sum) / total) * 100 if total else 0
+    progress_bar.value = display_progress
+    progress_bar.bar_style = 'warning' if active else 'success' if done == total else 'info'
+    
+    # Calculate ETA based on remaining tasks and current speed
+    remaining = total - done - failed
+    eta_str = ""
+    if active and batch_start_time:
+        elapsed = now - batch_start_time
+        if done > 0:
+            avg_time_per_task = elapsed / done
+            eta_seconds = avg_time_per_task * remaining
+            if eta_seconds < 60:
+                eta_str = f"{int(eta_seconds)}s"
+            elif eta_seconds < 3600:
+                eta_str = f"{int(eta_seconds // 60)}m {int(eta_seconds % 60)}s"
+            else:
+                eta_str = f"{int(eta_seconds // 3600)}h {int((eta_seconds % 3600) // 60)}m"
+    
+    if active:
+        speed_str = f"{display_speed:.1f} MB/s" if display_speed > 0 else "starting..."
+        eta_part = f" | ⏱️ {eta_str}" if eta_str else ""
+        moving_part = f" | 📤 {moving} moving" if moving else ""
+        progress_bar.description = f"⚡ {done}/{total}"
+        status_label.value = f"<small>📊 <b>{len(active)} downloading</b>{moving_part} | ⬇️ {speed_str}{eta_part}{disk_part}</small>"
+    elif moving:
+        progress_bar.description = f"📤 {done}/{total}"
+        status_label.value = f"<small>📤 <b>{moving} file{'s' if moving != 1 else ''} moving to Drive...</b>{disk_part}</small>"
+    elif done == total:
+        progress_bar.description = f"✅ {done}/{total}"
+        status_label.value = ""
+        last_display_speed = 0.0  # Reset for next batch
+    elif failed > 0:
+        progress_bar.description = f"⚠️ {done}/{total}"
+        status_label.value = f"<small style='color:orange'>❌ {failed} failed</small>"
+    else:
+        progress_bar.description = f"DL {done}/{total}"
+    
+    # --- PER-DOWNLOAD PROGRESS BARS ---
+    finished_ids = {t.id for t in tasks if t.status in ('done', 'skipped', 'failed')}
+    
+    # Create bars for newly-active tasks
+    for t in active:
+        if t.id not in _per_task_bars:
+            name = t.filename[:40] if t.filename else t.url[:40]
+            if hasattr(_per_task_accordion, 'set_bars'):
+                bar = _ProgressRow(t.id, name)
+            else:
+                bar = widgets.FloatProgress(
+                    value=0.0, min=0.0, max=100.0,
+                    description=name,
+                    bar_style='info',
+                    style={'description_width': '220px'},
+                    layout=widgets.Layout(width='100%', height='22px')
+                )
+            _per_task_bars[t.id] = bar
+    
+    # Update active bars with live stats
+    for t in active:
+        bar = _per_task_bars.get(t.id)
+        if not bar:
+            continue
+        stats = download_stats.get(t.id)
+        if stats:
+            pct = stats['pct']
+            speed = stats['speed_mbs']
+            bar.value = pct
+            name = t.filename[:30] if t.filename else 'download'
+            if stats.get('disk_wait'):
+                bar.bar_style = 'info'
+                bar.description = f"⏸️ {name}  {int(pct)}% (low disk)"
+            else:
+                bar.bar_style = 'warning'
+                task_speed = f"{speed:.1f} MB/s" if speed > 0 else "starting..."
+                bar.description = f"{name}  {int(pct)}% ({task_speed})"
+
+    # Bars for tasks handed to the mover thread (download done, Drive move pending)
+    for t in tasks:
+        if t.status == "moving":
+            bar = _per_task_bars.get(t.id)
+            if bar:
+                bar.value = 100
+                bar.bar_style = 'info'
+                name = t.filename[:35] if t.filename else 'download'
+                bar.description = f"📤 {name}"
+
+    # Mark completed/failed/skipped bars for linger
+    for task_id in list(_per_task_bars.keys()):
+        if task_id in finished_ids and task_id not in _per_task_done_at:
+            _per_task_done_at[task_id] = now
+            bar = _per_task_bars[task_id]
+            task = next((t for t in tasks if t.id == task_id), None)
+            if not task:
+                continue
+            bar.value = 100
+            name = task.filename[:35] if task.filename else 'download'
+            if task.status == 'failed':
+                bar.bar_style = 'danger'
+                bar.description = f"❌ {name}"
+            elif task.status == 'skipped':
+                bar.bar_style = 'success'
+                bar.description = f"⏭️ {name}"
+            else:
+                bar.bar_style = 'success'
+                bar.description = f"✅ {name}"
+    
+    # Remove bars that have lingered long enough (race-safe: .pop instead of del)
+    for task_id in list(_per_task_done_at.keys()):
+        if now - _per_task_done_at.get(task_id, now) >= _PER_TASK_LINGER:
+            bar = _per_task_bars.pop(task_id, None)
+            if bar:
+                bar.close()
+            _per_task_done_at.pop(task_id, None)
+    
+    # Sync the progress content without rebuilding the disclosure control.
+    visible_bars = list(_per_task_bars.values())
+    if hasattr(_per_task_accordion, 'set_bars') and not _colab_live_status_active:
+        _per_task_accordion.set_bars(visible_bars)
+    if visible_bars:
+        if not hasattr(_per_task_accordion, 'set_bars'):
+            _per_task_box.children = visible_bars
+        active_count = len(active)
+        if active_count > 0:
+            agg_speed = f"{display_speed:.1f} MB/s" if display_speed > 0 else "starting..."
+            _per_task_accordion.set_title(0, f"📥 {active_count} active download{'s' if active_count != 1 else ''} ({agg_speed})")
+        else:
+            _per_task_accordion.set_title(0, "📥 Finishing...")
+        _per_task_accordion.layout.display = 'none' if _colab_live_status_active else 'block'
+    else:
+        _per_task_box.children = []
+        _per_task_accordion.layout.display = 'none'
+
+def progress_monitor(tasks: List[DownloadTask], interval: float = 0.5):
+    """Background thread to update progress display periodically."""
+    global stop_monitor
+    reported_error = False
+    while not stop_monitor:
+        try:
+            update_progress_display(tasks)
+        except Exception as e:
+            if not reported_error:
+                print(f'⚠️ Progress display error: {e}')
+                reported_error = True
+        finally:
+            time.sleep(interval)
+
+
+def _run_download_pipeline(
+    all_tasks: List[DownloadTask],
+    parallel_tasks: List[DownloadTask],
+    youtube_urls: List[str],
+    mega_urls: List[str],
+    debrid_urls: List[str],
+    mode: str,
+    gofile_token: str,
+    rd_key: str,
+    max_workers: int,
+    magnet_file_tasks: Optional[List[DownloadTask]] = None,
+    tb_magnet_file_tasks: Optional[List[DownloadTask]] = None,
+    tb_key: str = "",
+    live_manager: Optional[LiveBatchManager] = None
+) -> Tuple[int, int]:
+    """
+    Shared download orchestration for parallel and sequential downloads.
+
+    Returns: (total_success, total_failed) counts
+    """
+    global yt_success_cumulative, yt_fail_cumulative, stop_monitor, batch_start_time, _live_status_tasks
+    import threading
+
+    start_keep_alive()
+    if globals().get('_live_batch') is not None:
+        _live_status_tasks = all_tasks
+    download_stats.clear()  # Drop progress entries from any previous batch
+    _clear_per_task_bars()
+    if live_manager is None and _live_batch is None:
+        _reset_cancel_state()
+    # Synchronous batches use the kernel interrupt; live batches use the Stop button.
+    if live_manager is None:
+        stop_hint.value = ("<div style='padding:4px 8px;background:#5a1e1e;border-radius:4px;"
+                           "display:inline-block'>⏹ <b>To stop:</b> menu <b>Runtime → Interrupt execution</b> "
+                           "&nbsp;(shortcut <b>Ctrl+M&nbsp;I</b>, Mac <b>⌘+M&nbsp;I</b>) — progress is saved for Resume/Retry.</div>")
+    else:
+        stop_hint.value = "<div style='padding:4px 8px'>Use <b>⏹ Stop Download</b> to save unfinished files for Resume.</div>"
+    stop_hint.layout.display = 'block'
+
+    def save_progress(throttle: bool = True):
+        """Persist batch state; throttled by default so per-task completions
+        don't hammer the (slow) Drive FUSE mount with JSON writes."""
+        save_session(all_tasks,
+                     playlist_range=playlist_selection.value.strip(),
+                     yt_success=yt_success_cumulative,
+                     yt_fail=yt_fail_cumulative,
+                     subtitle_langs_value=subtitle_langs.value,
+                     throttle=throttle)
+
+    # tb_magnet_file tasks come from torbox.app share links (which resolve via
+    # TorBox regardless of the debrid toggle) or TorBox magnet selections — so
+    # downloading them must not depend on the toggle either.
+    tb_file_key = tb_key or token_tb.value.strip()
+
+    # --- TORBOX: cached items download in parallel, not one-by-one ---
+    if tb_magnet_file_tasks and tb_file_key:
+        tb_ready, tb_magnet_file_tasks = convert_tb_tasks_to_parallel(tb_magnet_file_tasks, tb_file_key)
+        if tb_ready:
+            print(f"🔗 TorBox: {len(tb_ready)} cached file(s) will resolve as parallel slots open")
+            parallel_tasks = list(parallel_tasks) + tb_ready
+
+    # --- PARALLEL DOWNLOADS ---
+    if parallel_tasks:
+        total_parallel = len(parallel_tasks)
+        _reset_drive_xfer_stats()  # Per-batch, so the summary compares like with like
+        move_queue = None
+        mover_threads = []
+        if async_moves_checkbox.value:
+            # Overlap mode: workers hand finished files to the mover pool and immediately
+            # start the next download. Mover count is deliberately independent of
+            # max_workers: the download pool is sized by the debrid plan's concurrent
+            # slots (3 on the TorBox entry tier), which has nothing to do with how many
+            # uploads Drive will take. Measured at 3 concurrent API uploads: ~45 MB/s
+            # each, i.e. per-stream throughput holds as streams are added, so this is
+            # where the batch time actually comes from.
+            # Local-disk cost is (movers + MOVE_QUEUE_DEPTH) finished files waiting in
+            # /content; the disk guard still pauses downloads if that runs the disk down.
+            mover_count = max(1, int(drive_movers_slider.value))
+            move_queue = queue.Queue(maxsize=MOVE_QUEUE_DEPTH)
+            for _ in range(mover_count):
+                _mt = threading.Thread(target=_drive_mover, args=(move_queue, save_progress), daemon=True)
+                _mt.start()
+                mover_threads.append(_mt)
+            print(f"⚡ Starting {total_parallel} parallel downloads (max {max_workers} concurrent, {mover_count} Drive mover(s) overlapped)...")
+        else:
+            print(f"⚡ Starting {total_parallel} parallel downloads (max {max_workers} concurrent)...")
+
+        stop_monitor = False
+        batch_start_time = time.time()
+        
+        monitor_thread = threading.Thread(target=progress_monitor, args=(parallel_tasks,), daemon=True)
+        monitor_thread.start()
+        
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                try:
+                    if live_manager is None:
+                        future_to_task = {
+                            executor.submit(download_worker, task, gofile_token, move_queue, tb_file_key): task
+                            for task in parallel_tasks
+                        }
+                        completed = as_completed(future_to_task)
+                    else:
+                        ready = deque(parallel_tasks)
+                        live_manager.begin_parallel(parallel_tasks)
+                        future_to_task = {}
+                        completed = None
+
+                    while True:
+                        if live_manager is not None:
+                            ready.extend(live_manager.take_parallel())
+                            while ready and len(future_to_task) < max_workers and not _cancel_requested:
+                                task = ready.popleft()
+                                future = executor.submit(download_worker, task, gofile_token, move_queue, tb_file_key)
+                                future_to_task[future] = task
+                            if _cancel_requested:
+                                # Never submitted items stay pending for Resume.
+                                ready.clear()
+                            if future_to_task:
+                                finished, _ = wait(tuple(future_to_task), timeout=0.25,
+                                                   return_when=FIRST_COMPLETED)
+                            else:
+                                finished = ()
+                            if not finished and not future_to_task:
+                                if live_manager.close_parallel_if_empty():
+                                    break
+                                continue
+                        else:
+                            try:
+                                finished = (next(completed),)
+                            except StopIteration:
+                                break
+
+                        for future in finished:
+                            task = future_to_task.pop(future)
+                            try:
+                                result = future.result()
+                                for i, t in enumerate(all_tasks):
+                                    if t.id == result.id:
+                                        all_tasks[i] = result
+                                        break
+                                save_progress()
+                            except Exception as e:
+                                print(f"   ❌ Task failed: {str(e)[:80]}")
+                                task.status = "failed"
+                                task.error = str(e)[:100]
+                except KeyboardInterrupt:
+                    # Terminate the aria2 subprocesses HERE, before the executor's
+                    # shutdown(wait=True) on with-exit would otherwise block on them.
+                    # Workers see the dead process + cancel flag and return promptly.
+                    print("\n🛑 Interrupt received — stopping active downloads (progress is saved)...")
+                    stop_active_downloads()
+            if mover_threads:
+                if _cancel_requested:
+                    # Don't sit through queued multi-GB moves after an interrupt. The local
+                    # files survive in /content, so Retry re-moves them without re-downloading.
+                    skipped_moves = 0
+                    while True:
+                        try:
+                            q_task, _ = move_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        q_task.status = "failed"
+                        q_task.error = "Interrupted before Drive move (file kept locally)"
+                        move_queue.task_done()
+                        skipped_moves += 1
+                    if skipped_moves:
+                        print(f"   📤 {skipped_moves} queued move(s) skipped — Retry re-moves them without re-downloading")
+                    if move_queue.unfinished_tasks:
+                        print("   ⏳ Waiting for in-flight Drive upload(s) to finish...")
+                elif move_queue.unfinished_tasks:
+                    print("📤 Downloads finished — waiting for remaining Drive uploads...")
+                # One sentinel per mover: each thread consumes exactly one and exits, so a
+                # single None would strand every other mover blocked on get() forever.
+                for _ in mover_threads:
+                    move_queue.put(None)
+                try:
+                    for _mt in mover_threads:
+                        _mt.join()
+                except KeyboardInterrupt:
+                    # Second interrupt: stop waiting. The daemon movers finish their current
+                    # file; anything they never reach stays "moving", which resume retries.
+                    print("\n🛑 Interrupt — not waiting for Drive moves; unfinished items can be retried")
+        finally:
+            stop_monitor = True
+            monitor_thread.join(timeout=2)  # Wait for monitor's final tick before touching shared state
+        
+        update_progress_display(parallel_tasks)
+        _clear_per_task_bars()  # Clean up before sequential phase
+        print(f"✅ Parallel downloads complete!")
+        _xfer = _drive_xfer_summary()
+        if _xfer: print(_xfer)
+    
+    # --- SEQUENTIAL DOWNLOADS ---
+    yt_success = 0
+    yt_fail = 0
+    
+    if youtube_urls:
+        print(f"\n▶️ Processing {len(youtube_urls)} YouTube links...")
+        playlist_url_count = sum(1 for u in youtube_urls if 'list=' in u or '/playlist' in u)
+        use_playlist_range = playlist_url_count <= 1
+        if not use_playlist_range and playlist_selection.value.strip():
+            print("   ℹ️ Multiple playlist URLs detected - playlist range ignored (downloading all videos)")
+        
+        for i, url in enumerate(youtube_urls, 1):
+            if _cancel_requested:
+                print("   🛑 Stopped — remaining YouTube links left pending for resume")
+                break
+            print(f"   [{i}/{len(youtube_urls)}] {url[:60]}...")
+            s, f, total = process_youtube_link(url, mode, apply_playlist_range=use_playlist_range)
+            yt_success += s
+            yt_fail += f
+            yt_success_cumulative += s
+            yt_fail_cumulative += f
+            
+            for task in all_tasks:
+                if task.url == url and task.link_type == 'youtube':
+                    task.status = "done" if f == 0 else "failed"
+                    break
+            save_progress()
+        
+        if yt_fail > 0:
+            print(f"   📊 YouTube: {yt_success_cumulative} succeeded, {yt_fail_cumulative} failed")
+        else:
+            print(f"   📊 YouTube: {yt_success_cumulative} succeeded")
+    
+    if mega_urls:
+        print(f"\n☁️ Processing {len(mega_urls)} Mega links...")
+        for i, url in enumerate(mega_urls, 1):
+            if _cancel_requested:
+                print("   🛑 Stopped — remaining Mega links left pending for resume")
+                break
+            print(f"   [{i}/{len(mega_urls)}] {url[:60]}...")
+            mega_success = process_mega_link(url)
+            for t in all_tasks:
+                if t.url == url and t.link_type == 'mega':
+                    t.status = "done" if mega_success else "failed"
+                    break
+            save_progress()
+    
+    if debrid_urls:
+        if rd_key:
+            print(f"\n🔓 Processing {len(debrid_urls)} RD links...")
+            for i, url in enumerate(debrid_urls, 1):
+                if _cancel_requested:
+                    print("   🛑 Stopped — remaining links left pending for resume")
+                    break
+                print(f"   [{i}/{len(debrid_urls)}] {url[:60]}...")
+                ok = process_rd_link(url, rd_key)
+                for t in all_tasks:
+                    if t.url == url and t.link_type == 'magnet':
+                        t.status = "done" if ok else "failed"
+                        break
+                save_progress()
+        elif tb_key:
+            print(f"\n🔓 Processing {len(debrid_urls)} TorBox links...")
+            for i, url in enumerate(debrid_urls, 1):
+                if _cancel_requested:
+                    print("   🛑 Stopped — remaining links left pending for resume")
+                    break
+                print(f"   [{i}/{len(debrid_urls)}] {url[:60]}...")
+                ok = process_tb_link(url, tb_key)
+                for t in all_tasks:
+                    if t.url == url:
+                        t.status = "done" if ok else "failed"
+                        break
+                save_progress()
+
+    # --- MAGNET FILE TASKS (RD) --- (process_* sets each task's status per file)
+    if magnet_file_tasks and rd_key and not _cancel_requested:
+        print(f"\n🧲 Processing {len(magnet_file_tasks)} selected magnet files (RD)...")
+        process_magnet_file_tasks(magnet_file_tasks, rd_key)
+
+    # --- MAGNET FILE TASKS (TorBox) ---
+    if tb_magnet_file_tasks and tb_file_key and not _cancel_requested:
+        print(f"\n🧲 Processing {len(tb_magnet_file_tasks)} selected magnet files (TorBox)...")
+        process_tb_magnet_file_tasks(tb_magnet_file_tasks, tb_file_key)
+    elif tb_magnet_file_tasks and not tb_file_key:
+        print(f"\n❌ TorBox token required for {len(tb_magnet_file_tasks)} TorBox file(s) — enter TB Token, then Resume/Retry")
+    
+    # --- SUMMARY ---
+    save_progress(throttle=False)  # Final state must always hit disk (throttled saves may have skipped it)
+    done_count = sum(1 for t in all_tasks if t.status == 'done')
+    failed_count = sum(1 for t in all_tasks if t.status == 'failed')
+    
+    # Adjust for YouTube individual counts
+    total_success = done_count - len([t for t in all_tasks if t.link_type == 'youtube' and t.status == 'done']) + yt_success_cumulative
+    total_failed = failed_count - len([t for t in all_tasks if t.link_type == 'youtube' and t.status == 'failed']) + yt_fail_cumulative
+    
+    return total_success, total_failed
+
+
+# --- AUTO RETRY ---
+# Optional "Auto Retry" field: when set to N, a batch that ends with failures
+# automatically re-runs the 🔁 Retry Failed path until nothing is left failed or
+# N extra passes have run, whichever comes first. State is module-level because
+# one batch spans several functions (queue preview → execute_selected_tasks →
+# chained execute_batch resumes): the failure handlers set 'pending', and each
+# batch function consumes it at its tail — after the finally block — so the next
+# pass starts with keep-alive, cancel state, and buttons fully reset.
+_auto_retry_state = {'remaining': 0, 'total': 0, 'pending': False}
+
+def _arm_auto_retry():
+    """Read the Auto Retry field at a user-initiated batch start (fresh budget).
+    Chained retries skip this so they consume the budget instead of refreshing it."""
+    try:
+        n = max(0, int(auto_retry_input.value.strip()))
+    except ValueError:
+        n = 0  # empty or non-numeric = feature off
+    _auto_retry_state.update(remaining=n, total=n, pending=False)
+
+def _run_auto_retry_chain(mode: str):
+    """Fire a queued auto retry — equivalent to clicking 🔁 Retry Failed. The grace
+    pause gives the kernel interrupt a window to cancel the chain between passes."""
+    if not _auto_retry_state['pending']:
+        return
+    _auto_retry_state['pending'] = False
+    _auto_retry_state['remaining'] -= 1
+    attempt = _auto_retry_state['total'] - _auto_retry_state['remaining']
+    try:
+        print(f"\n🔁 Auto Retry {attempt}/{_auto_retry_state['total']} starting in 5s — use Stop Download to cancel a live run...")
+        for _ in range(5):
+            if cancel_requested():
+                _auto_retry_state['remaining'] = 0
+                print("\n🛑 Auto Retry cancelled — session kept for manual retry.")
+                return
+            time.sleep(1)  # 1s steps so an interrupt lands promptly
+    except KeyboardInterrupt:
+        _auto_retry_state['remaining'] = 0
+        print("\n🛑 Auto Retry cancelled — session kept, use 🔁 Retry Failed to continue manually.")
+        return
+    if cancel_requested():
+        _auto_retry_state['remaining'] = 0
+        print("\n🛑 Auto Retry cancelled — session kept for manual retry.")
+        return
+    execute_batch(mode, resume=True, auto_retry_chain=True)
+
+
+def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str,
+                           live_manager: Optional[LiveBatchManager] = None):
+    """Execute download for selected tasks from queue."""
+    global yt_success_cumulative, yt_fail_cumulative
+    yt_success_cumulative = 0
+    yt_fail_cumulative = 0
+    _arm_auto_retry()
+
+    if live_manager is None:
+        _restore_standard_status_widgets()
+        clear_output(wait=True)
+        display(input_ui)
+    settings_ui.layout.display = 'none'
+    btn.disabled = True
+    btn_quick.disabled = True
+    btn_resume.disabled = True
+    btn_retry.layout.display = 'none'
+
+    start_keep_alive()
+    try:
+        gofile_token = token_gf.value.strip()
+        debrid_service, rd_key, tb_key = get_active_debrid()
+        max_workers = concurrent_slider.value
+
+        # Quick Download skips the queue preview — run TMDB matching here if it hasn't run.
+        # (Do NOT re-run analyze_batch_episodes here: it would re-analyze on the selected
+        # subset and could lose the batch detection computed at preview time.)
+        if tmdb_is_enabled():
+            if not _tmdb_match_cache:  # Quick Download path — no queue preview ran
+                analyze_batch_metadata([t.filename for t in selected_tasks if t.filename])
+            _apply_tmdb_overrides(selected_tasks)  # honor any manual corrections
+        _apply_queue_overrides(selected_tasks)  # independent of TMDB — works either way
+
+        # Separate by type: everything without a sequential processor goes parallel
+        parallel_tasks = [t for t in selected_tasks if t.link_type not in SEQUENTIAL_LINK_TYPES]
+        youtube_urls = [t.url for t in selected_tasks if t.link_type == 'youtube']
+        mega_urls = [t.url for t in selected_tasks if t.link_type == 'mega']
+        debrid_urls = [t.url for t in selected_tasks if t.link_type == 'magnet']
+        magnet_file_tasks = [t for t in selected_tasks if t.link_type == 'magnet_file']
+        tb_magnet_file_tasks = [t for t in selected_tasks if t.link_type == 'tb_magnet_file']
+        
+        # Resolve FShare download links sequentially before parallel download
+        # (deferred from Resolve Links phase so user can review queue first)
+        fshare_unresolved = [t for t in parallel_tasks if t.link_type == 'fshare' and 'fshare.vn/file/' in t.url]
+        if fshare_unresolved:
+            fshare_email = token_fshare_email.value.strip()
+            fshare_password = token_fshare_password.value.strip()
+            if fshare_email and fshare_password:
+                session = _get_fshare_web_session(fshare_email, fshare_password)
+                if session:
+                    total_fshare = len(fshare_unresolved)
+                    print(f"🔄 Resolving {total_fshare} FShare download link(s)...")
+                    print(f"   ⚠️ Each resolved link counts toward your daily FShare download limit")
+                    resolved_count = 0
+                    limit_reached = False
+                    consecutive_failures = 0
+                    for i, task in enumerate(fshare_unresolved, 1):
+                        if live_manager is not None and cancel_requested():
+                            print('   🛑 FShare preparation stopped; remaining files stay pending')
+                            break
+                        print(f"   [{i}/{total_fshare}] {task.filename[:60]}{'...' if len(task.filename) > 60 else ''}")
+                        dl_link = _fshare_web_get_download_link(task.url, session)
+                        if dl_link == "FSHARE_LIMIT_REACHED":
+                            print(f"   🛑 FShare download policy restriction — stopping resolution")
+                            print(f"   💡 Try again later or check your FShare account status")
+                            task.status = "failed"
+                            task.error = "FShare policy restriction"
+                            # Mark remaining tasks as failed too
+                            for remaining in fshare_unresolved[i:]:
+                                remaining.status = "failed"
+                                remaining.error = "FShare policy restriction"
+                            limit_reached = True
+                            break
+                        elif dl_link:
+                            task.url = dl_link
+                            resolved_count += 1
+                            consecutive_failures = 0
+                            print(f"   ✅ Resolved")
+                        else:
+                            print(f"   ⚠️ Could not resolve — will skip")
+                            task.status = "failed"
+                            task.error = "Could not resolve FShare download link"
+                            consecutive_failures += 1
+                            if consecutive_failures >= 3:
+                                print(f"   🛑 3 consecutive failures — stopping resolution")
+                                print(f"   💡 FShare may be temporarily blocking requests")
+                                for remaining in fshare_unresolved[i:]:
+                                    remaining.status = "failed"
+                                    remaining.error = "Skipped (consecutive failures)"
+                                limit_reached = True
+                                break
+                        time.sleep(1)  # Rate limiting
+                    # Remove failed FShare tasks from parallel
+                    parallel_tasks = [t for t in parallel_tasks if t.status != "failed"]
+                    if limit_reached:
+                        print(f"   📊 {resolved_count}/{total_fshare} resolved before limit was reached\n")
+                    else:
+                        print(f"   📊 {resolved_count}/{total_fshare} FShare links resolved\n")
+                else:
+                    print("   ❌ FShare login failed — skipping FShare downloads")
+                    parallel_tasks = [t for t in parallel_tasks if t.link_type != 'fshare']
+        
+        all_tasks = live_manager.all_tasks if live_manager is not None else selected_tasks.copy()
+        
+        total_parallel = len(parallel_tasks)
+        total_sequential = len(youtube_urls) + len(mega_urls) + len(debrid_urls) + len(magnet_file_tasks) + len(tb_magnet_file_tasks)
+        print(f"📊 Starting: {total_parallel} parallel + {total_sequential} sequential\n")
+
+        # Run shared download pipeline
+        if live_manager is not None:
+            _set_live_controls()
+        total_success, total_failed = _run_download_pipeline(
+            all_tasks=all_tasks,
+            parallel_tasks=parallel_tasks,
+            youtube_urls=youtube_urls,
+            mega_urls=mega_urls,
+            debrid_urls=debrid_urls,
+            mode=mode,
+            gofile_token=gofile_token,
+            rd_key=rd_key,
+            max_workers=max_workers,
+            magnet_file_tasks=magnet_file_tasks,
+            tb_magnet_file_tasks=tb_magnet_file_tasks,
+            tb_key=tb_key,
+            live_manager=live_manager
+        )
+
+        # Files added after the parallel pool closed (including sequential links)
+        # form another wave. The manager closes atomically with the last empty check.
+        while live_manager is not None and not cancel_requested():
+            wave = live_manager.next_wave_or_finish()
+            if wave is None:
+                break
+            wave_parallel = [t for t in wave if t.link_type not in SEQUENTIAL_LINK_TYPES]
+            total_success, total_failed = _run_download_pipeline(
+                all_tasks=all_tasks,
+                parallel_tasks=wave_parallel,
+                youtube_urls=[t.url for t in wave if t.link_type == 'youtube'],
+                mega_urls=[t.url for t in wave if t.link_type == 'mega'],
+                debrid_urls=[t.url for t in wave if t.link_type == 'magnet'],
+                mode=mode,
+                gofile_token=gofile_token,
+                rd_key=rd_key or token_rd.value.strip(),
+                max_workers=max_workers,
+                magnet_file_tasks=[t for t in wave if t.link_type == 'magnet_file'],
+                tb_magnet_file_tasks=[t for t in wave if t.link_type == 'tb_magnet_file'],
+                tb_key=tb_key or token_tb.value.strip(),
+                live_manager=live_manager
+            )
+        
+        # Handle results
+        unfinished = any(t.status in ('pending', 'downloading', 'moving') for t in all_tasks)
+        if total_failed > 0 or unfinished or cancel_requested():
+            failed_files = [t.filename for t in all_tasks if t.status == 'failed']
+            if cancel_requested():
+                print(f"\n🛑 Batch stopped by user — {total_success} completed, {total_failed} cancelled/failed.")
+                _auto_retry_state['remaining'] = 0  # user stopped — don't auto-retry
+            else:
+                print(f"\n⚠️ Completed with {total_success} success, {total_failed} failed after 3 attempts:")
+                for f in failed_files[:5]:
+                    print(f"   ❌ {f[:60]}")
+                if len(failed_files) > 5:
+                    print(f"   ... and {len(failed_files) - 5} more")
+
+            save_session(all_tasks,
+                        playlist_range=playlist_selection.value.strip(),
+                        yt_success=yt_success_cumulative, yt_fail=yt_fail_cumulative)
+            print(f"\n💾 Session saved. Click '🔁 Retry Failed' to try again, or 'Clear Session' in Settings to mark complete.")
+            btn_restart.layout.display = 'inline-block'
+            btn_retry.layout.display = 'inline-block'
+            if _auto_retry_state['remaining'] > 0:
+                _auto_retry_state['pending'] = True  # chain fires after cleanup (see function tail)
+        else:
+            print(f"\n✅ All {total_success} downloads completed successfully!")
+            clear_session()
+            btn_restart.layout.display = 'none'
+            btn_retry.layout.display = 'none'
+            yt_success_cumulative = 0
+            yt_fail_cumulative = 0
+
+    except KeyboardInterrupt:
+        # User hit the kernel interrupt — stop cleanly and keep the session for retry.
+        # selected_tasks holds the same task objects the pipeline mutated (shallow copy).
+        stop_active_downloads()
+        _auto_retry_state['remaining'] = 0  # user stopped — don't auto-retry
+        print(f"\n🛑 Stopped by user (kernel interrupt). Progress saved.")
+        save_session(selected_tasks,
+                    playlist_range=playlist_selection.value.strip(),
+                    yt_success=yt_success_cumulative, yt_fail=yt_fail_cumulative)
+        print(f"💾 Session saved. Click '🔁 Retry Failed' to continue.")
+        btn_restart.layout.display = 'inline-block'
+        btn_retry.layout.display = 'inline-block'
+    except Exception as e:
+        print(f"\n❌ Critical Error: {e}")
+        if live_manager is not None:
+            save_session(live_manager.all_tasks,
+                         playlist_range=playlist_selection.value.strip(),
+                         yt_success=yt_success_cumulative,
+                         yt_fail=yt_fail_cumulative,
+                         subtitle_langs_value=subtitle_langs.value)
+            btn_retry.layout.display = 'inline-block'
+    finally:
+        stop_keep_alive()
+        stop_hint.layout.display = 'none'
+        _reset_cancel_state()
+        btn.disabled = False
+        btn_quick.disabled = False
+        btn_resume.disabled = False
+        reset_progress()
+        check_resume_available()
+
+    # Auto Retry fires outside try/finally so keep-alive, cancel state, and buttons
+    # are fully reset before the next pass (mirrors clicking 🔁 Retry Failed).
+    if live_manager is None:
+        _run_auto_retry_chain(mode)
+
+
+def _resolve_queue_links(urls: List[str]) -> List[DownloadTask]:
+    """Shared resolution and playlist expansion for initial and appended links."""
+    gofile_token = token_gf.value.strip()
+    debrid_service, rd_key, tb_key = get_active_debrid()
+    ytdlp_hosts = STREAMING_HOSTS + ('tiktok.com', 'dailymotion.com', 'soundcloud.com')
+    needs_ytdlp = any(url_matches_host(u, ytdlp_hosts) for u in urls) or \
+                  any(url_matches_host(u, ('archive.org',)) and '/details/' in u for u in urls)
+    needs_mega = any(url_matches_host(u, ('mega.nz', 'transfer.it')) for u in urls)
+    needs_aria = not (needs_ytdlp and not needs_mega) or any(
+        url_matches_host(u, ('gofile.io', 'pixeldrain.com', 'real-debrid.com', 'mega.nz', 'fshare.vn'))
+        or u.startswith('magnet:') for u in urls)
+
+    if _running_live_batch():
+        setup_environment(needs_mega, needs_ytdlp, needs_aria, during_active=True)
+    else:
+        setup_environment(needs_mega, needs_ytdlp, needs_aria)
+
+    s, t = get_gofile_session(gofile_token)
+
+    print(f"🔍 Resolving {len(urls)} links...")
+    parallel_tasks, youtube_urls, mega_urls, debrid_urls = resolve_all_links(urls, s, t, rd_key, tb_key, debrid_service)
+
+    # Create session-compatible task list for saving
+    all_tasks = parallel_tasks.copy()
+
+    # Expand YouTube playlists into individual video tasks for queue display
+    for url in youtube_urls:
+        yt_tasks = resolve_youtube_playlist(url)
+        all_tasks.extend(yt_tasks)
+
+    for url in mega_urls:
+        all_tasks.append(DownloadTask(url=url, filename="", source="mega", link_type="mega"))
+    for url in debrid_urls:
+        # Distinguish between magnet links and other debrid-related links
+        if url.startswith("magnet:"):
+            all_tasks.append(DownloadTask(url=url, filename="", source="debrid", link_type="magnet"))
+        else:
+            debrid_type = "tb" if debrid_service == 'tb' else "rd"
+            all_tasks.append(DownloadTask(url=url, filename="", source="debrid", link_type=debrid_type))
+
+    return all_tasks
+
+
+def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False, auto_retry_chain: bool = False):
+    global yt_success_cumulative, yt_fail_cumulative  # Must be at function start
+
+    if _live_batch is not None and cancel_requested():
+        print('🛑 Download stopped. The session is available for Resume.')
+        return
+    if not auto_retry_chain:
+        _arm_auto_retry()  # user-initiated (Resolve/Quick/Resume/Retry) — fresh retry budget
+    queue_open = False  # True while the queue preview is waiting for user input
+    all_tasks = []  # Ensure defined for the KeyboardInterrupt handler even if we stop early
+    if _live_batch is None:
+        _restore_standard_status_widgets()
+        clear_output(wait=True)
+        display(input_ui)
+    settings_ui.layout.display = 'none'  # Close settings panel if open
+    btn.disabled = True
+    btn_quick.disabled = True
+    btn_resume.disabled = True
+    btn_retry.layout.display = 'none'
+    print(f"\n🚀 Initializing... (Mode: {mode}, Resume: {resume})")
+    
+    start_keep_alive()
+    try:
+        gofile_token = token_gf.value.strip()
+        debrid_service, rd_key, tb_key = get_active_debrid()
+        max_workers = concurrent_slider.value
+        
+        # Load from session or parse new URLs
+        if resume:
+            session_data = load_session()
+            if not session_data:
+                print("❌ No session to resume!")
+                return
+            
+            # Tokens are not persisted in the session (plaintext on Drive) — use the
+            # current widget/Colab Secrets values. Legacy sessions may still carry
+            # tokens; fall back to those only when nothing is configured now.
+            gofile_token = gofile_token or session_data.get('gofile_token', '')
+            rd_key = rd_key or session_data.get('rd_token', '')
+            tb_key = tb_key or session_data.get('tb_token', '')
+            # Restore playlist range from session
+            saved_playlist_range = session_data.get('playlist_range', '')
+            if saved_playlist_range:
+                playlist_selection.value = saved_playlist_range
+                print(f"   🎯 Restored playlist range: {saved_playlist_range}")
+            # Restore subtitle language selection from session
+            saved_subtitle_langs = session_data.get('subtitle_langs', None)
+            if saved_subtitle_langs:
+                subtitle_langs.value = tuple(saved_subtitle_langs)
+                print(f"   🔤 Restored subtitle languages: {', '.join(saved_subtitle_langs)}")
+            # Restore cumulative YouTube counters
+            # Only restore success count - reset fail count so previous 403s don't persist
+            yt_success_cumulative = session_data.get('yt_success', 0)
+            yt_fail_cumulative = 0  # Reset failures - only count failures in current run
+            all_tasks = [task_from_dict(t) for t in session_data.get('tasks', [])]
+            
+            # Filter to unfinished tasks (downloading/moving = was active when the runtime
+            # crashed or was interrupted; retrying a 'moving' task is cheap — the duplicate
+            # check finds the already-moved Drive copy, or the local file skips the download)
+            pending_tasks = [t for t in all_tasks if t.status in ['pending', 'failed', 'downloading', 'moving']]
+            print(f"📂 Resuming {len(pending_tasks)} of {len(all_tasks)} tasks...")
+
+            # Fresh runtime — re-run TMDB matching, then reapply saved manual corrections
+            if tmdb_is_enabled():
+                analyze_batch_metadata([t.filename for t in pending_tasks if t.filename])
+                _apply_tmdb_overrides(pending_tasks)
+            _apply_queue_overrides(pending_tasks)  # forced seasons/episodes persist across resume
+
+            # Install required tools first
+            needs_pixeldrain_gofile_rd_tb = any(t.link_type in ['gofile', 'pixeldrain', 'rd', 'tb'] for t in pending_tasks)
+            needs_fshare = any(t.link_type == 'fshare' for t in pending_tasks)
+            needs_ytdlp = any(t.link_type in ['youtube', 'archive'] for t in pending_tasks)
+            needs_mega = any(t.link_type == 'mega' for t in pending_tasks)
+            needs_aria = any(t.link_type not in ['youtube', 'mega', 'magnet'] for t in pending_tasks)
+            setup_environment(needs_mega, needs_ytdlp, needs_aria)
+            
+            # Re-resolve Gofile/Pixeldrain/RD/TB URLs to get fresh API tokens (bypasses IP rate limits)
+            if needs_pixeldrain_gofile_rd_tb:
+                print("🔄 Re-resolving links with fresh session...")
+                s, t = get_gofile_session(gofile_token)
+                # rd/tb tasks keep their original service on resume regardless of
+                # the debrid toggle (mirrors the resolve/download phases) — fall
+                # back to the token widgets when the toggle-derived key is empty.
+                rd_refresh_key = rd_key or token_rd.value.strip()
+                tb_refresh_key = tb_key or token_tb.value.strip()
+                
+                for task in pending_tasks:
+                    if task.original_url and task.link_type in ['gofile', 'pixeldrain', 'rd', 'tb']:
+                        try:
+                            if task.link_type == 'gofile':
+                                resolved = resolve_gofile(task.original_url, s, t)
+                                if resolved:
+                                    task.url = resolved[0][0]  # Update with fresh API URL
+                                    task.cookie = t.get('token')
+                            elif task.link_type == 'pixeldrain':
+                                resolved = resolve_pixeldrain(task.original_url, s)
+                                if resolved:
+                                    task.url = resolved[0][0]  # Update with fresh API URL
+                            elif task.link_type == 'rd' and rd_refresh_key:
+                                resolved = resolve_rd_link(task.original_url, rd_refresh_key)
+                                if resolved:
+                                    task.url = resolved[0][0]  # Update with fresh API URL
+                            elif task.link_type == 'tb' and tb_refresh_key:
+                                resolved = resolve_tb_link(task.original_url, tb_refresh_key)
+                                if resolved:
+                                    task.url = resolved[0][0]  # Update with fresh API URL
+                        except Exception as e:
+                            print(f"   ⚠️ Could not re-resolve {task.filename}: {e}")
+            
+            # Re-resolve FShare URLs with fresh login session
+            if needs_fshare:
+                fshare_email = token_fshare_email.value.strip()
+                fshare_password = token_fshare_password.value.strip()
+                if fshare_email and fshare_password:
+                    fshare_tasks = [t for t in pending_tasks if t.original_url and t.link_type == 'fshare']
+                    if fshare_tasks:
+                        print(f"🔄 Re-resolving {len(fshare_tasks)} FShare link(s)...")
+                        print(f"   ⚠️ Note: Each resolved link counts toward your daily FShare download limit")
+                        for task in fshare_tasks:
+                            try:
+                                resolved = resolve_fshare(task.original_url, fshare_email, fshare_password)
+                                if resolved:
+                                    task.url = resolved[0][0]
+                            except Exception as e:
+                                print(f"   ⚠️ Could not re-resolve FShare {task.filename}: {e}")
+            
+            # Separate by type: everything without a sequential processor goes parallel
+            parallel_tasks = [t for t in pending_tasks if t.link_type not in SEQUENTIAL_LINK_TYPES]
+            youtube_urls = [t.url for t in pending_tasks if t.link_type == 'youtube']
+            mega_urls = [t.url for t in pending_tasks if t.link_type == 'mega']
+            debrid_urls = [t.url for t in pending_tasks if t.link_type == 'magnet']
+            magnet_file_tasks = [t for t in pending_tasks if t.link_type == 'magnet_file']
+            tb_magnet_file_tasks = [t for t in pending_tasks if t.link_type == 'tb_magnet_file']
+        else:
+            urls = [x.strip() for x in text_area.value.split('\n') if x.strip()]
+            if not urls:
+                print("❌ No links provided!")
+                btn.disabled = False
+                return
+
+            all_tasks = _resolve_queue_links(urls)
+
+            # Save initial session
+            save_session(all_tasks,
+                        playlist_range=playlist_selection.value.strip())
+
+            if quick_mode:
+                # Quick Download: Skip queue preview, start immediately
+                print(f"⚡ Quick Download: Starting {len(all_tasks)} items...")
+                execute_selected_tasks(all_tasks, mode)
+            else:
+                # Show queue preview instead of immediate download
+                show_queue_preview(all_tasks, mode)
+                if all_tasks:
+                    text_area.value = ''  # Ready for more links in the same field.
+                queue_open = True  # Keep Quick/Resume disabled while adding/reviewing.
+            return  # Wait for user to click "Start Selected"
+        
+        # This code only runs for RESUME mode (preview was skipped)
+        total_parallel = len(parallel_tasks)
+        total_sequential = len(youtube_urls) + len(mega_urls) + len(debrid_urls) + len(magnet_file_tasks) + len(tb_magnet_file_tasks)
+        print(f"📊 Tasks: {total_parallel} parallel + {total_sequential} sequential\n")
+
+        # Run shared download pipeline
+        if _live_batch is not None and cancel_requested():
+            print('🛑 Download stopped before the retry began. The session is available for Resume.')
+            return
+        total_success, total_failed = _run_download_pipeline(
+            all_tasks=all_tasks,
+            parallel_tasks=parallel_tasks,
+            youtube_urls=youtube_urls,
+            mega_urls=mega_urls,
+            debrid_urls=debrid_urls,
+            mode=mode,
+            gofile_token=gofile_token,
+            rd_key=rd_key,
+            max_workers=max_workers,
+            magnet_file_tasks=magnet_file_tasks,
+            tb_magnet_file_tasks=tb_magnet_file_tasks,
+            tb_key=tb_key
+        )
+        
+        # Handle results
+        unfinished = any(t.status in ('pending', 'downloading', 'moving') for t in all_tasks)
+        if total_failed > 0 or unfinished or cancel_requested():
+            if cancel_requested():
+                print(f"\n🛑 Batch stopped by user — {total_success} completed, {total_failed} cancelled/failed (session saved)")
+                _auto_retry_state['remaining'] = 0  # user stopped — don't auto-retry
+            else:
+                print(f"\n⚠️ Completed with {total_success} success, {total_failed} failed (session saved for retry)")
+            btn_restart.layout.display = 'inline-block'
+            btn_retry.layout.display = 'inline-block'
+            if _auto_retry_state['remaining'] > 0:
+                _auto_retry_state['pending'] = True  # chain fires after cleanup (see function tail)
+        else:
+            print(f"\n✅ All {total_success} downloads completed successfully!")
+            clear_session()
+            btn_restart.layout.display = 'none'
+            btn_retry.layout.display = 'none'
+            yt_success_cumulative = 0
+            yt_fail_cumulative = 0
+
+    except KeyboardInterrupt:
+        # User hit the kernel interrupt (resume path) — stop cleanly, keep session
+        stop_active_downloads()
+        _auto_retry_state['remaining'] = 0  # user stopped — don't auto-retry
+        print(f"\n🛑 Stopped by user (kernel interrupt). Progress saved.")
+        if all_tasks:
+            save_session(all_tasks,
+                        playlist_range=playlist_selection.value.strip(),
+                        yt_success=yt_success_cumulative, yt_fail=yt_fail_cumulative)
+        print(f"💾 Session saved. Click '🔁 Retry Failed' to continue.")
+        btn_restart.layout.display = 'inline-block'
+        btn_retry.layout.display = 'inline-block'
+    except Exception as e:
+        print(f"\n❌ Critical Error: {e}")
+    finally:
+        stop_keep_alive()
+        stop_hint.layout.display = 'none'
+        _reset_cancel_state()
+        if not queue_open:
+            # An open queue enables Add Links, but keeps Quick/Resume disabled;
+            # hide_queue()/start_from_queue() restore the initial controls later.
+            btn.disabled = False
+            btn_quick.disabled = False
+            btn_resume.disabled = False
+            reset_progress()
+        check_resume_available()
+
+    # Auto Retry fires outside try/finally so keep-alive, cancel state, and buttons
+    # are fully reset before the next pass (mirrors clicking 🔁 Retry Failed).
+    _run_auto_retry_chain(mode)
+
+
+
+# --- QUICK DOWNLOAD ---
+def on_quick_download(b=None):
+    """Quick Download - bypass queue preview and download immediately."""
+    urls = text_area.value.strip()
+    if not urls:
+        print("⚠️ No links to download!")
+        return
+    
+    # Setup subtitle languages for Quick Download if enabled
+    if quick_dl_subs_checkbox.value:
+        subtitle_langs.value = quick_dl_subtitle_langs.value
+
+    # Call execute_batch with quick_mode to skip queue preview
+    execute_batch("video", quick_mode=True)
+
+# --- BINDINGS ---
+btn.on_click(on_resolve_links)
+btn_stop.on_click(stop_live_batch)
+btn_quick.on_click(on_quick_download)
+btn_resume.on_click(lambda b: execute_batch("video", resume=True))
+btn_retry.on_click(lambda b: execute_batch("video", resume=True))  # Retry = resume machinery, no restart needed
+btn_restart.on_click(restart_runtime)
+btn_history.on_click(view_history)
+
+# Queue control bindings
+btn_queue_up.on_click(queue_move_up)
+btn_queue_down.on_click(queue_move_down)
+btn_queue_select_all.on_click(queue_select_all)
+btn_queue_select_none.on_click(queue_select_none)
+btn_queue_remove.on_click(queue_remove_selected)
+btn_queue_cancel.on_click(queue_cancel)
+btn_queue_sort.on_click(queue_sort_alpha)
+btn_tmdb_match.on_click(apply_tmdb_override)
+btn_tmdb_clear.on_click(clear_tmdb_override)
+btn_queue_apply_changes.on_click(apply_queue_changes)
+btn_season_apply.on_click(apply_season_override)
+btn_season_clear.on_click(clear_season_override)
+btn_renumber.on_click(apply_renumber)
+btn_renumber_clear.on_click(clear_renumber)
+btn_part_apply.on_click(apply_part_override)
+btn_part_remove.on_click(remove_part_override)
+btn_name_apply.on_click(apply_name_override)
+btn_name_clear.on_click(clear_name_override)
+btn_route_apply.on_click(apply_route_override)
+btn_route_clear.on_click(clear_route_override)
+btn_queue_start.on_click(lambda b: start_from_queue(mode="video"))
+btn_queue_start_subs.on_click(lambda b: start_from_queue(mode="subs_only"))
+
+# Settings control bindings
+btn_settings.on_click(toggle_settings)
+btn_settings_close.on_click(close_settings)
+btn_upload_cookies.on_click(upload_cookies)
+btn_clear_cookies.on_click(clear_cookies)
+btn_clear_history.on_click(request_clear_history)
+btn_clear_ytarchive.on_click(request_clear_ytarchive)
+btn_clear_session.on_click(request_clear_session)
+btn_confirm_yes.on_click(confirm_action)
+btn_confirm_cancel.on_click(cancel_confirmation)
+
+# Embedded subtitle extraction bindings
+btn_extract_library.on_click(run_library_extract)
+
+# --- INITIAL SETUP ---
+def early_mount_drive():
+    """Mount Drive on script load to enable session resume detection."""
+    drive_path = f"{COLAB_ROOT}drive"
+    if drive is not None and not os.path.exists(drive_path):
+        try:
+            print("📂 Mounting Google Drive for session detection...")
+            drive.mount(drive_path)
+        except Exception as e:
+            print(f"⚠️ Could not mount Drive: {e}")
+    check_resume_available()
+
+# Display UI first (so it shows even if mount hangs), then mount drive
+display(input_ui)
+early_mount_drive()

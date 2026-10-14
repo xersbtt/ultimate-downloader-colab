@@ -73,6 +73,11 @@ test_*.py
 !test_queue_table.py
 !test_progress_panel.py
 !test_live_queue.py
+!test_pikpak.py
+!test_download_backoff.py
+!test_rename_existing_files.py
+!test_drive_settings.py
+!test_okru.py
 test_*.txt
 debug_*.py
 

@@ -1,10 +1,44 @@
 # Changelog
 
-All notable changes to the Ultimate Downloader will be documented in this file.
+All notable changes to Ultimate Downloader are documented here.
+
+## v7.1
+**Theme: PikPak & Live Download Reliability**
+
+### New features
+
+- **PikPak support:** browse public or protected shares, nested shared folders, and your own account files and folders. Use `PIKPAK_TOKEN` in Settings or Colab Secrets, independently of the Debrid selector. The pinned official client installs automatically with checksum verification.
+- **Selected-file saves and resume:** only selected shared files are saved to your PikPak account when downloading starts. Existing Drive files are skipped before saving; files you already own are reused, including `FILE_RESTORE_OWN` responses. Account file IDs and pending save references persist for Resume and Retry, which request fresh original-file links. Saved copies remain in your PikPak account.
+
+### Improvements
+
+- **Live Resume and Retry:** Add Links and Stop Download remain available during resumed batches and automatic retries. Completed files, partial downloads and saved account file IDs are retained; automatic retries stay in the same live batch and use the configured retry budget.
+- **Individual YouTube progress:** queue items show percentage, speed, preparation, video processing and Drive transfer states in both Colab's live display and the standard progress panel, including videos added during a running batch.
+- **Download-server recovery:** temporary HTTP 500/502/503/504 errors use bounded 15/30/60-second waits with a visible countdown and partial-file continuation. PikPak reduces connections and refreshes download links after waiting; both HTTP and HTTPS original-file links are accepted.
+- **Readable failures:** live status and completion logs retain service error codes, redacted details and actual attempt counts, including failures during preparation. Tokens and signed URLs are hidden.
+
+### Bug fixes
+
+- **Drive API preferences:** restore saved settings immediately after mounting Drive so unrelated edits cannot overwrite the API upload choice. Reviewed downloads, Resume and Retry request Google access on the notebook thread before starting the background batch; an explicit mount preference remains respected.
+- **Completion controls:** finished live batches restore the toolbar, hide Stop Download and show Retry Failed when work remains. Final status stays visible even when a batch finishes before the first display refresh.
+- **OK.ru compatibility:** older or already-loaded yt-dlp versions accept both decoded metadata and legacy JSON strings for titles, subtitles and downloads. The fix applies only to each OK.ru extractor instance; `odnoklassniki.ru` links also use the streaming resolver.
+- **YouTube queue edits:** naming and destination overrides apply to duplicate checks, videos and subtitle sidecars, including live additions and saved sessions from earlier versions. Matching uses full playlist titles, and separate temporary folders prevent one link from inheriting another's edits.
+
+### Experimental standalone tool
+
+`rename_existing_files.py` runs separately in its own Colab notebook and is not integrated into Ultimate Downloader. Try it on a small test folder and review the preview before moving files.
+
+- **Rename existing Drive files:** browse Drive and preview paths before moving selected videos and matching subtitles. The tool uses saved library folders, optional TMDB names, years and anime routing, and manual overrides. Downloader-style naming, Specials, episode ranges, and subtitle language, forced and SDH tags are supported.
+- **Convert episode numbering:** convert season numbering to `S01E<absolute>` in `Season 01`, or map absolute numbering back to season folders using TMDB counts. Missing counts, out-of-range episodes and ranges crossing seasons are skipped for review. Unrecognised files, unmatched subtitles, destination conflicts and files changed since preview are also skipped.
+
+### Verification
+
+- Regression coverage includes PikPak resolution, selected-file saves, authentication, installation, cancellation and resume; server retries and redacted errors; live queues and completion controls; YouTube progress and naming; Drive preference restoration; OK.ru metadata; and renaming plans, numbering, subtitle pairing, conflicts and move-time validation.
+- See [RELEASING.md](RELEASING.md) for the test command and Colab smoke checklist.
 
 ---
 
-## v7.0 (Latest)
+## v7.0
 **Theme: Live Queues, Resizable Preview & TorBox Folder Context**
 
 ### ✨ New Features

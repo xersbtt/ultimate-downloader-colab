@@ -9,6 +9,8 @@ import difflib
 import queue
 import builtins
 import html
+import hashlib
+import platform
 from collections import deque
 from typing import Optional, Tuple, List, Dict, Any, Callable
 from dataclasses import dataclass, field, fields, asdict
@@ -57,6 +59,7 @@ def check_and_load_secrets():
     secret_fields = [
         (token_rd, 'RD_TOKEN'),
         (token_tb, 'TB_TOKEN'),
+        (token_pikpak, 'PIKPAK_TOKEN'),
         (token_gf, 'GOFILE_TOKEN'),
         (token_tmdb, 'TMDB_API_KEY'),
         (token_fshare_email, 'FSHARE_EMAIL'),
@@ -133,7 +136,7 @@ class DownloadTask:
     url: str  # Direct download URL (may be resolved API URL)
     filename: str
     source: str
-    link_type: str  # gofile, pixeldrain, direct, youtube, mega, rd, tb
+    link_type: str  # gofile, pixeldrain, direct, youtube, mega, rd, tb, pikpak
     id: str = field(default_factory=lambda: str(uuid4()))  # Unique ID for tracking
     status: str = "pending"  # pending, downloading, moving (downloaded, Drive move pending), done, failed, skipped
     error: Optional[str] = None
@@ -148,6 +151,13 @@ class DownloadTask:
     route_override: Optional[str] = None  # Manual destination category (persisted); set by queue 🎯 Route as
     part_override: Optional[int] = None  # Manual part suffix (persisted); N = force -ptN, 0 = force none
     selected_by_default: bool = True  # Resolver hint for the queue preview; users can still select the row
+    pikpak_share_id: Optional[str] = None  # Stable public share/file references, never account tokens
+    pikpak_file_id: Optional[str] = None
+    pikpak_saved_file_id: Optional[str] = None  # Own-drive ID reused for fresh URLs on retry/resume
+    pikpak_original_name: Optional[str] = None
+    pikpak_size: int = 0
+    pikpak_restore_root: Optional[str] = None
+    pikpak_restore_task_id: Optional[str] = None
 
 _TASK_FIELDS = {f.name for f in fields(DownloadTask)}
 
@@ -165,7 +175,7 @@ def task_from_dict(data: Dict[str, Any]) -> DownloadTask:
 progress_lock = Lock()
 print_lock = Lock()  # Prevent interleaved print output from parallel threads
 _session_save_lock = Lock()  # session.json is written from the main thread AND the Drive mover thread
-download_stats: Dict[str, Dict[str, float]] = {}  # task_id -> {'pct': 0-100, 'speed_mbs': MB/s}
+download_stats: Dict[str, Dict[str, Any]] = {}  # progress, cooldown, and redacted transfer errors by task ID
 # Sentinel returned by download_with_aria2 when the file is already in Drive (a skip,
 # not a failure). Callers must check `is DUPLICATE_SKIP` before treating a falsy result
 # as failed, so resume doesn't retry already-complete files forever.
@@ -447,6 +457,7 @@ token_tmdb = widgets.Text(description='TMDB:', placeholder='API Key (optional)',
 tmdb_enabled_checkbox = widgets.Checkbox(value=True, description='TMDB matching', tooltip='Match filenames for canonical names, years, anime library routing, and season mapping', indent=False, layout=widgets.Layout(width='150px'))
 token_rd = widgets.Text(description='RD Token:', placeholder='Real-Debrid API Key', value=get_colab_secret('RD_TOKEN'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
 token_tb = widgets.Text(description='TB Token:', placeholder='TorBox API Key', value=get_colab_secret('TB_TOKEN'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
+token_pikpak = widgets.Password(description='PikPak:', placeholder='Personal Access Token', value=get_colab_secret('PIKPAK_TOKEN'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
 # Debrid sits second in its row, after the 280px auto-organise checkbox — the same slot
 # the 280px Name field occupies in the row below. Same 50px label width as Year:, so the
 # dropdown and the Year box line up without margin tweaks.
@@ -825,6 +836,9 @@ settings_ui = widgets.VBox([
     tmdb_numbering_row,
     widgets.HTML("<div style='margin-top:10px'><small><b>🇻🇳 FShare Account:</b></small></div>"),
     fshare_keys_row,
+    widgets.HTML("<div style='margin-top:10px'><small><b>☁️ PikPak Account:</b></small></div>"),
+    widgets.HBox([token_pikpak]),
+    widgets.HTML("<small>Use a token with Read files and Manage files permissions. Selected shared files are saved to your PikPak before downloading. <a href='https://mypikpak.com/en-US/help-center/connected_apps/personal_access_tokens/create_personal_access_token' target='_blank'>Create a token</a></small>"),
     secrets_status,
     widgets.HTML("<div style='margin-top:10px'><small><b>📁 Download Directories (relative to Google Drive):</b></small></div>"),
     dir_config_row,
@@ -853,7 +867,7 @@ about_ui = widgets.VBox([
     widgets.HTML("""
         <div style='padding: 10px;'>
             <h3>ℹ️ About Ultimate Downloader</h3>
-            <p><strong>Version:</strong> 7.0</p>
+            <p><strong>Version:</strong> 7.1</p>
             <p><strong>Author:</strong> xersbtt</p>
             <p><strong>Repository:</strong> <a href='https://github.com/xersbtt/ultimate-downloader-colab' target='_blank'>github.com/xersbtt/ultimate-downloader-colab</a></p>
             <hr>
@@ -1564,7 +1578,7 @@ queue_ui = widgets.VBox([
 
 
 input_ui = widgets.VBox([
-    widgets.HTML("<h3>🚀 Ultimate Downloader v7.0</h3>"),
+    widgets.HTML("<h3>🚀 Ultimate Downloader v7.1</h3>"),
     widgets.HBox([auto_organize_checkbox, debrid_service_toggle]),
     widgets.HBox([concurrent_slider, auto_retry_input]),
     links_row,
@@ -1624,7 +1638,7 @@ def save_session(
     try:
         with _session_save_lock:
             session = {
-                "version": "7.0",
+                "version": "7.1",
                 "started_at": datetime.now().isoformat(),
                 "playlist_range": playlist_range,
                 "yt_success": yt_success,
@@ -1726,11 +1740,12 @@ def check_secrets_status():
     gf_status = "✅" if token_gf.value.strip() else "❌"
     rd_status = "✅" if token_rd.value.strip() else "❌"
     tb_status = "✅" if token_tb.value.strip() else "❌"
+    pikpak_status = "✅" if token_pikpak.value.strip() else "❌"
     tmdb_status = "✅" if token_tmdb.value.strip() else "❌"
     fs_status = "✅" if token_fshare_email.value.strip() and token_fshare_password.value.strip() else "❌"
     debrid = debrid_service_toggle.value
     debrid_label = f"<b>[{debrid}]</b>"
-    secrets_status.value = f"<span style='font-size:12px'>{gf_status} Gofile &nbsp; {rd_status} Real-Debrid &nbsp; {tb_status} TorBox &nbsp; {tmdb_status} TMDB &nbsp; {fs_status} FShare &nbsp; | Debrid: {debrid_label}</span>"
+    secrets_status.value = f"<span style='font-size:12px'>{gf_status} Gofile &nbsp; {rd_status} Real-Debrid &nbsp; {tb_status} TorBox &nbsp; {pikpak_status} PikPak &nbsp; {tmdb_status} TMDB &nbsp; {fs_status} FShare &nbsp; | Debrid: {debrid_label}</span>"
 
 def check_cookie_status():
     """Check if cookies.txt exists and update status display."""
@@ -1948,6 +1963,15 @@ class LiveBatchManager:
             self.running = False
             return None
 
+    def restart(self):
+        """Reopen this batch for another retry pass, retaining all task objects."""
+        with self.lock:
+            self.running = True
+            self.parallel_open = False
+            self.parallel_view = None
+            self.pending_parallel.clear()
+            self.pending_wave.clear()
+
     def close(self):
         with self.lock:
             self.running = False
@@ -1960,6 +1984,21 @@ _last_live_status: Optional[dict] = None
 _live_status_tasks: Optional[List[DownloadTask]] = None
 
 
+def _sync_live_controls():
+    """Resend toolbar controls from the browser callback, where Colab delivers comms.
+
+    Background trait changes can miss the displayed widget views. Assigning the
+    same values again does not emit a change, so resend both button and layout
+    models explicitly while running and before polling stops.
+    """
+    for control in (btn, btn_quick, btn_stop, btn_retry, btn_resume, btn_restart,
+                    btn_settings, btn_history, auto_organize_checkbox,
+                    debrid_service_toggle, concurrent_slider, auto_retry_input,
+                    btn_queue_start, btn_queue_start_subs, stop_hint):
+        control.send_state()
+        control.layout.send_state()
+
+
 def _colab_live_status_snapshot(token: str):
     """Serve one browser-requested snapshot; no background widget push is needed."""
     global _colab_live_status_active
@@ -1967,6 +2006,8 @@ def _colab_live_status_snapshot(token: str):
     if manager is None or manager.token != token:
         last = _last_live_status
         if last is not None and last.get('token') == token:
+            if manager is None:
+                _sync_live_controls()
             return JSON(last)
         return JSON({'token': token, 'running': False, 'progress': 0,
                      'description': 'Download finished', 'summary': '',
@@ -1980,6 +2021,8 @@ def _colab_live_status_snapshot(token: str):
         status_label.layout.display = 'none'
         live_log.layout.display = 'none'
 
+    _sync_live_controls()
+
     with manager.lock:
         current_tasks = globals().get('_live_status_tasks')
         tasks = list(current_tasks if current_tasks is not None else manager.all_tasks)
@@ -1992,16 +2035,28 @@ def _colab_live_status_snapshot(token: str):
     moving = sum(t.status == 'moving' for t in tasks)
     failed = sum(t.status == 'failed' for t in tasks)
     active = [t for t in tasks if t.status == 'downloading']
-    # Sequential TorBox/RD transfers have no progress monitor. Read their aria2
-    # stats here, and keep parallel rows current even if widget sync is delayed.
-    for task in active:
+    # Read transfer stats directly so rows stay current even if widget sync is delayed.
+    for task in tasks:
+        if task.status not in ('downloading', 'moving'):
+            continue
+        name = (task.filename or 'download')[:30]
+        if task.status == 'moving':
+            bars_by_id[task.id] = dict(id=task.id, description=f'📤 {name}', value=100.0, state='info')
+            continue
         stats = download_stats.get(task.id, {})
         pct = max(0.0, min(100.0, float(stats.get('pct', 0))))
         speed = float(stats.get('speed_mbs', 0))
-        name = (task.filename or 'download')[:30]
-        detail = 'low disk' if stats.get('disk_wait') else f'{speed:.1f} MB/s' if speed > 0 else 'starting...'
+        if stats.get('disk_wait'):
+            detail = 'low disk'
+        elif stats.get('retry_reason'):
+            remaining = max(0, int(stats.get('retry_until', 0) - time.time() + 0.999))
+            detail = f"{stats['retry_reason']}, retry in {remaining}s"
+        elif stats.get('stage'):
+            detail = stats['stage']
+        else:
+            detail = f'{speed:.1f} MB/s' if speed > 0 else 'starting...'
         bars_by_id[task.id] = dict(id=task.id, description=f'{name}  {int(pct)}% ({detail})',
-                                   value=pct, state='info' if stats.get('disk_wait') else 'warning')
+                                   value=pct, state='info' if stats.get('disk_wait') or stats.get('retry_reason') or stats.get('stage') else 'warning')
     bars = list(bars_by_id.values())
     active_fraction = sum(max(0.0, min(100.0, float(download_stats.get(t.id, {}).get('pct', 0)))) / 100.0
                           for t in active)
@@ -2019,6 +2074,8 @@ def _colab_live_status_snapshot(token: str):
         'description': description, 'summary': summary,
         'counts': {'done': done, 'total': total, 'failed': failed},
         'bars': bars, 'log': log_text,
+        'errors': [dict(name=t.filename or 'download', error=t.error or 'Download failed')
+                   for t in tasks if t.status == 'failed'][:5],
     })
 
 
@@ -2030,6 +2087,7 @@ def _colab_live_status_html(token: str):
   <div data-description style="margin:6px 0">Starting...</div>
   <progress data-progress max="100" value="0" style="width:100%;height:16px"></progress>
   <div data-summary style="margin:5px 0"></div>
+  <div data-errors style="white-space:pre-wrap;overflow-wrap:anywhere;color:#e57373;margin:5px 0"></div>
   <details data-files><summary>Individual downloads</summary><div data-rows></div></details>
   <pre data-log style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:220px;overflow:auto;margin:8px 0 0"></pre>
 </div>
@@ -2054,6 +2112,7 @@ def _colab_live_status_html(token: str):
       find('description').textContent = state.description || '';
       find('progress').value = Math.max(0, Math.min(100, Number(state.progress) || 0));
       find('summary').textContent = state.summary || '';
+      find('errors').textContent = (state.errors || []).map(item => '❌ ' + item.name + ': ' + item.error).join('\n');
       const log = find('log');
       const followLog = log.scrollHeight - log.scrollTop - log.clientHeight < 24;
       log.textContent = state.log || '';
@@ -2166,7 +2225,7 @@ def update_queue_display(preserve_selection: bool = True):
         source_icon = {"gofile": "📁", "pixeldrain": "💾", "rd": "⚡", "tb": "📦", "tb_host": "📦", "direct": "🔗", 
                        "youtube": "▶️", "mega": "☁️", "mediafire": "🔥", "1fichier": "📦",
                        "magnet": "🧲", "magnet_file": "🧲", "tb_magnet_file": "🧲", "archive": "📚",
-                       "fshare": "🇻🇳", "okru": "🟠"}.get(task.link_type, "📄")
+                       "fshare": "🇻🇳", "okru": "🟠", "pikpak": "☁️"}.get(task.link_type, "📄")
         filename = _strip_size_suffix(task.filename) if task.filename else task.url
         name = filename
         overrides = []
@@ -2393,6 +2452,8 @@ def show_queue_preview(tasks: List[DownloadTask], mode: str, append: bool = Fals
 
 def _queue_task_key(task: DownloadTask) -> tuple:
     """Stable resolved-file identity, independent of temporary download URLs."""
+    if task.link_type == 'pikpak':
+        return 'pikpak', task.pikpak_share_id or '', task.pikpak_file_id
     if task.link_type in ('magnet_file', 'tb_magnet_file'):
         return task.link_type, task.original_url or task.url
     if task.link_type == 'youtube':
@@ -2678,12 +2739,19 @@ def start_from_queue(b=None, mode="video"):
     _launch_live_batch(selected_tasks, mode)
 
 
-def _launch_live_batch(tasks: List[DownloadTask], mode: str):
+def _launch_live_batch(tasks: List[DownloadTask], mode: str, *, resume: bool = False,
+                       session_data: Optional[Dict[str, Any]] = None):
     """Return control to Colab so Add Links and Stop clicks can be handled."""
     global _live_batch, _last_live_status, _live_status_tasks, _colab_live_status_active
     if _live_batch is not None:
         print('⚠️ The previous download is still finishing. Try again in a moment.')
         return
+    # Colab's access prompt needs the calling notebook thread. Resume/Retry now
+    # launch a background batch, and a reviewed queue can enable the API after
+    # resolving links, so authenticate before starting either kind of worker.
+    load_dir_settings()
+    if drive_api_checkbox.value:
+        _init_drive_api()
     _restore_standard_status_widgets()
     manager = LiveBatchManager(tasks, mode)
     _live_batch = manager
@@ -2712,13 +2780,16 @@ def _launch_live_batch(tasks: List[DownloadTask], mode: str):
     def run():
         global _live_batch, _last_live_status, _colab_live_status_active
         try:
-            execute_selected_tasks(tasks, mode, live_manager=manager)
-            if _auto_retry_state['pending']:
+            if resume:
+                execute_batch(mode, resume=True, live_manager=manager, session_data=session_data)
+            else:
+                execute_selected_tasks(tasks, mode, live_manager=manager)
+            while _auto_retry_state['pending']:
                 manager.close()  # additions stop at the retry boundary
                 btn.disabled = True
                 btn_quick.disabled = True
                 btn_resume.disabled = True
-                _run_auto_retry_chain(mode)
+                _run_auto_retry_chain(mode, live_manager=manager)
         except Exception as e:
             print(f'❌ Live batch error: {e}')
         finally:
@@ -2748,7 +2819,7 @@ def _launch_live_batch(tasks: List[DownloadTask], mode: str):
                     if any(t.link_type == 'youtube' for t in pending_queue):
                         btn_queue_start_subs.layout.display = 'inline-block'
             finally:
-                if colab_status_enabled and _colab_live_status_active:
+                if colab_status_enabled:
                     try:
                         _last_live_status = _colab_live_status_snapshot(manager.token).data
                         _last_live_status['running'] = False
@@ -3962,9 +4033,11 @@ def analyze_batch_metadata(filenames: List[str], merge: bool = False) -> int:
         print("   ⚠️ TMDB: some lookups failed — falling back to filename parsing")
     return matched
 
-def check_duplicate_in_drive(filename: str, source: str = "generic", playlist_index: Optional[int] = None) -> bool:
+def check_duplicate_in_drive(filename: str, source: str = "generic", playlist_index: Optional[int] = None,
+                             task=None) -> bool:
     """Check if file already exists in Drive to avoid re-downloading"""
-    dest_path, category = determine_destination_path(filename, source, dry_run=True, playlist_index=playlist_index)
+    dest_path, category = determine_destination_path(filename, source, dry_run=True,
+                                                     playlist_index=playlist_index, task=task)
     if os.path.exists(dest_path):
         file_size = os.path.getsize(dest_path) / (1024 * 1024)
         print(f"   ⏭️  SKIPPED (Already exists): {os.path.basename(dest_path)} ({file_size:.1f} MB)")
@@ -4216,8 +4289,13 @@ def detect_episode_info(filename: str, use_batch: bool = True) -> Dict[str, Any]
         'episode_end': episode_end,
     }
 
-def determine_destination_path(filename: str, source: str = "generic", dry_run: bool = False, playlist_index: Optional[int] = None) -> Tuple[str, str]:
+def determine_destination_path(filename: str, source: str = "generic", dry_run: bool = False,
+                               playlist_index: Optional[int] = None, task=None) -> Tuple[str, str]:
     filename = sanitize_filename(filename)
+    # YouTube's downloaded name/container can differ from its queue filename.
+    # Keep looking up the selected row's naming data without aliasing shared caches
+    # to filenames that may belong to other downloads in the live batch.
+    naming_filename = task.filename if task is not None and task.filename else filename
     
     # If auto-organise is disabled, just return Downloads folder with original filename
     if not is_auto_organize_enabled():
@@ -4227,13 +4305,19 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
 
     # 🎯 Route as 'Downloads (as-is)': keep the original name, skip organising —
     # the per-file version of switching auto-organise off
-    route_ov = get_route_override(filename)
+    route_ov = get_route_override(naming_filename)
     if route_ov == 'downloads':
         downloads_dir = os.path.join(DRIVE_BASE, get_downloads_path())
         if not dry_run: _ensure_dest_dir(downloads_dir)  # API path owns folder creation
         return os.path.join(downloads_dir, filename), "Downloads"
-    # Parse episode/show info from the filename (pure logic, unit-testable)
-    info = detect_episode_info(filename)
+    # Full queue names retain batch episode detection even if yt-dlp changes the
+    # container. Older sessions and failed previews have labels instead of names;
+    # parse the downloaded filename in that case while retaining their override key.
+    analysis_filename = naming_filename
+    if task is not None and (naming_filename.endswith('...')
+                             or naming_filename.startswith(('http://', 'https://'))):
+        analysis_filename = filename
+    info = detect_episode_info(analysis_filename)
     part_suffix = info['part_suffix']
     english_part_suffix = info['english_part_suffix']
     show_name = info['show_name']
@@ -4243,7 +4327,7 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
     episode_detected = info['episode_detected']
 
     # Manual name/year (queue ✏️ Force Name) — the manual counterpart of a TMDB match
-    name_ov = get_name_override(filename)
+    name_ov = get_name_override(naming_filename)
     manual_show_name = name_ov[0] if name_ov else ''
     manual_year = name_ov[1] if name_ov else ''
 
@@ -4258,18 +4342,18 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
 
     # Manual season override (queue 🗂️ Force Season) wins over filename parsing and
     # TMDB mapping — the parsed number stays the episode, only the season is forced
-    season_ov = get_season_override(filename)
+    season_ov = get_season_override(naming_filename)
     if season_ov is not None:
         season_num = season_ov
 
     # Manual renumbering (queue 🔢 Renumber) wins over every episode source, and
     # marks the file as an episode even when detection found none
-    episode_ov = get_episode_override(filename)
+    episode_ov = get_episode_override(naming_filename)
     if episode_ov is not None:
         episode_num = episode_ov
         # A renumber replaces the episode identity outright: a plain number makes
         # the file a single episode, a range (🔢 7-9) makes it span E07-E09
-        episode_end = get_episode_end_override(filename)
+        episode_end = get_episode_end_override(naming_filename)
         is_tv = True
         if not episode_detected:
             episode_detected = True
@@ -4282,7 +4366,7 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
     # Library family is a separate axis from naming: Force Name replaces the display
     # identity but keeps a confident anime classification. An explicit Route always
     # wins, including TV/Movie routes that deliberately force the standard libraries.
-    metadata_match = get_tmdb_match(filename)
+    metadata_match = get_tmdb_match(naming_filename)
     effective_kind = 'tv' if (is_tv or episode_detected) else 'movie'
     is_anime = resolve_library_is_anime(route_ov, metadata_match, effective_kind)
     tmdb_match = None if manual_show_name else metadata_match
@@ -4356,7 +4440,7 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
     if english_part_suffix and not info['has_sxe'] and episode_ov is None:
         part_suffix = part_suffix or english_part_suffix
     # Manual part override (queue 📎 Set Part / ✖ No Part) wins over all detection
-    part_ov = get_part_override(filename)
+    part_ov = get_part_override(naming_filename)
     if part_ov is not None:
         part_suffix = f"-pt{part_ov}" if part_ov else ""
     # Multi-episode files keep their span in the Plex convention (S01E01-E03)
@@ -4396,10 +4480,11 @@ def setup_environment(needs_mega, needs_ytdlp, needs_aria, during_active=False):
         load_dir_settings()
         save_dir_settings()
 
-    # Drive API auth happens here, on the main thread: Colab renders a consent
-    # prompt, and settings (which decide whether the API is wanted at all) have
-    # only just been restored above.
-    if drive_api_checkbox.value and not during_active:
+    # Colab's consent prompt must run on the notebook thread. Live Resume/Retry
+    # already attempts auth in _launch_live_batch before entering this worker;
+    # if that failed, keep the logged mount fallback instead of prompting here.
+    if (drive_api_checkbox.value and not during_active
+            and current_thread() is main_thread()):
         _init_drive_api()
     
     # Create media folders and config folder
@@ -4440,19 +4525,60 @@ def setup_environment(needs_mega, needs_ytdlp, needs_aria, during_active=False):
     
     check_resume_available()
 
-def ytdl_hook(d):
-    if d['status'] == 'downloading':
-        try:
-            p = d.get('_percent_str', '0%').replace('%','')
-            speed = d.get('_speed_str', 'N/A')
-            with progress_lock:
-                progress_bar.value = float(p)
-                progress_bar.description = f"YT: {p}% ({speed})"
-        except Exception: pass
-    elif d['status'] == 'finished':
-        with progress_lock:
-            progress_bar.value = 100
-            progress_bar.description = "Done!"
+def ytdl_hook(d, task=None, postprocessing=False):
+    """Attach yt-dlp's numeric progress to its queue row; retain standalone updates."""
+    status = d.get('status')
+    if status not in ('downloading', 'finished', 'started', 'processing'):
+        return
+    with progress_lock:
+        stats = (download_stats.setdefault(task.id, {'pct': 0.0, 'speed_mbs': 0.0})
+                 if task is not None else {})
+        if postprocessing or status == 'finished':
+            pct, speed_mbs = 100.0, 0.0
+            stage = 'Processing video...'
+        else:
+            total = d.get('total_bytes') or d.get('total_bytes_estimate')
+            if total and total > 0 and d.get('downloaded_bytes') is not None:
+                pct = 100.0 * d['downloaded_bytes'] / total
+            else:
+                # Older/download-specific hooks may only supply a formatted value.
+                percent = re.sub(r'\x1b\[[0-9;]*m', '', d.get('_percent_str') or '').strip().rstrip('%')
+                try:
+                    pct = float(percent)
+                except (ValueError, TypeError):
+                    pct = stats.get('pct', 0.0)
+            pct = max(0.0, min(100.0, pct))
+            speed_mbs = max(0.0, float(d.get('speed') or 0)) / (1024 * 1024)
+            stage = None
+        if task is not None:
+            stats.update(pct=pct, speed_mbs=speed_mbs)
+            if stage:
+                stats['stage'] = stage
+            else:
+                stats.pop('stage', None)
+        else:
+            progress_bar.value = pct
+            progress_bar.description = stage or f"YT: {pct:.1f}% ({speed_mbs:.1f} MB/s)"
+
+def _configure_okru_extractor(ydl, url: str):
+    """Accept OK.ru's decoded metadata in older stable/in-memory yt-dlp versions.
+
+    Upstream fix: https://github.com/yt-dlp/yt-dlp/pull/17739
+    Keep the compatibility change on this downloader's OK.ru extractor instance;
+    other sites and yt-dlp's normal JSON string validation stay unchanged.
+    """
+    if not url_matches_host(url, ('ok.ru', 'odnoklassniki.ru')):
+        return
+    extractor = ydl.get_info_extractor('Odnoklassniki')
+    parse_json = extractor._parse_json
+
+    def parse_metadata(value, *args, **kwargs):
+        if isinstance(value, dict):
+            return value
+        return parse_json(value, *args, **kwargs)
+
+    extractor._parse_json = parse_metadata
+
 
 def get_youtube_title(url: str) -> str:
     """Quickly fetch video/playlist title for queue display."""
@@ -4465,6 +4591,7 @@ def get_youtube_title(url: str) -> str:
             'skip_download': True,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            _configure_okru_extractor(ydl, url)
             info = ydl.extract_info(url, download=False)
             if info:
                 title = info.get('title', '')
@@ -4478,7 +4605,7 @@ def get_youtube_title(url: str) -> str:
     return ""  # Fall back to showing URL
 
 def resolve_youtube_playlist(url: str) -> List[DownloadTask]:
-    """Expand a YouTube playlist URL into individual video DownloadTasks for queue display.
+    """Expand a YouTube playlist into tasks with full filenames for naming/matching.
     For single videos, returns a single-element list.
     Uses extract_flat for fast metadata-only extraction.
     """
@@ -4491,6 +4618,7 @@ def resolve_youtube_playlist(url: str) -> List[DownloadTask]:
             'skip_download': True,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            _configure_okru_extractor(ydl, url)
             info = ydl.extract_info(url, download=False)
             if info and info.get('_type') == 'playlist':
                 entries = [e for e in info.get('entries', []) if e is not None]
@@ -4501,11 +4629,8 @@ def resolve_youtube_playlist(url: str) -> List[DownloadTask]:
                     video_url = entry.get('url') or entry.get('webpage_url') or entry.get('id', '')
                     if video_url and not video_url.startswith('http'):
                         video_url = f"https://www.youtube.com/watch?v={video_url}"
-                    display = f"[{i}/{len(entries)}] {video_title}"
-                    if len(display) > 60:
-                        display = display[:57] + "..."
                     tasks.append(DownloadTask(
-                        url=video_url, filename=display,
+                        url=video_url, filename=sanitize_filename(f"{video_title}.mkv"),
                         source="youtube", link_type="youtube",
                         original_url=url  # Store original playlist URL
                     ))
@@ -4515,13 +4640,12 @@ def resolve_youtube_playlist(url: str) -> List[DownloadTask]:
             elif info:
                 # Single video — return as-is
                 title = info.get('title', '')
-                display = title[:60] + "..." if len(title) > 60 else title
                 return [DownloadTask(
-                    url=url, filename=display or url[:50] + "...",
+                    url=url, filename=sanitize_filename(f"{title}.mkv") if title else url[:50] + "...",
                     source="youtube", link_type="youtube"
                 )]
     except Exception as e:
-        print(f"   ⚠️ Could not expand YouTube link: {e}")
+        print(f"   ⚠️ Could not resolve video link: {e}")
     # Fallback: return single task with URL
     return [DownloadTask(url=url, filename=url[:50] + "...", source="youtube", link_type="youtube")]
 
@@ -4540,6 +4664,7 @@ def get_youtube_subtitles(url: str) -> dict:
             'listsubtitles': False,  # We'll get them from info dict
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            _configure_okru_extractor(ydl, url)
             info = ydl.extract_info(url, download=False)
             if info:
                 # For playlists, get subs from first available entry
@@ -4574,34 +4699,45 @@ def get_youtube_subtitles(url: str) -> dict:
         pass
     return {}
 
-def process_youtube_link(url, mode="video", apply_playlist_range=True) -> Tuple[int, int, int]:
+def process_youtube_link(url, mode="video", apply_playlist_range=True, task=None) -> Tuple[int, int, int]:
     """Process YouTube link. Returns (success_count, fail_count, total_count).
     
     Args:
         url: YouTube URL to process
         mode: 'video' or 'subtitles'
         apply_playlist_range: If False, download all items (ignore playlist_selection)
+        task: Selected queue row whose naming settings apply to video and subtitles
     """
     import yt_dlp
     print(f"   ▶️ Processing Video: {url}")
-    if not _wait_for_disk_space(DISK_START_GB, label="YouTube download"):
+    if task is not None:
+        task.status = 'downloading'
+        with progress_lock:
+            download_stats[task.id] = dict(pct=0.0, speed_mbs=0.0, stage='Preparing video...')
+    if not _wait_for_disk_space(DISK_START_GB, label="YouTube download",
+                                task_id=task.id if task is not None else None):
         return (0, 1, 1)
-    with progress_lock:
-        progress_bar.value = 0
-        progress_bar.description = "Starting..."
+    if task is None:
+        with progress_lock:
+            progress_bar.value = 0
+            progress_bar.description = "Starting..."
     
     success_count = 0
     fail_count = 0
     skip_count = 0
     
     archive_path = f"{UD_CONFIG_PATH}yt_history.txt"
+    # Own the output directory so a concurrent Drive mover's extracted subtitles
+    # cannot be mistaken for this video's files. Reuse it on Retry/Resume.
+    download_dir = os.path.join(COLAB_ROOT, 'youtube_' + hashlib.sha256(url.encode()).hexdigest()[:16])
+    os.makedirs(download_dir, exist_ok=True)
     # Only apply playlist range if flag is True and user provided a range
     playlist_items = normalize_playlist_range(playlist_selection.value) if apply_playlist_range else None
     
     ydl_opts = {
         'outtmpl': {
-            'default': f'{COLAB_ROOT}%(title)s.%(ext)s',
-            'subtitle': f'{COLAB_ROOT}%(title)s.%(ext)s',  # Match video naming for subtitles
+            'default': os.path.join(download_dir, '%(title)s.%(ext)s'),
+            'subtitle': os.path.join(download_dir, '%(title)s.%(ext)s'),
         },
         'quiet': True, 'no_warnings': True, 
         'restrictfilenames': False, 
@@ -4609,7 +4745,8 @@ def process_youtube_link(url, mode="video", apply_playlist_range=True) -> Tuple[
         'writesubtitles': True, 
         'subtitleslangs': [f'{lang}.*' if lang == 'en' else lang for lang in subtitle_langs.value] or ['en'],  # Use selected languages 
         'subtitlesformat': 'srt', 
-        'progress_hooks': [ytdl_hook], 
+        'progress_hooks': [lambda data: ytdl_hook(data, task=task)],
+        'postprocessor_hooks': [lambda data: ytdl_hook(data, task=task, postprocessing=True)],
         'noprogress': True,
         'download_archive': archive_path,
     }
@@ -4632,6 +4769,7 @@ def process_youtube_link(url, mode="video", apply_playlist_range=True) -> Tuple[
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            _configure_okru_extractor(ydl, url)
             try: 
                 info = ydl.extract_info(url, download=False)
             except Exception as e:
@@ -4679,24 +4817,30 @@ def process_youtube_link(url, mode="video", apply_playlist_range=True) -> Tuple[
                 title = entry.get('title', 'Unknown')
                 ext = 'mkv' if mode == "video" else 'srt'
                 temp_filename = f"{title}.{ext}"
-                if check_duplicate_in_drive(temp_filename, source="youtube", playlist_index=i):
+                if check_duplicate_in_drive(temp_filename, source="youtube", playlist_index=i, task=task):
                     skip_count += 1
                     continue
                 
                 print(f"      [{i}/{total_items}] Downloading: {title}")
                 
                 try:
-                    before = set(os.listdir(COLAB_ROOT))
+                    if task is not None:
+                        task.status = 'downloading'
                     ydl.download([entry.get('webpage_url', entry.get('url'))])
-                    after = set(os.listdir(COLAB_ROOT))
-                    new_files = list(after - before)
+                    # Include complete files left by an interrupted prior attempt.
+                    downloaded_files = [f for f in os.listdir(download_dir)
+                                        if not f.endswith(('.part', '.ytdl'))
+                                        and os.path.isfile(os.path.join(download_dir, f))]
                     
-                    if not new_files:
+                    if not downloaded_files:
                         fail_count += 1
                         continue
-                    for f in new_files:
-                        if f.endswith(('.part', '.ytdl')): continue
-                        handle_file_processing(os.path.join(COLAB_ROOT, f), source="youtube")
+                    if task is not None:
+                        task.status = 'moving'
+                        with progress_lock:
+                            download_stats[task.id].update(pct=100.0, speed_mbs=0.0)
+                    for f in downloaded_files:
+                        handle_file_processing(os.path.join(download_dir, f), source="youtube", task=task)
                     success_count += 1
                 except Exception as e:
                     print(f"      ❌ Failed to download {title}: {str(e)[:80]}")
@@ -4705,8 +4849,9 @@ def process_youtube_link(url, mode="video", apply_playlist_range=True) -> Tuple[
         print(f"   ❌ YouTube processing failed: {str(e)[:100]}")
         return (success_count, fail_count + 1, success_count + fail_count + skip_count + 1)
     
-    with progress_lock:
-        progress_bar.description = "Idle"
+    if task is None:
+        with progress_lock:
+            progress_bar.description = "Idle"
     
     total = success_count + fail_count + skip_count
     return (success_count, fail_count, total)
@@ -4787,6 +4932,19 @@ def _speed_to_mbs(value: float, unit: str) -> float:
     if unit == 'G': return value * 1024
     return value
 
+SERVER_BACKOFF_SECS = 15
+SERVER_MAX_BACKOFF_SECS = 60
+MAX_SERVER_WAITS = 3  # Extra waits for transient HTTP failures, bounded per file
+
+
+def _redact_transfer_error(value: str) -> str:
+    """Keep download diagnostics without signed URLs or authorization headers."""
+    value = re.sub(r'(?i)https?://\S+', '[URL]', value)
+    value = re.sub(r'(?i)(bearer\s+|accountToken=)\S+', r'\1[hidden]', value)
+    value = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', value)
+    return ' '.join(value.split())[:240]
+
+
 def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optional[str] = None,
                         task_id: Optional[str] = None, update_bar: bool = True,
                         url_refresh: Optional[Callable[[], str]] = None) -> Optional[str]:
@@ -4841,6 +4999,7 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
     # Request-metered hosts get fewer connections and aria2's stock 20M split
     # floor, so a near-complete file can't spray Range requests at the limiter.
     rate_limited = url_matches_host(url, RATE_LIMITED_HOSTS)
+    pikpak_transfer = url_matches_host(url, ('mypikpak.com',))
     conn_args = ['-x', '2', '-s', '2'] if rate_limited else ['-x', '16', '-s', '16']
     retry_wait = '30' if rate_limited else '2'
     cmd = ['aria2c', url, '-d', dest_folder, '-o', filename, *conn_args, '-k', '20M',
@@ -4852,6 +5011,9 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
     proc_key = task_id or str(uuid4())
     attempt = 0
     throttle_waits = 0  # Reset when downloaded bytes advance, including within 99%
+    server_waits = 0
+    launched_attempts = 0
+    last_failure = ''
     downloaded_high_water = None
     while attempt < 3:
         attempt += 1
@@ -4862,16 +5024,24 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
             completed_path = None  # Path reported by aria2's "Download complete:" line
             last_error_line = ""  # aria2's own error text, surfaced when the attempt fails
             saw_throttle = False
+            http_status = 0
+            transient_status = 0
             made_progress = False
             disk_paused = False  # Set by the watchdog when it terminates aria2 on low disk
             last_disk_check = time.time()
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
+            launched_attempts += 1
             _register_proc(proc_key, process)
             last_speed = ""
             last_speed_mbs = 0.0
             for line in process.stdout:
-                if 'status=429' in line:
-                    saw_throttle = True
+                status_match = re.search(r'\bstatus=(\d{3})\b', line)
+                if status_match:
+                    http_status = int(status_match.group(1))
+                    if http_status == 429:
+                        saw_throttle = True
+                    if http_status in (500, 502, 503, 504):
+                        transient_status = http_status
                 # Use aria2's completed byte count, not file size (sparse files can
                 # already have their final size) or rounded integer percentages.
                 downloaded = re.search(r'\[#[\da-f]+\s+([\d.]+)([KMGT]?i?B)/', line, re.I)
@@ -4890,7 +5060,7 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
                 err_match = re.search(r'(errorCode=\d+.*|status=\d{3}.*|Timeout\b.*|'
                                       r'Authorization failed.*|Resource not found.*)', line)
                 if err_match:
-                    last_error_line = err_match.group(1).strip()[:120]
+                    last_error_line = _redact_transfer_error(err_match.group(1))
                 match = re.search(r'\((\d+)%\)', line)
                 # aria2 outputs speed as "DL:5.2MiB" or "DL: 5.2MiB/s" - capture various formats
                 speed_match = re.search(r'DL:\s*(\d+\.?\d*)\s*([KMG])i?B', line)
@@ -4956,22 +5126,72 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
                     with print_lock:
                         print(f"      ✓ Found downloaded file: {f}")
                     return candidate
-            detail = f" — {last_error_line}" if last_error_line else ""
+            status = 429 if saw_throttle else transient_status or http_status
+            reason = last_error_line or (f'aria2 exited with code {process.returncode}'
+                                        if process.returncode else 'aria2 reported success but no completed file was found')
+            last_failure = f'HTTP {status}: {reason}' if status else reason
+            detail = f" — {last_failure}"
             with print_lock:
-                if not os.path.exists(final_path):
-                    print(f"      ⚠️ Retry {attempt}/3 - File not found at expected path{detail}")
-                    print(f"         Expected: {final_path}")
+                if process.returncode != 0:
+                    print(f"      ⚠️ Download attempt {launched_attempts} failed{detail}")
                 else:
-                    print(f"      ⚠️ Retry {attempt}/3 - aria2 returned code {process.returncode}{detail}")
-            # A 429 says the account is being throttled, not that the link died:
-            # the URL is still good and aria2 -c has a resumable partial on disk.
-            # Re-minting would only spend more of the rate budget on requestdl
-            # (TorBox's most rate-limited endpoint) and make the throttle worse.
+                    print(f"      ⚠️ File not found at expected path{detail}")
+                    print(f"         Expected: {final_path}")
+
+            # A 429 keeps its existing throttle budget. Transient server errors
+            # get a separate, bounded cooldown instead of rapidly exhausting retries.
             throttled = saw_throttle
+            if made_progress:
+                throttle_waits = 0
+            cool_off = 0
+            wait_reason = ''
+            if throttled and throttle_waits < MAX_THROTTLE_WAITS:
+                throttle_waits += 1
+                attempt -= 1
+                cool_off = min(THROTTLE_BACKOFF_SECS * (2 ** (throttle_waits - 1)),
+                               THROTTLE_MAX_BACKOFF_SECS)
+                cmd[cmd.index('-x') + 1] = '1'
+                cmd[cmd.index('-s') + 1] = '1'
+                wait_reason = 'Rate limited (HTTP 429)'
+            elif not throttled and transient_status and server_waits < MAX_SERVER_WAITS:
+                server_waits += 1
+                attempt -= 1
+                cool_off = min(SERVER_BACKOFF_SECS * (2 ** (server_waits - 1)),
+                               SERVER_MAX_BACKOFF_SECS)
+                wait_reason = f'Server unavailable (HTTP {transient_status})'
+                if pikpak_transfer:
+                    # Reduce the range-request burst only after PikPak rejects it.
+                    connections = '4' if server_waits == 1 else '1'
+                    cmd[cmd.index('-x') + 1] = connections
+                    cmd[cmd.index('-s') + 1] = connections
+
+            elif not throttled and transient_status:
+                # The server has not recovered within its cooldown budget.
+                attempt = 3
+
+            if cool_off:
+                with progress_lock:
+                    if task_id:
+                        download_stats[task_id].update(speed_mbs=0.0, retry_reason=wait_reason,
+                                                       retry_until=time.time() + cool_off)
+                    if update_bar:
+                        progress_bar.description = f'{wait_reason}: retry in {cool_off}s'
+                with print_lock:
+                    print(f"      ⏳ {wait_reason} — waiting {cool_off}s, then resuming the partial download")
+                for _ in range(cool_off):
+                    if _cancel_requested:
+                        return None
+                    time.sleep(1)
+                if task_id:
+                    with progress_lock:
+                        download_stats[task_id].pop('retry_reason', None)
+                        download_stats[task_id].pop('retry_until', None)
+            if _cancel_requested:
+                return None
+
+            # After a server cooldown, request a fresh link using the saved file
+            # reference. Throttled URLs stay valid and must not be re-minted.
             if url_refresh and attempt < 3 and not throttled:
-                # The debrid link may simply have expired — re-mint it so the
-                # retry has a live URL to use.
-                # aria2 -c still resumes whatever partial is already on disk.
                 try:
                     fresh_url = url_refresh()
                 except Exception:
@@ -4979,44 +5199,30 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
                 if fresh_url and fresh_url != cmd[1]:
                     cmd[1] = fresh_url
                     with print_lock:
-                        print(f"      🔄 Re-requested a fresh download link")
-            if made_progress:
-                throttle_waits = 0
-            if throttled and throttle_waits < MAX_THROTTLE_WAITS:
-                # Same treatment as a disk pause: the file is fine and -c resumes it,
-                # so a throttle must not burn a retry — otherwise a 99%-complete file
-                # exhausts its 3 attempts on the last few MB and can never land.
-                throttle_waits += 1
-                attempt -= 1
-                cool_off = min(THROTTLE_BACKOFF_SECS * (2 ** (throttle_waits - 1)),
-                               THROTTLE_MAX_BACKOFF_SECS)
-                # Resume with one stream after throttling instead of repeating
-                # the same burst of range requests on every retry.
-                cmd[cmd.index('-x') + 1] = '1'
-                cmd[cmd.index('-s') + 1] = '1'
-                with progress_lock:
-                    if task_id:
-                        download_stats[task_id]['speed_mbs'] = 0.0
-                    if update_bar:
-                        progress_bar.description = f"Rate limited: retry in {cool_off}s"
-                with print_lock:
-                    print(f"      ⏳ Rate limited (429) — cooling off {cool_off}s, then resuming from where it stopped")
-                for _ in range(cool_off):
+                        print("      🔄 Re-requested a fresh download link")
+            if cool_off:
+                continue
+            if attempt < 3:
+                for _ in range(2 ** attempt):
                     if _cancel_requested:
                         return None
                     time.sleep(1)
-                continue
-            time.sleep(2**attempt)
         except Exception as e:
             _unregister_proc(proc_key)
+            last_failure = _redact_transfer_error(str(e))
             with print_lock:
-                print(f"      ❌ Download error (attempt {attempt}/3): {str(e)[:80]}")
+                print(f"      ❌ Download error: {last_failure}")
             break
 
     if _cancel_requested:
         return None
+    attempts = f' after {launched_attempts} attempt(s)' if launched_attempts else ''
+    failure = f'Download failed{attempts}: {last_failure or "No completed file was found"}'
+    if task_id:
+        with progress_lock:
+            download_stats[task_id]['error'] = failure
     with print_lock:
-        print(f"   ❌ Download failed after 3 attempts - Check URL validity or network connection")
+        print(f"   ❌ {failure}")
     return None
 
 # --- EMBEDDED SUBTITLE EXTRACTION ---
@@ -5546,7 +5752,7 @@ def _move_with_progress_impl(src: str, dest: str):
                 pass
         raise
 
-def handle_file_processing(file_path, source="generic"):
+def handle_file_processing(file_path, source="generic", task=None):
     if not file_path or not os.path.exists(file_path): return
     filename = os.path.basename(file_path)
     _, ext = os.path.splitext(filename)
@@ -5556,7 +5762,7 @@ def handle_file_processing(file_path, source="generic"):
         # its video's TMDB/season entry) and re-attach it to the final name afterwards.
         processing_name, lang = _split_subtitle_lang(filename)
 
-        final_dest, cat = determine_destination_path(processing_name, source)
+        final_dest, cat = determine_destination_path(processing_name, source, task=task)
 
         if lang:  # re-attach a Plex-friendly language code before the subtitle extension
             base, sub_ext = os.path.splitext(final_dest)
@@ -7377,6 +7583,433 @@ def _tb_url_refresher(task: DownloadTask, tb_key: str = "") -> Optional[Callable
         return url
     return _refresh
 
+# --- PIKPAK (OFFICIAL CLI) ---
+# Keep this integration in the notebook's single downloadable script. The CLI
+# owns authentication and API compatibility; aria2 owns transfers and resume.
+PIKPAK_CLI_VERSION = 'v0.5.2'
+PIKPAK_CLI_SHA256 = {
+    'linux_amd64': 'f697499cb35645ba4c9e79fff9f6eafd0032743f08c6ecef327688e4ecece140',
+    'linux_arm64': '2f5502863c0aec4772f1d62c4b66a201803dd391652a1efd571b62384e00b3eb',
+    'darwin_amd64': '34a65ed2a3f1cfe75002709a0ce2d678120989a845b22a91ced9828b6e53e9b0',
+    'darwin_arm64': '306e1cfb6b12834b36c4a387ab5ee810e560dbd67a3e88e8f00b861dea3df765',
+    'windows_amd64': '698f9ad7f98d3a4b87aac15ecae5ba2f0470514309b6db97af5992d339a54d8f',
+    'windows_arm64': '334944591b61083318383bdbc87725808ef838612e3fabbca63313098407e5f5',
+}
+_pikpak_install_lock = Lock()
+_pikpak_command_lock = Lock()
+
+
+def _pikpak_validate_download_url(link: str) -> str:
+    if (not isinstance(link, str) or not link or re.search(r'\s', link) or
+            urlparse(link).scheme not in ('https', 'http') or not urlparse(link).hostname):
+        raise RuntimeError('PikPak did not provide an original-file download URL')
+    return link
+
+
+def _pikpak_redact(value: str) -> str:
+    """Remove the account token and signed URLs from service errors."""
+    secrets = [token_pikpak.value.strip()]
+    value = str(value)
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        if secret:
+            value = value.replace(secret, '[token]')
+    value = re.sub(r'(?i)bearer\s+\S+', 'Bearer [token]', value)
+    value = re.sub(r'(?i)https?://\S+', '[URL]', value)
+    value = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', value)
+    return ' '.join(value.split())[:240]
+
+
+def _pikpak_cli_path() -> str:
+    """Lazily install a pinned, checksum-verified official binary locally."""
+    arch = {'x86_64': 'amd64', 'amd64': 'amd64', 'aarch64': 'arm64',
+            'arm64': 'arm64'}.get(platform.machine().lower())
+    target = f'{platform.system().lower()}_{arch}'
+    checksum = PIKPAK_CLI_SHA256.get(target)
+    if not checksum:
+        raise RuntimeError('PikPak CLI does not support this runtime architecture')
+    asset = f'pikpak_{target}' + ('.exe' if os.name == 'nt' else '')
+    folder = os.path.join(COLAB_ROOT, 'ultimate_downloader_tools', PIKPAK_CLI_VERSION)
+    path = os.path.join(folder, asset)
+    with _pikpak_install_lock:
+        if os.path.isfile(path):
+            with open(path, 'rb') as stream:
+                if hashlib.sha256(stream.read()).hexdigest() == checksum:
+                    return path
+        if cancel_requested():
+            raise RuntimeError('Cancelled by user')
+        print('🛠️ Installing the official PikPak client...')
+        url = f'https://download.mypikpak.com/cli/release/{PIKPAK_CLI_VERSION}/{asset}'
+        with requests.get(url, timeout=(REQUEST_TIMEOUT, 120), stream=True) as response:
+            response.raise_for_status()
+            os.makedirs(folder, exist_ok=True)
+            partial = path + '.tmp'
+            digest = hashlib.sha256()
+            try:
+                with open(partial, 'wb') as stream:
+                    for chunk in response.iter_content(1024 * 1024):
+                        if cancel_requested():
+                            raise RuntimeError('Cancelled by user')
+                        digest.update(chunk)
+                        stream.write(chunk)
+                if digest.hexdigest() != checksum:
+                    raise RuntimeError('PikPak client checksum verification failed')
+                os.chmod(partial, 0o700)
+                os.replace(partial, path)
+            finally:
+                if os.path.isfile(partial):
+                    os.remove(partial)
+    return path
+
+
+def _pikpak_cli(args: List[str], *, json_output: bool = True) -> Any:
+    # Serialize client state access and link requests while transfers stay parallel.
+    with _pikpak_command_lock:
+        return _pikpak_cli_unlocked(args, json_output=json_output)
+
+
+def _pikpak_failure(stdout: str, stderr: str, args: List[str]) -> RuntimeError:
+    """Preserve useful service errors without exposing credentials or signed links."""
+    fields = {}
+    for output in (stdout, stderr):
+        try:
+            payload = json.loads(output)
+            error = payload.get('error') if isinstance(payload, dict) else None
+            if isinstance(error, dict):
+                fields.update({k: str(error[k]) for k in ('code', 'message', 'reason', 'hint') if error.get(k)})
+        except (ValueError, TypeError):
+            for label, value in re.findall(r'^\s*(Code|Reason|Hint):\s*(.+)$', output, re.M):
+                fields[label.lower()] = value
+
+    safe = _pikpak_redact
+
+    code = safe(fields.get('code', '')).upper()
+    if not re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}', code):
+        code = ''
+    diagnostic = (stdout + stderr).lower()
+    if any(word in diagnostic for word in ('quota', 'storage', 'space_not_enough', 'daily_create_limit', '429')):
+        message = 'storage or transfer limit reached; check your account quota'
+    elif any(word in diagnostic for word in ('access_denied', 'permission', 'scope', 'forbidden')):
+        message = 'token permissions rejected; check Read files and Manage files'
+    elif any(word in diagnostic for word in ('unauth', 'token_expired', 'expired token', 'invalid token', 'login', 'credential', '401')):
+        message = 'token is invalid or expired; update PIKPAK_TOKEN in Settings'
+    else:
+        message = 'request failed'
+    command = tuple(args[:2]) if args[:1] in (['share'], ['task']) else tuple(args[:1])
+    action = {('share', 'restore'): 'saving shared file', ('share', 'get'): 'browsing share',
+              ('task', 'get'): 'checking saved file', ('download',): 'getting download link',
+              ('get',): 'reading saved file', ('ls',): 'listing account files'}.get(command, 'request')
+    detail = safe(fields.get('reason') or fields.get('message') or '')
+    hint = safe(fields.get('hint', ''))
+    suffix = f' [{code}]' if code else ''
+    if detail:
+        suffix += f': {detail}'
+    if hint and hint != detail:
+        suffix += f'. {hint}'
+    failure = RuntimeError(f'PikPak {action}: {message}{suffix}')
+    failure.pikpak_code = code
+    return failure
+
+
+def _pikpak_cli_unlocked(args: List[str], *, json_output: bool = True) -> Any:
+    """Run the official client with a PAT kept in memory, never in argv/logs."""
+    key = token_pikpak.value.strip()
+    if not key:
+        raise RuntimeError('Enter a PikPak token in Settings or Colab Secrets (PIKPAK_TOKEN)')
+    if cancel_requested():
+        raise RuntimeError('Cancelled by user')
+    command = [_pikpak_cli_path(), *args]
+    if json_output:
+        command.extend(['-F', 'json'])
+    env = os.environ.copy()
+    env.update(PIKPAK_TOKEN=key,
+               PIKPAK_DIR=os.path.join(COLAB_ROOT, 'ultimate_downloader_tools', 'pikpak_state'),
+               PIKPAK_NO_LOG='1', PIKPAK_NO_UPDATE_NOTIFIER='1', PIKPAK_NO_SKILL_SYNC='1')
+    # Isolate this runtime from credentials paths inherited from a local shell.
+    env.pop('PIKPAK_CREDENTIALS', None)
+    env.pop('PIKPAK_PAT_PATH', None)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               stdin=subprocess.DEVNULL, text=True, encoding='utf-8',
+                               errors='replace', env=env,
+                               creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    proc_key = 'pikpak_' + str(uuid4())
+    _register_proc(proc_key, process)
+    deadline = time.monotonic() + 120
+    try:
+        while True:
+            if cancel_requested():
+                raise RuntimeError('Cancelled by user')
+            if time.monotonic() >= deadline:
+                raise RuntimeError('PikPak request timed out; retry the link')
+            try:
+                stdout, stderr = process.communicate(timeout=1)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        if cancel_requested():
+            raise RuntimeError('Cancelled by user')
+        if process.returncode:
+            raise _pikpak_failure(stdout, stderr, args)
+        if not json_output:
+            return stdout.strip()
+        try:
+            result = json.loads(stdout)
+        except (TypeError, ValueError):
+            raise RuntimeError('PikPak returned an unreadable response; retry the link') from None
+        if not isinstance(result, dict):
+            raise RuntimeError('PikPak returned an unsuccessful response; check your account permissions')
+        if result.get('error'):
+            raise _pikpak_failure(stdout, stderr, args)
+        return result
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+        _unregister_proc(proc_key)
+
+
+def _pikpak_id(value: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', value):
+        raise ValueError('Invalid PikPak file or folder ID')
+    return value
+
+
+def _pikpak_page_folder(page: str) -> str:
+    """Decode the public page's Nuxt breadcrumbs to resolve opaque share routes.
+
+    A share URL may end in a navigation token, not a drive folder ID. Use the
+    actual breadcrumb ID; never silently expand its much larger parent share.
+    """
+    match = re.search(r'<script\b[^>]*\bid=[\"\']__NUXT_DATA__[\"\'][^>]*>(.*?)</script>',
+                      page, re.S)
+    if not match:
+        raise ValueError('PikPak folder location is unavailable; use a direct folder ID')
+    try:
+        values = json.loads(match.group(1))
+        memo = {}
+
+        def expand(index):
+            if not isinstance(index, int) or index < 0:
+                return None
+            if index in memo:
+                return memo[index]
+            value = values[index]
+            if isinstance(value, dict):
+                memo[index] = result = {}
+                result.update({key: expand(ref) for key, ref in value.items()})
+            elif isinstance(value, list):
+                if value and value[0] in ('ShallowReactive', 'Reactive', 'Ref', 'ShallowRef'):
+                    memo[index] = result = expand(value[1])
+                else:
+                    memo[index] = result = []
+                    result.extend(expand(ref) for ref in value)
+            else:
+                memo[index] = result = value
+            return result
+
+        # Breadcrumb responses are the share records whose files have IDs and
+        # names, but no kind/size. Full share and folder listings include kind.
+        for index, value in enumerate(values):
+            if isinstance(value, dict) and 'share_status' in value and 'files' in value:
+                record = expand(index)
+                crumbs = record.get('files')
+                if (isinstance(crumbs, list) and crumbs and
+                        all(isinstance(item, dict) and item.get('id') and
+                            item.get('name') and 'kind' not in item for item in crumbs)):
+                    return _pikpak_id(crumbs[-1]['id'])
+    except (ValueError, TypeError, IndexError, KeyError, RecursionError):
+        pass
+    raise ValueError('Cannot identify this PikPak subfolder; use a direct folder ID')
+
+
+def _pikpak_location(url: str) -> Tuple[str, str, str, str]:
+    """Return (share ID, folder ID, own file ID, share password)."""
+    parsed = urlparse(url)
+    parts = [unquote(part) for part in parsed.path.split('/') if part]
+    params = parse_qs(parsed.query)
+    password = (params.get('pass_code') or params.get('password') or [''])[0]
+    if parsed.scheme == 'pikpak' and parsed.netloc in ('file', 'folder') and len(parts) == 1:
+        item = _pikpak_id(parts[0])
+        return ('', item, '', '') if parsed.netloc == 'folder' else ('', '', item, '')
+    if parsed.scheme not in ('https', 'http') or _url_host(url) not in ('mypikpak.com', 'www.mypikpak.com'):
+        raise ValueError('Use a PikPak share URL or pikpak://folder/ID or pikpak://file/ID')
+    if len(parts) >= 2 and parts[0] == 's':
+        share = _pikpak_id(parts[1])
+        parent = ''
+        if len(parts) > 2:
+            # Resolve both raw-ID and opaque navigation forms through the public
+            # page so the exact linked folder is selected, including nested paths.
+            with requests.get(url, timeout=REQUEST_TIMEOUT) as response:
+                response.raise_for_status()
+                parent = _pikpak_page_folder(response.text)
+        return share, parent, '', password
+    if parts[:2] == ['drive', 'all']:
+        parent = (params.get('parent_id') or [''])[0]
+        if len(parts) == 3:
+            parent = parts[2]
+        elif len(parts) > 3:
+            raise ValueError('Use pikpak://folder/ID for this PikPak folder')
+        return '', _pikpak_id(parent) if parent else '', '', ''
+    raise ValueError('Use a PikPak share link or pikpak://folder/ID or pikpak://file/ID')
+
+
+def _pikpak_size_bytes(value) -> int:
+    """Raw API sizes are bytes; the share CLI formats approximate KB/MB/GB."""
+    text = str(value or '').strip()
+    if text.isdigit():
+        return int(text)
+    match = re.fullmatch(r'([0-9]+(?:\.[0-9]+)?)\s*(B|[KMGT]I?B)', text, re.I)
+    if not match:
+        return 0
+    unit = match.group(2).upper().replace('I', '')
+    return int(float(match.group(1)) * 1024 ** {'B': 0, 'KB': 1, 'MB': 2, 'GB': 3, 'TB': 4}[unit])
+
+
+def _pikpak_files(parent: str, share: str = '', password: str = '') -> List[dict]:
+    """Fetch every page of one folder, guarding against repeating page tokens."""
+    files, seen_pages = [], set()
+    page = ''
+    while True:
+        if share:
+            args = ['share', 'get', _pikpak_id(share), '--limit', '100']
+            if password:
+                args.extend(['--password', password])
+            if parent:
+                args.extend(['--parent', _pikpak_id(parent)])
+        else:
+            args = ['ls', '--raw', '--limit', '100']
+            if parent:
+                args.extend(['--parent', _pikpak_id(parent)])
+        if page:
+            args.extend(['--token', page])
+        data = _pikpak_cli(args)
+        if str(data.get('status', '')).upper() in ('EXPIRED', 'DELETED', 'ERROR', 'FORBIDDEN'):
+            raise RuntimeError('PikPak share is unavailable or requires a share password')
+        entries = data.get('file_list') if share else data.get('files')
+        if share and not isinstance(entries, list):
+            entries = data.get('files')  # --parent returns files, the root returns file_list
+        if not isinstance(entries, list):
+            raise RuntimeError('PikPak did not return a file listing; check the share and permissions')
+        files.extend(entries)
+        page = data.get('next_page_token') or ''
+        if not page:
+            return files
+        if page in seen_pages:
+            raise RuntimeError('PikPak repeated a page token; retry folder resolution')
+        seen_pages.add(page)
+
+
+def resolve_pikpak(url: str) -> List[DownloadTask]:
+    """Browse shares/own folders without saving any files to the account yet."""
+    if not token_pikpak.value.strip():
+        raise RuntimeError('Enter a PikPak token in Settings or Colab Secrets (PIKPAK_TOKEN)')
+    share, parent, own_file, password = _pikpak_location(url)
+    tasks, seen = [], set()
+    if own_file:
+        roots = [_pikpak_cli(['get', own_file, '--raw'])]
+    else:
+        roots = _pikpak_files(parent, share, password)
+    pending = [(entry, '') for entry in reversed(roots)]
+    while pending:
+        if cancel_requested():
+            raise RuntimeError('Cancelled by user')
+        entry, context = pending.pop()
+        file_id = _pikpak_id(entry.get('id', ''))
+        if file_id in seen:
+            continue
+        seen.add(file_id)
+        name = entry.get('name') or file_id
+        raw_name = f'{context}/{name}' if context else name
+        if entry.get('kind') in ('folder', 'drive#folder') or entry.get('type') == 'folder':
+            children = _pikpak_files(file_id, share, password)
+            pending.extend((child, raw_name) for child in reversed(children))
+            continue
+        raw_size = entry.get('size') or 0
+        size = _pikpak_size_bytes(raw_size)
+        exact_size = size if str(raw_size).isdigit() else 0
+        filename = _tb_contextual_filename(raw_name)
+        tasks.append(DownloadTask(
+            url=url, original_url=url, filename=(f'{filename} ({size / (1024 * 1024):.1f} MB)'
+                                                if size else filename),
+            source='pikpak', link_type='pikpak',
+            pikpak_share_id=share or None, pikpak_file_id=file_id,
+            pikpak_saved_file_id=None if share else file_id,
+            pikpak_original_name=name, pikpak_size=exact_size,
+            selected_by_default=not _tb_file_in_extras_folder(raw_name)))
+    print(f'   ✅ PikPak: found {len(tasks)} file(s); ready for selected downloads')
+    return tasks
+
+
+def _pikpak_restored_file(root: str, task: DownloadTask) -> str:
+    """Find the restored file when the API returns a container folder ID."""
+    pending, seen, matches = [root], set(), []
+    while pending:
+        item = pending.pop()
+        if item in seen:
+            continue
+        seen.add(item)
+        info = _pikpak_cli(['get', _pikpak_id(item), '--raw'])
+        if info.get('kind') == 'drive#folder':
+            pending.extend(_pikpak_id(child.get('id', '')) for child in _pikpak_files(item))
+        elif (info.get('name') == task.pikpak_original_name and
+              (not task.pikpak_size or int(info.get('size') or 0) == task.pikpak_size)):
+            matches.append(item)
+    if len(matches) != 1:
+        raise RuntimeError('Cannot uniquely identify the saved PikPak file; use pikpak://file/ID')
+    return matches[0]
+
+
+def _pikpak_download_url(task: DownloadTask) -> str:
+    """Save only this selected file, then mint a fresh original-file URL."""
+    if not task.pikpak_saved_file_id and not task.pikpak_restore_root:
+        if not task.pikpak_share_id or not task.pikpak_file_id:
+            raise RuntimeError('PikPak task has no file reference; resolve the link again')
+        args = ['share', 'restore', _pikpak_id(task.pikpak_share_id),
+                '--file-ids', _pikpak_id(task.pikpak_file_id)]
+        password = (parse_qs(urlparse(task.original_url or task.url).query).get('pass_code') or
+                    parse_qs(urlparse(task.original_url or task.url).query).get('password') or [''])[0]
+        if password:
+            args.extend(['--password', password])
+        try:
+            restored = _pikpak_cli(args)
+        except RuntimeError as error:
+            if getattr(error, 'pikpak_code', '') != 'FILE_RESTORE_OWN':
+                raise
+            # A share created by this account refers to files already in its
+            # drive. Verify the source ID/name before using it directly, and
+            # retain that ID so link refreshes and resumed tasks skip restore.
+            task.pikpak_saved_file_id = _pikpak_restored_file(task.pikpak_file_id, task)
+            restored = None
+        if restored is not None:
+            if str(restored.get('restore_status', '')).lower() in ('error', 'failed'):
+                raise RuntimeError('PikPak could not save this file; check storage and token permissions')
+            root = restored.get('file_id')
+            if not root:
+                raise RuntimeError('PikPak returned no saved file ID; check the share and available storage')
+            # Remember the restore result immediately so retries/resume never save a
+            # second copy just because copying or link generation took too long.
+            task.pikpak_restore_root = _pikpak_id(root)
+            task.pikpak_restore_task_id = restored.get('restore_task_id') or None
+    if not task.pikpak_saved_file_id:
+        restore_id = task.pikpak_restore_task_id
+        if restore_id:
+            deadline = time.monotonic() + 120
+            while True:
+                result = _pikpak_cli(['task', 'get', _pikpak_id(restore_id)])
+                status = str(result.get('status', result.get('phase', ''))).lower()
+                if status in ('complete', 'phase_type_complete'):
+                    break
+                if status in ('error', 'failed', 'phase_type_error'):
+                    raise RuntimeError('PikPak share save failed; check your account')
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('PikPak is still saving this file; use Retry Failed shortly')
+                if cancel_requested():
+                    raise RuntimeError('Cancelled by user')
+                time.sleep(1)
+        task.pikpak_saved_file_id = _pikpak_restored_file(task.pikpak_restore_root, task)
+    link = _pikpak_cli(['download', _pikpak_id(task.pikpak_saved_file_id), '--url-only'],
+                       json_output=False)
+    return _pikpak_validate_download_url(link)
+
 # --- PARALLEL DOWNLOAD WORKER ---
 def download_worker(task: DownloadTask, gofile_token: str, move_queue: Optional[queue.Queue] = None,
                     tb_key: str = "") -> DownloadTask:
@@ -7391,6 +8024,13 @@ def download_worker(task: DownloadTask, gofile_token: str, move_queue: Optional[
     try:
         download_url = task.url
         url_refresh = _tb_url_refresher(task, tb_key)
+        if task.link_type == 'pikpak':
+            if check_duplicate_in_drive(_strip_size_suffix(task.filename)):
+                task.status = 'skipped'
+                return task
+            download_url = _pikpak_download_url(task)
+            url_refresh = lambda: _pikpak_download_url(task)
+            task.filename = _strip_size_suffix(task.filename)
         if task.link_type == 'tb_magnet_file':
             # Resolve only when this worker has a real download slot. A 153-file
             # torrent with three workers therefore holds at most three newly-minted
@@ -7434,7 +8074,7 @@ def download_worker(task: DownloadTask, gofile_token: str, move_queue: Optional[
             if download_stats.get(task.id, {}).get('disk_gave_up'):
                 task.error = "Local disk full — Drive moves couldn't free space in time"
             else:
-                task.error = "Download returned None"
+                task.error = download_stats.get(task.id, {}).get('error') or 'Download did not complete'
     except KeyboardInterrupt:
         if not cancel_requested():
             raise
@@ -7442,7 +8082,10 @@ def download_worker(task: DownloadTask, gofile_token: str, move_queue: Optional[
         task.error = "Cancelled by user"
     except Exception as e:
         task.status = "failed"
-        task.error = str(e)[:100]
+        task.error = str(e)[:600] if task.link_type == 'pikpak' else str(e)[:100]
+    if task.status == 'failed':
+        with print_lock:
+            print(f"   ❌ {task.filename[:60]}: {task.error or 'Download failed'}")
     return task
 
 def _drive_mover(move_queue: queue.Queue, save_progress):
@@ -7484,7 +8127,7 @@ def _drive_mover(move_queue: queue.Queue, save_progress):
         save_progress()
 
 # --- URL CLASSIFICATION ---
-STREAMING_HOSTS = ('youtube.com', 'youtu.be', 'vimeo.com', 'twitch.tv', 'ok.ru')
+STREAMING_HOSTS = ('youtube.com', 'youtu.be', 'vimeo.com', 'twitch.tv', 'ok.ru', 'odnoklassniki.ru')
 
 def _url_host(url: str) -> str:
     """Return the lowercased hostname of a URL ('' if unparseable)."""
@@ -7503,6 +8146,8 @@ def url_matches_host(url: str, hosts) -> bool:
 
 def _classify_url(url: str, has_debrid: bool) -> str:
     """Map a URL to a resolver kind (mirrors the historical routing order)."""
+    if url.startswith('pikpak://') or _url_host(url) in ('mypikpak.com', 'www.mypikpak.com'):
+        return 'pikpak'
     if url_matches_host(url, ('transfer.it',)):
         return 'transfer'
     if url_matches_host(url, ('mega.nz',)):
@@ -7663,6 +8308,8 @@ def resolve_all_links(urls: List[str], session: requests.Session, tokens: dict, 
                         url=u, filename=n, source="rd", link_type="rd",
                         original_url=url  # Store original for re-resolve
                     ))
+            elif kind == 'pikpak':
+                parallel_tasks.extend(resolve_pikpak(url))
             elif kind == 'fshare':
                 # FShare file or folder links - resolve with VIP account
                 fshare_email = token_fshare_email.value.strip()
@@ -7784,7 +8431,9 @@ def update_progress_display(tasks: List[DownloadTask]):
     finished_ids = {t.id for t in tasks if t.status in ('done', 'skipped', 'failed')}
     
     # Create bars for newly-active tasks
-    for t in active:
+    for t in tasks:
+        if t.status not in ('downloading', 'moving'):
+            continue
         if t.id not in _per_task_bars:
             name = t.filename[:40] if t.filename else t.url[:40]
             if hasattr(_per_task_accordion, 'set_bars'):
@@ -7813,6 +8462,13 @@ def update_progress_display(tasks: List[DownloadTask]):
             if stats.get('disk_wait'):
                 bar.bar_style = 'info'
                 bar.description = f"⏸️ {name}  {int(pct)}% (low disk)"
+            elif stats.get('retry_reason'):
+                bar.bar_style = 'info'
+                remaining = max(0, int(stats.get('retry_until', 0) - now + 0.999))
+                bar.description = f"⏳ {name}  {int(pct)}% ({stats['retry_reason']}, retry in {remaining}s)"
+            elif stats.get('stage'):
+                bar.bar_style = 'info'
+                bar.description = f"{name}  {int(pct)}% ({stats['stage']})"
             else:
                 bar.bar_style = 'warning'
                 task_speed = f"{speed:.1f} MB/s" if speed > 0 else "starting..."
@@ -8093,22 +8749,40 @@ def _run_download_pipeline(
         if not use_playlist_range and playlist_selection.value.strip():
             print("   ℹ️ Multiple playlist URLs detected - playlist range ignored (downloading all videos)")
         
-        for i, url in enumerate(youtube_urls, 1):
-            if _cancel_requested:
-                print("   🛑 Stopped — remaining YouTube links left pending for resume")
-                break
-            print(f"   [{i}/{len(youtube_urls)}] {url[:60]}...")
-            s, f, total = process_youtube_link(url, mode, apply_playlist_range=use_playlist_range)
-            yt_success += s
-            yt_fail += f
-            yt_success_cumulative += s
-            yt_fail_cumulative += f
-            
-            for task in all_tasks:
-                if task.url == url and task.link_type == 'youtube':
-                    task.status = "done" if f == 0 else "failed"
+        # The parallel monitor stops before this phase. Keep the standard widgets
+        # updating while YouTube downloads, processes, and moves files to Drive.
+        stop_monitor = False
+        if batch_start_time is None:
+            batch_start_time = time.time()
+        monitor_thread = threading.Thread(target=progress_monitor, args=(all_tasks,), daemon=True)
+        monitor_thread.start()
+        try:
+            for i, url in enumerate(youtube_urls, 1):
+                if _cancel_requested:
+                    print("   🛑 Stopped — remaining YouTube links left pending for resume")
                     break
-            save_progress()
+                print(f"   [{i}/{len(youtube_urls)}] {url[:60]}...")
+                youtube_task = next((t for t in all_tasks if t.url == url and t.link_type == 'youtube'
+                                     and t.status in ('pending', 'failed', 'downloading')), None)
+                if youtube_task is not None:
+                    youtube_task.status = 'downloading'
+                    youtube_task.error = None
+                s, f, total = process_youtube_link(url, mode, apply_playlist_range=use_playlist_range,
+                                                 task=youtube_task)
+                yt_success += s
+                yt_fail += f
+                yt_success_cumulative += s
+                yt_fail_cumulative += f
+
+                if youtube_task is not None:
+                    youtube_task.status = 'failed' if f or _cancel_requested else 'done'
+                    if _cancel_requested:
+                        youtube_task.error = 'Cancelled by user'
+                update_progress_display(all_tasks)
+                save_progress()
+        finally:
+            stop_monitor = True
+            monitor_thread.join(timeout=2)
         
         if yt_fail > 0:
             print(f"   📊 YouTube: {yt_success_cumulative} succeeded, {yt_fail_cumulative} failed")
@@ -8181,6 +8855,28 @@ def _run_download_pipeline(
     return total_success, total_failed
 
 
+def _run_live_waves(live_manager: Optional[LiveBatchManager], mode: str,
+                    gofile_token: str, rd_key: str, tb_key: str, max_workers: int,
+                    counts: Tuple[int, int]) -> Tuple[int, int]:
+    """Drain additions arriving after the parallel pool closes, on every start path."""
+    while live_manager is not None and not cancel_requested():
+        wave = live_manager.next_wave_or_finish()
+        if wave is None:
+            break
+        counts = _run_download_pipeline(
+            all_tasks=live_manager.all_tasks,
+            parallel_tasks=[t for t in wave if t.link_type not in SEQUENTIAL_LINK_TYPES],
+            youtube_urls=[t.url for t in wave if t.link_type == 'youtube'],
+            mega_urls=[t.url for t in wave if t.link_type == 'mega'],
+            debrid_urls=[t.url for t in wave if t.link_type == 'magnet'],
+            mode=mode, gofile_token=gofile_token,
+            rd_key=rd_key or token_rd.value.strip(), max_workers=max_workers,
+            magnet_file_tasks=[t for t in wave if t.link_type == 'magnet_file'],
+            tb_magnet_file_tasks=[t for t in wave if t.link_type == 'tb_magnet_file'],
+            tb_key=tb_key or token_tb.value.strip(), live_manager=live_manager)
+    return counts
+
+
 # --- AUTO RETRY ---
 # Optional "Auto Retry" field: when set to N, a batch that ends with failures
 # automatically re-runs the 🔁 Retry Failed path until nothing is left failed or
@@ -8200,7 +8896,7 @@ def _arm_auto_retry():
         n = 0  # empty or non-numeric = feature off
     _auto_retry_state.update(remaining=n, total=n, pending=False)
 
-def _run_auto_retry_chain(mode: str):
+def _run_auto_retry_chain(mode: str, live_manager: Optional[LiveBatchManager] = None):
     """Fire a queued auto retry — equivalent to clicking 🔁 Retry Failed. The grace
     pause gives the kernel interrupt a window to cancel the chain between passes."""
     if not _auto_retry_state['pending']:
@@ -8224,7 +8920,7 @@ def _run_auto_retry_chain(mode: str):
         _auto_retry_state['remaining'] = 0
         print("\n🛑 Auto Retry cancelled — session kept for manual retry.")
         return
-    execute_batch(mode, resume=True, auto_retry_chain=True)
+    execute_batch(mode, resume=True, auto_retry_chain=True, live_manager=live_manager)
 
 
 def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str,
@@ -8354,42 +9050,23 @@ def execute_selected_tasks(selected_tasks: List[DownloadTask], mode: str,
             live_manager=live_manager
         )
 
-        # Files added after the parallel pool closed (including sequential links)
-        # form another wave. The manager closes atomically with the last empty check.
-        while live_manager is not None and not cancel_requested():
-            wave = live_manager.next_wave_or_finish()
-            if wave is None:
-                break
-            wave_parallel = [t for t in wave if t.link_type not in SEQUENTIAL_LINK_TYPES]
-            total_success, total_failed = _run_download_pipeline(
-                all_tasks=all_tasks,
-                parallel_tasks=wave_parallel,
-                youtube_urls=[t.url for t in wave if t.link_type == 'youtube'],
-                mega_urls=[t.url for t in wave if t.link_type == 'mega'],
-                debrid_urls=[t.url for t in wave if t.link_type == 'magnet'],
-                mode=mode,
-                gofile_token=gofile_token,
-                rd_key=rd_key or token_rd.value.strip(),
-                max_workers=max_workers,
-                magnet_file_tasks=[t for t in wave if t.link_type == 'magnet_file'],
-                tb_magnet_file_tasks=[t for t in wave if t.link_type == 'tb_magnet_file'],
-                tb_key=tb_key or token_tb.value.strip(),
-                live_manager=live_manager
-            )
+        total_success, total_failed = _run_live_waves(
+            live_manager, mode, gofile_token, rd_key, tb_key, max_workers,
+            (total_success, total_failed))
         
         # Handle results
         unfinished = any(t.status in ('pending', 'downloading', 'moving') for t in all_tasks)
         if total_failed > 0 or unfinished or cancel_requested():
-            failed_files = [t.filename for t in all_tasks if t.status == 'failed']
+            failed_tasks = [t for t in all_tasks if t.status == 'failed']
             if cancel_requested():
                 print(f"\n🛑 Batch stopped by user — {total_success} completed, {total_failed} cancelled/failed.")
                 _auto_retry_state['remaining'] = 0  # user stopped — don't auto-retry
             else:
-                print(f"\n⚠️ Completed with {total_success} success, {total_failed} failed after 3 attempts:")
-                for f in failed_files[:5]:
-                    print(f"   ❌ {f[:60]}")
-                if len(failed_files) > 5:
-                    print(f"   ... and {len(failed_files) - 5} more")
+                print(f"\n⚠️ Completed with {total_success} success, {total_failed} failed:")
+                for task in failed_tasks[:5]:
+                    print(f"   ❌ {task.filename[:60]}: {task.error or 'Download failed'}")
+                if len(failed_tasks) > 5:
+                    print(f"   ... and {len(failed_tasks) - 5} more")
 
             save_session(all_tasks,
                         playlist_range=playlist_selection.value.strip(),
@@ -8453,8 +9130,8 @@ def _resolve_queue_links(urls: List[str]) -> List[DownloadTask]:
                   any(url_matches_host(u, ('archive.org',)) and '/details/' in u for u in urls)
     needs_mega = any(url_matches_host(u, ('mega.nz', 'transfer.it')) for u in urls)
     needs_aria = not (needs_ytdlp and not needs_mega) or any(
-        url_matches_host(u, ('gofile.io', 'pixeldrain.com', 'real-debrid.com', 'mega.nz', 'fshare.vn'))
-        or u.startswith('magnet:') for u in urls)
+        url_matches_host(u, ('gofile.io', 'pixeldrain.com', 'real-debrid.com', 'mega.nz', 'fshare.vn', 'mypikpak.com'))
+        or u.startswith(('magnet:', 'pikpak://')) for u in urls)
 
     if _running_live_batch():
         setup_environment(needs_mega, needs_ytdlp, needs_aria, during_active=True)
@@ -8487,8 +9164,24 @@ def _resolve_queue_links(urls: List[str]) -> List[DownloadTask]:
     return all_tasks
 
 
-def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False, auto_retry_chain: bool = False):
+def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False,
+                  auto_retry_chain: bool = False, *, live_manager: Optional[LiveBatchManager] = None,
+                  session_data: Optional[Dict[str, Any]] = None):
     global yt_success_cumulative, yt_fail_cumulative  # Must be at function start
+
+    # Resume/Retry callbacks must return to Colab, just like reviewed queues.
+    # Keep the saved completed tasks in the manager for counts and deduplication.
+    if resume and live_manager is None and not auto_retry_chain:
+        if _live_batch is not None:
+            print('⏳ The current download is still running or finishing. Use Stop Download first.')
+            return
+        saved = session_data if session_data is not None else load_session()
+        if not saved:
+            print('❌ No session to resume!')
+            return
+        tasks = [task_from_dict(t) for t in saved.get('tasks', [])]
+        _launch_live_batch(tasks, mode, resume=True, session_data=saved)
+        return
 
     if _live_batch is not None and cancel_requested():
         print('🛑 Download stopped. The session is available for Resume.')
@@ -8516,7 +9209,7 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False, aut
         
         # Load from session or parse new URLs
         if resume:
-            session_data = load_session()
+            session_data = session_data if session_data is not None else load_session()
             if not session_data:
                 print("❌ No session to resume!")
                 return
@@ -8541,12 +9234,17 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False, aut
             # Only restore success count - reset fail count so previous 403s don't persist
             yt_success_cumulative = session_data.get('yt_success', 0)
             yt_fail_cumulative = 0  # Reset failures - only count failures in current run
-            all_tasks = [task_from_dict(t) for t in session_data.get('tasks', [])]
+            all_tasks = (live_manager.all_tasks if live_manager is not None else
+                         [task_from_dict(t) for t in session_data.get('tasks', [])])
+            if live_manager is not None:
+                live_manager.restart()
             
             # Filter to unfinished tasks (downloading/moving = was active when the runtime
             # crashed or was interrupted; retrying a 'moving' task is cheap — the duplicate
             # check finds the already-moved Drive copy, or the local file skips the download)
             pending_tasks = [t for t in all_tasks if t.status in ['pending', 'failed', 'downloading', 'moving']]
+            for task in pending_tasks:
+                task.status, task.error = 'pending', None
             print(f"📂 Resuming {len(pending_tasks)} of {len(all_tasks)} tasks...")
 
             # Fresh runtime — re-run TMDB matching, then reapply saved manual corrections
@@ -8650,10 +9348,16 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False, aut
         total_sequential = len(youtube_urls) + len(mega_urls) + len(debrid_urls) + len(magnet_file_tasks) + len(tb_magnet_file_tasks)
         print(f"📊 Tasks: {total_parallel} parallel + {total_sequential} sequential\n")
 
-        # Run shared download pipeline
+        # Run shared download pipeline with the same manager as the live toolbar.
         if _live_batch is not None and cancel_requested():
+            save_session(all_tasks, playlist_range=playlist_selection.value.strip(),
+                         yt_success=yt_success_cumulative, yt_fail=yt_fail_cumulative,
+                         subtitle_langs_value=subtitle_langs.value)
+            _auto_retry_state['remaining'] = 0
             print('🛑 Download stopped before the retry began. The session is available for Resume.')
             return
+        if live_manager is not None:
+            _set_live_controls()
         total_success, total_failed = _run_download_pipeline(
             all_tasks=all_tasks,
             parallel_tasks=parallel_tasks,
@@ -8666,8 +9370,12 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False, aut
             max_workers=max_workers,
             magnet_file_tasks=magnet_file_tasks,
             tb_magnet_file_tasks=tb_magnet_file_tasks,
-            tb_key=tb_key
+            tb_key=tb_key,
+            live_manager=live_manager
         )
+        total_success, total_failed = _run_live_waves(
+            live_manager, mode, gofile_token, rd_key, tb_key, max_workers,
+            (total_success, total_failed))
         
         # Handle results
         unfinished = any(t.status in ('pending', 'downloading', 'moving') for t in all_tasks)
@@ -8703,6 +9411,11 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False, aut
         btn_retry.layout.display = 'inline-block'
     except Exception as e:
         print(f"\n❌ Critical Error: {e}")
+        if live_manager is not None:
+            save_session(live_manager.all_tasks, playlist_range=playlist_selection.value.strip(),
+                         yt_success=yt_success_cumulative, yt_fail=yt_fail_cumulative,
+                         subtitle_langs_value=subtitle_langs.value)
+            btn_retry.layout.display = 'inline-block'
     finally:
         stop_keep_alive()
         stop_hint.layout.display = 'none'
@@ -8718,7 +9431,8 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False, aut
 
     # Auto Retry fires outside try/finally so keep-alive, cancel state, and buttons
     # are fully reset before the next pass (mirrors clicking 🔁 Retry Failed).
-    _run_auto_retry_chain(mode)
+    if live_manager is None:
+        _run_auto_retry_chain(mode)
 
 
 
@@ -8786,7 +9500,7 @@ btn_extract_library.on_click(run_library_extract)
 
 # --- INITIAL SETUP ---
 def early_mount_drive():
-    """Mount Drive on script load to enable session resume detection."""
+    """Mount Drive and restore preferences before settings can be edited."""
     drive_path = f"{COLAB_ROOT}drive"
     if drive is not None and not os.path.exists(drive_path):
         try:
@@ -8794,6 +9508,10 @@ def early_mount_drive():
             drive.mount(drive_path)
         except Exception as e:
             print(f"⚠️ Could not mount Drive: {e}")
+    # The initial settings read ran before the mount. Restore now: otherwise an
+    # unrelated edit can save defaults (including drive_api=False) over the user's
+    # saved choices before setup_environment gets its later chance to read them.
+    load_dir_settings()
     check_resume_available()
 
 # Display UI first (so it shows even if mount hangs), then mount drive
