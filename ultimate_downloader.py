@@ -11,16 +11,18 @@ import builtins
 import html
 import hashlib
 import platform
+from contextlib import nullcontext
+from html.parser import HTMLParser
 from collections import deque
 from typing import Optional, Tuple, List, Dict, Any, Callable
 from dataclasses import dataclass, field, fields, asdict
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
-from threading import Lock, RLock, local, Thread, current_thread, main_thread
+from threading import Lock, RLock, BoundedSemaphore, local, Thread, current_thread, main_thread
 from uuid import uuid4
 import ipywidgets as widgets
 from IPython.display import display, clear_output, HTML, JSON
-from urllib.parse import urlparse, unquote, parse_qs
+from urllib.parse import urlparse, urljoin, unquote, parse_qs, quote
 try:
     from google.colab import drive
 except ImportError:
@@ -64,6 +66,9 @@ def check_and_load_secrets():
         (token_tmdb, 'TMDB_API_KEY'),
         (token_fshare_email, 'FSHARE_EMAIL'),
         (token_fshare_password, 'FSHARE_PASSWORD'),
+        (token_chauthanh_session, 'CHAUTHANH_PHPSESSID'),
+        (token_chauthanh_username, 'CHAUTHANH_USERNAME'),
+        (token_chauthanh_password, 'CHAUTHANH_PASSWORD'),
     ]
     global _loading_settings
     _loading_settings = True  # secret writes are programmatic, not user edits
@@ -158,6 +163,7 @@ class DownloadTask:
     pikpak_size: int = 0
     pikpak_restore_root: Optional[str] = None
     pikpak_restore_task_id: Optional[str] = None
+    chauthanh_size: int = 0  # Verified donor-file size; retained for Retry/Resume
 
 _TASK_FIELDS = {f.name for f in fields(DownloadTask)}
 
@@ -458,19 +464,21 @@ tmdb_enabled_checkbox = widgets.Checkbox(value=True, description='TMDB matching'
 token_rd = widgets.Text(description='RD Token:', placeholder='Real-Debrid API Key', value=get_colab_secret('RD_TOKEN'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
 token_tb = widgets.Text(description='TB Token:', placeholder='TorBox API Key', value=get_colab_secret('TB_TOKEN'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
 token_pikpak = widgets.Password(description='PikPak:', placeholder='Personal Access Token', value=get_colab_secret('PIKPAK_TOKEN'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
-# Debrid sits second in its row, after the 280px auto-organise checkbox — the same slot
-# the 280px Name field occupies in the row below. Same 50px label width as Year:, so the
-# dropdown and the Year box line up without margin tweaks.
-debrid_service_toggle = widgets.Dropdown(
-    options=['None', 'Real-Debrid', 'TorBox'],
-    value='None',
-    description='Debrid:',
-    tooltip='Select debrid service for premium links & magnets',
-    style={'description_width': '75px'},  # matches Auto Retry so both label+field pairs align
-    layout=widgets.Layout(width='215px')
-)
 token_fshare_email = widgets.Text(description='FShare:', placeholder='Email', value=get_colab_secret('FSHARE_EMAIL'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
 token_fshare_password = widgets.Password(description='Password:', placeholder='FShare Password', value=get_colab_secret('FSHARE_PASSWORD'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
+token_chauthanh_session = widgets.Password(description='PC session:', placeholder='PHPSESSID from your active PC login', value=get_colab_secret('CHAUTHANH_PHPSESSID'), style={'description_width': '130px'}, layout=widgets.Layout(width='450px'))
+btn_chauthanh_session = widgets.Button(description='Use PC login', button_style='success', layout=widgets.Layout(width='145px'))
+token_chauthanh_username = widgets.Text(description='Châu Thành:', placeholder='Username', value=get_colab_secret('CHAUTHANH_USERNAME'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
+token_chauthanh_password = widgets.Password(description='Password:', placeholder='Châu Thành password', value=get_colab_secret('CHAUTHANH_PASSWORD'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
+btn_chauthanh_login = widgets.Button(description='Log in / Check account', layout=widgets.Layout(width='190px'))
+btn_chauthanh_browser = widgets.Button(description='Open browser login', layout=widgets.Layout(width='180px'))
+chauthanh_login_status = widgets.HTML('')
+chauthanh_browser_box = widgets.VBox([])
+chauthanh_other_login = widgets.Accordion(children=[widgets.VBox([
+    widgets.HBox([token_chauthanh_username, token_chauthanh_password], layout=widgets.Layout(flex_flow='row wrap')),
+    widgets.HBox([btn_chauthanh_login, btn_chauthanh_browser]),
+])], selected_index=None)
+chauthanh_other_login.set_title(0, 'Other login options')
 # Season match (default): bare episode numbers on TMDB-matched shows are converted to
 # SxxEyy via per-season counts (e.g. "One Piece - 1085" → S19E..). Absolute: keep the
 # number as-is (S01E1085) for libraries scanned with absolute ordering. Only affects
@@ -480,7 +488,7 @@ episode_numbering_toggle = widgets.Dropdown(
     options=['Season match', 'Absolute'],
     value='Season match',
     description='Episode numbering:',
-    tooltip='Season match: convert absolute episode numbers to SxxEyy using TMDB season data. Absolute: keep the absolute number as-is (e.g. S01E1085). Applies only to TMDB-matched shows with no season marker in the filename.',
+    tooltip='Season match: convert absolute episode numbers to SxxEyy using the chosen TMDB episode order (standard aired order by default). Choose alternate orders with Load episode orders in the queue. Absolute: keep the number as-is (e.g. S01E1085). Applies only to TMDB-matched shows with no season marker in the filename.',
     style={'description_width': '130px'},  # matches the settings key-field label column
     layout=widgets.Layout(width='270px')
 )
@@ -836,6 +844,12 @@ settings_ui = widgets.VBox([
     tmdb_numbering_row,
     widgets.HTML("<div style='margin-top:10px'><small><b>🇻🇳 FShare Account:</b></small></div>"),
     fshare_keys_row,
+    widgets.HTML("<div style='margin-top:10px'><small><b>Châu Thành donor account:</b></small></div>"),
+    widgets.HBox([token_chauthanh_session, btn_chauthanh_session], layout=widgets.Layout(flex_flow='row wrap')),
+    widgets.HTML('<small>Paste PHPSESSID from your signed-in PC browser, or use Colab Secret CHAUTHANH_PHPSESSID, then click Use PC login. Find it in browser developer tools → Application (Chrome/Edge) or Storage (Firefox/Mullvad) → Cookies → chauthanh.info → PHPSESSID → Value. This route installs no browser in Colab. The session stays in runtime memory and is excluded from saved settings. If it expires, copy the current value again. Signing in elsewhere can end the session.</small>'),
+    chauthanh_other_login,
+    chauthanh_login_status,
+    chauthanh_browser_box,
     widgets.HTML("<div style='margin-top:10px'><small><b>☁️ PikPak Account:</b></small></div>"),
     widgets.HBox([token_pikpak]),
     widgets.HTML("<small>Use a token with Read files and Manage files permissions. Selected shared files are saved to your PikPak before downloading. <a href='https://mypikpak.com/en-US/help-center/connected_apps/personal_access_tokens/create_personal_access_token' target='_blank'>Create a token</a></small>"),
@@ -867,7 +881,7 @@ about_ui = widgets.VBox([
     widgets.HTML("""
         <div style='padding: 10px;'>
             <h3>ℹ️ About Ultimate Downloader</h3>
-            <p><strong>Version:</strong> 7.1</p>
+            <p><strong>Version:</strong> 7.2</p>
             <p><strong>Author:</strong> xersbtt</p>
             <p><strong>Repository:</strong> <a href='https://github.com/xersbtt/ultimate-downloader-colab' target='_blank'>github.com/xersbtt/ultimate-downloader-colab</a></p>
             <hr>
@@ -1507,7 +1521,17 @@ name_group = widgets.HBox([
     widgets.HTML("<small><b>&nbsp;&nbsp;✏️ Force Name:</b></small>"),
     queue_name_input, queue_year_input, btn_name_apply, btn_name_clear
 ])
-identity_row = widgets.HBox([tmdb_group, name_group], layout=widgets.Layout(flex_flow='row wrap', display='none'))
+tmdb_episode_order = widgets.Dropdown(
+    options=[('Original Air Date (standard)', '')], value='', description='Episode order:',
+    style={'description_width': '115px'}, layout=widgets.Layout(width='650px'),
+    tooltip='Select one TMDB-matched show in the queue, load its orders, then apply an order to selected files. Used for absolute episode numbers with Season match.')
+btn_episode_orders = widgets.Button(description='Load episode orders', icon='list', layout=widgets.Layout(width='170px'))
+btn_episode_order_apply = widgets.Button(description='Apply Order', button_style='info', layout=widgets.Layout(width='120px'))
+identity_row = widgets.VBox([
+    widgets.HBox([tmdb_group, name_group], layout=widgets.Layout(flex_flow='row wrap')),
+    widgets.HBox([tmdb_episode_order, btn_episode_orders, btn_episode_order_apply],
+                 layout=widgets.Layout(flex_flow='row wrap')),
+], layout=widgets.Layout(display='none'))
 
 # Manual routing: send the selected rows to a specific library folder — so one batch
 # can mix anime and live-action, series and movies ('Downloads (as-is)' skips
@@ -1578,7 +1602,7 @@ queue_ui = widgets.VBox([
 
 
 input_ui = widgets.VBox([
-    widgets.HTML("<h3>🚀 Ultimate Downloader v7.1</h3>"),
+    widgets.HTML("<h3>🚀 Ultimate Downloader v7.2</h3>"),
     widgets.HBox([auto_organize_checkbox, debrid_service_toggle]),
     widgets.HBox([concurrent_slider, auto_retry_input]),
     links_row,
@@ -1638,7 +1662,7 @@ def save_session(
     try:
         with _session_save_lock:
             session = {
-                "version": "7.1",
+                "version": "7.2",
                 "started_at": datetime.now().isoformat(),
                 "playlist_range": playlist_range,
                 "yt_success": yt_success,
@@ -2207,6 +2231,8 @@ def _queue_dest_preview(task) -> Optional[str]:
         # Full Drive-relative path: with per-row routing the library folder is
         # the part being controlled, so it belongs in the preview
         return os.path.relpath(dest, DRIVE_BASE).replace(os.sep, '/')
+    except ValueError as exc:
+        return f'Review needed: {exc}'
     except Exception:
         return None  # a preview glitch must never break the queue display
 
@@ -2225,7 +2251,7 @@ def update_queue_display(preserve_selection: bool = True):
         source_icon = {"gofile": "📁", "pixeldrain": "💾", "rd": "⚡", "tb": "📦", "tb_host": "📦", "direct": "🔗", 
                        "youtube": "▶️", "mega": "☁️", "mediafire": "🔥", "1fichier": "📦",
                        "magnet": "🧲", "magnet_file": "🧲", "tb_magnet_file": "🧲", "archive": "📚",
-                       "fshare": "🇻🇳", "okru": "🟠", "pikpak": "☁️"}.get(task.link_type, "📄")
+                       "fshare": "🇻🇳", "okru": "🟠", "pikpak": "☁️", "chauthanh": "📺"}.get(task.link_type, "📄")
         filename = _strip_size_suffix(task.filename) if task.filename else task.url
         name = filename
         overrides = []
@@ -2263,6 +2289,8 @@ def update_queue_display(preserve_selection: bool = True):
             overrides.append('No TMDB')
         elif ov:
             overrides.append('Match')
+        if m and m.get('episode_group'):
+            overrides.append(m['episode_group']['name'])
         if getattr(task, 'name_override', None):
             overrides.append('Name')
         if getattr(task, 'route_override', None):
@@ -3147,6 +3175,8 @@ _tmdb_match_cache: Dict[str, dict] = {}  # stripped filename -> match dict (per 
 _tmdb_query_cache: Dict[str, Optional[dict]] = {}  # "kind|query|year" -> match/None (persistent)
 _tmdb_details_cache: Dict[Tuple[str, str], dict] = {}  # (kind, id) -> full details (per runtime)
 _tmdb_query_cache_loaded = False
+_tmdb_episode_order_cache = {}  # successful group responses only; failures can retry
+_episode_order_show_id = None  # show whose choices are currently loaded in the UI
 
 def tmdb_is_enabled() -> bool:
     """TMDB matching is active when the checkbox is on and a key is configured."""
@@ -3493,8 +3523,17 @@ def _apply_tmdb_overrides(tasks: List[DownloadTask]):
                     if ref not in upgraded:
                         upgraded[ref] = _tmdb_fetch_by_id(*ref)
                     if upgraded[ref]:
-                        ov = upgraded[ref]
+                        refreshed = upgraded[ref]
+                        if ov.get('episode_group'):
+                            refreshed = dict(refreshed, episode_group=ov['episode_group'])
+                        ov = refreshed
                         t.tmdb_override = ov
+            group = ov.get('episode_group') if isinstance(ov, dict) else None
+            if group and 'aired_episode_numbers' not in group:
+                tables = episode_position_tables(ov.get('seasons') or {}, [group],
+                    lambda season: _tmdb_episode_order_get(f"/tv/{ov['id']}/season/{season}"))
+                ov = dict(ov, episode_group=dict(group, aired_episode_numbers=tables))
+                t.tmdb_override = ov
             _tmdb_match_cache[key] = ov
 
 def _selected_queue_indices() -> List[int]:
@@ -3969,6 +4008,192 @@ def apply_queue_changes(b=None):
     print(f'✅ Applied changes to {len(rows)} item(s) — selection kept')
 
 
+def episode_order_options(groups: list[dict]) -> list[tuple[str, str]]:
+    types = {1: 'Original Air Date', 2: 'Absolute', 3: 'DVD', 4: 'Digital',
+             5: 'Story Arc', 6: 'Production', 7: 'TV'}
+    return [('Original Air Date (standard)', '')] + [
+        (f"{group['name']} ({types.get(group.get('type'), 'Other')}) — "
+         f"{group.get('group_count', '?')} groups, {group.get('episode_count', '?')} episodes", group['id'])
+        for group in groups if group.get('id') and group.get('name')
+    ]
+
+
+def build_episode_group(data: dict) -> dict:
+    """Keep TMDB's group season and episode positions, keyed by aired identity.
+
+    Group order is the season number (0 is Specials); episode order is zero
+    based. The episode's own season_number/episode_number remain its aired ID.
+    String keys and list values also survive the downloader's session JSON.
+    """
+    mapping, reverse = {}, {}
+    for group in data.get('groups') or []:
+        season = group.get('order')
+        if type(season) is not int or season < 0:
+            raise ValueError('TMDB episode order has an invalid season position')
+        for episode in group.get('episodes') or []:
+            aired_season, aired_episode = episode.get('season_number'), episode.get('episode_number')
+            position = episode.get('order')
+            if (type(aired_season) is not int or aired_season < 0 or
+                    type(aired_episode) is not int or aired_episode < 1 or
+                    type(position) is not int or position < 0):
+                raise ValueError('TMDB episode order has an invalid episode position')
+            source, target = f'{aired_season}:{aired_episode}', f'{season}:{position + 1}'
+            if source in mapping or target in reverse:
+                raise ValueError('TMDB episode order contains duplicate episode positions')
+            mapping[source] = [season, position + 1]
+            reverse[target] = [aired_season, aired_episode]
+    if not mapping:
+        raise ValueError('TMDB episode order contains no episodes')
+    return {'id': data['id'], 'name': data.get('name') or data['id'],
+            'mapping': mapping, 'reverse': reverse}
+
+
+def map_episode_order(episode: int, seasons: dict, group: dict) -> tuple[int, int]:
+    """Map an aired absolute number by identity; omitted episodes are not shifted."""
+    counts = {int(key): count for key, count in seasons.items() if int(key) > 0}
+    remaining = episode
+    if episode < 1:
+        raise ValueError('Absolute episodes must start at 1')
+    for season in range(1, max(counts, default=0) + 1):
+        if season not in counts:
+            raise ValueError('TMDB season counts have a gap')
+        if remaining <= counts[season]:
+            numbers = (group.get('aired_episode_numbers') or {}).get(str(season))
+            aired_number = numbers[remaining - 1] if numbers else remaining
+            target = group['mapping'].get(f'{season}:{aired_number}')
+            if target is None:
+                raise ValueError(f"Episode {episode} is absent from the selected order ({group['name']})")
+            return tuple(target)
+        remaining -= counts[season]
+    raise ValueError('Absolute episode exceeds the known TMDB season counts')
+
+
+def map_episode_order_range(episode: int, end: Optional[int], seasons: dict,
+                            group: dict) -> tuple[int, int, Optional[int]]:
+    season, number = map_episode_order(episode, seasons, group)
+    if end is None:
+        return season, number, None
+    if end < episode:
+        raise ValueError('Episode range end precedes its start')
+    for offset, absolute in enumerate(range(episode, end + 1)):
+        if map_episode_order(absolute, seasons, group) != (season, number + offset):
+            raise ValueError('Episode range crosses a season boundary or is not consecutive in the selected order')
+    return season, number, number + end - episode
+
+
+def episode_position_tables(seasons: dict, groups: list[dict], fetch_season) -> dict:
+    """Map season-relative positions to TMDB's sometimes continued episode IDs.
+
+    A complete episode group already supplies the official IDs. For partial or
+    filler-free orders, fetch the season so omitted episodes do not shift them.
+    """
+    tables = {}
+    for key, count in seasons.items():
+        season = int(key)
+        if season < 1:
+            continue
+        covered = sorted({int(identity.split(':')[1]) for group in groups
+                          for identity in group['mapping'] if int(identity.split(':')[0]) == season})
+        if len(covered) == count:
+            numbers = covered
+        else:
+            details = fetch_season(season)
+            if not details:
+                raise ValueError(f'Could not load TMDB episode positions for season {season}; try again')
+            episodes = details.get('episodes') or []
+            numbers = [entry.get('episode_number') for entry in episodes]
+            if (len(numbers) != count or any(type(number) is not int or number < 1 for number in numbers)
+                    or len(set(numbers)) != len(numbers)):
+                raise ValueError(f'TMDB episode positions for season {season} are incomplete; reload the match')
+            numbers.sort()
+        tables[str(season)] = numbers
+    return tables
+
+
+def _tmdb_episode_order_get(path: str) -> dict:
+    if path not in _tmdb_episode_order_cache:
+        data = _tmdb_get(path, {})
+        if data is None:
+            raise ValueError('Could not load TMDB episode orders. Check the API key and try again.')
+        _tmdb_episode_order_cache[path] = data
+    return _tmdb_episode_order_cache[path]
+
+
+def _selected_episode_order_matches() -> list:
+    if not tmdb_is_enabled():
+        raise ValueError('Enable TMDB matching and set an API key in Settings first')
+    indices = [i for i in _selected_queue_indices() if 0 <= i < len(pending_queue)]
+    if not indices:
+        raise ValueError('Select files for one TMDB-matched TV show first')
+    selected = [(pending_queue[i], get_tmdb_match(pending_queue[i].filename)) for i in indices]
+    if any(not match or match.get('type') != 'tv' for _, match in selected):
+        raise ValueError('Every selected file must have a TMDB TV match; use Match Selected first')
+    if len({str(match['id']) for _, match in selected}) != 1:
+        raise ValueError('Select one show at a time when choosing an episode order')
+    return selected
+
+
+def load_episode_orders(b=None):
+    global _episode_order_show_id
+    btn_episode_orders.disabled = True
+    try:
+        selected = _selected_episode_order_matches()
+        match = selected[0][1]
+        groups = _tmdb_episode_order_get(f"/tv/{match['id']}/episode_groups").get('results') or []
+        tmdb_episode_order.options = episode_order_options(groups)
+        _episode_order_show_id = str(match['id'])
+        current = match.get('episode_group') or {}
+        if current.get('id') in [value for _, value in tmdb_episode_order.options]:
+            tmdb_episode_order.value = current['id']
+        print(f"{match['name']}: {len(groups)} alternate episode orders available. Choose an order, then Apply Order.")
+    except ValueError as exc:
+        _episode_order_show_id = None
+        tmdb_episode_order.options = episode_order_options([])
+        print(f'⚠️ {exc}')
+    finally:
+        btn_episode_orders.disabled = False
+
+
+def apply_episode_order(b=None):
+    try:
+        selected = _selected_episode_order_matches()
+        if str(selected[0][1]['id']) != _episode_order_show_id:
+            raise ValueError('Load episode orders for the selected show first')
+        group_id = tmdb_episode_order.value
+        group = build_episode_group(_tmdb_episode_order_get(f'/tv/episode_group/{group_id}')) if group_id else None
+        if group:
+            match = selected[0][1]
+            tables = episode_position_tables(match.get('seasons') or {}, [group],
+                lambda season: _tmdb_episode_order_get(f"/tv/{match['id']}/season/{season}"))
+            group = dict(group, aired_episode_numbers=tables)
+        # Prepare the entire mapping before changing tasks. Store it with each
+        # manual match so Start, Retry and Resume use the same chosen order.
+        updates = {}
+        for task, match in selected:
+            updated = dict(match)
+            if group:
+                updated['episode_group'] = group
+            else:
+                updated.pop('episode_group', None)
+            updates[os.path.splitext(_match_cache_key(task.filename))[0]] = updated
+        # Pair by the language-stripped stem, preserving the choice on sidecars
+        # too so resuming just a subtitle retains its video's episode order.
+        for task in pending_queue:
+            if not task.filename:
+                continue
+            key = _match_cache_key(task.filename)
+            updated = updates.get(os.path.splitext(key)[0])
+            if updated is not None:
+                task.tmdb_override = updated
+                _tmdb_match_cache[key] = updated
+        episode_numbering_toggle.value = 'Season match'
+        update_queue_display(preserve_selection=True)
+        label = group['name'] if group else 'Original Air Date (standard)'
+        print(f"✅ Applied {label} to {len(selected)} selected file(s) and their matching sidecars. Explicit season markers and manual season/episode overrides keep their numbering.")
+    except (ValueError, KeyError, TypeError) as exc:
+        print(f'⚠️ {exc}')
+
+
 def _map_absolute_episode(episode: int, seasons: Dict[str, int]) -> Tuple[int, int]:
     """Convert an absolute episode number to (season, episode) using per-season
     counts. Returns (1, episode) unchanged when mapping doesn't apply — including
@@ -4380,7 +4605,18 @@ def determine_destination_path(filename: str, source: str = "generic", dry_run: 
         if (episode_detected and not info['has_sxe'] and season_num == 1
                 and season_ov is None and episode_ov is None
                 and episode_numbering_toggle.value == 'Season match'):
-            season_num, episode_num = _map_absolute_episode(episode_num, tmdb_match.get('seasons') or {})
+            if tmdb_match.get('episode_group'):
+                season_num, episode_num, episode_end = map_episode_order_range(
+                    episode_num, episode_end, tmdb_match.get('seasons') or {},
+                    tmdb_match['episode_group'])
+            else:
+                original_episode = episode_num
+                season_num, episode_num = _map_absolute_episode(episode_num, tmdb_match.get('seasons') or {})
+                if episode_end is not None:
+                    end_season, mapped_end = _map_absolute_episode(episode_end, tmdb_match.get('seasons') or {})
+                    if end_season != season_num or mapped_end - episode_num != episode_end - original_episode:
+                        raise ValueError('Episode range crosses a TMDB season boundary')
+                    episode_end = mapped_end
 
     # Apply Force Name override - affects both TV shows and movies
     if manual_show_name:
@@ -4934,7 +5170,7 @@ def _speed_to_mbs(value: float, unit: str) -> float:
 
 SERVER_BACKOFF_SECS = 15
 SERVER_MAX_BACKOFF_SECS = 60
-MAX_SERVER_WAITS = 3  # Extra waits for transient HTTP failures, bounded per file
+MAX_SERVER_WAITS = 3  # Shared by transient HTTP failures and PikPak EOFs, bounded per file
 
 
 def _redact_transfer_error(value: str) -> str:
@@ -4947,7 +5183,7 @@ def _redact_transfer_error(value: str) -> str:
 
 def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optional[str] = None,
                         task_id: Optional[str] = None, update_bar: bool = True,
-                        url_refresh: Optional[Callable[[], str]] = None) -> Optional[str]:
+                        url_refresh: Optional[Callable[[], str]] = None, source: str = '') -> Optional[str]:
     """Thread-safe aria2 download with progress tracking.
 
     update_bar=False leaves the shared progress bar to the batch monitor thread
@@ -4956,6 +5192,9 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
     url_refresh re-mints time-limited debrid URLs between attempts. Retrying the
     same expired URL can never succeed, so callers that retain a stable item/file
     reference pass this and each retry gets a live link.
+
+    source preserves provider-specific recovery when the download uses an
+    alternate CDN hostname. Direct URLs can still be identified by their host.
     """
     filename = sanitize_filename(filename)
 
@@ -4999,9 +5238,12 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
     # Request-metered hosts get fewer connections and aria2's stock 20M split
     # floor, so a near-complete file can't spray Range requests at the limiter.
     rate_limited = url_matches_host(url, RATE_LIMITED_HOSTS)
-    pikpak_transfer = url_matches_host(url, ('mypikpak.com',))
-    conn_args = ['-x', '2', '-s', '2'] if rate_limited else ['-x', '16', '-s', '16']
-    retry_wait = '30' if rate_limited else '2'
+    pikpak_transfer = source == 'pikpak' or url_matches_host(url, ('mypikpak.com',))
+    chauthanh_transfer = source == 'chauthanh'
+    connections = ('5' if chauthanh_transfer else '2' if rate_limited else
+                   '4' if pikpak_transfer else '16')
+    conn_args = ['-x', connections, '-s', connections]
+    retry_wait = '30' if rate_limited else '5' if pikpak_transfer else '2'
     cmd = ['aria2c', url, '-d', dest_folder, '-o', filename, *conn_args, '-k', '20M',
            '-c', '--file-allocation=none', '--user-agent', 'Mozilla/5.0',
            '--connect-timeout=30', '--timeout=60', '--max-tries=3', f'--retry-wait={retry_wait}',
@@ -5023,6 +5265,7 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
             dl_start = time.time()
             completed_path = None  # Path reported by aria2's "Download complete:" line
             last_error_line = ""  # aria2's own error text, surfaced when the attempt fails
+            eof_error = ''  # Keep a dropped-connection diagnosis across later summary lines
             saw_throttle = False
             http_status = 0
             transient_status = 0
@@ -5058,9 +5301,12 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
                 # — without it a failure only ever surfaced as a generic exit code
                 # and the real cause (403/429/expired link) was invisible.
                 err_match = re.search(r'(errorCode=\d+.*|status=\d{3}.*|Timeout\b.*|'
-                                      r'Authorization failed.*|Resource not found.*)', line)
+                                      r'Authorization failed.*|Resource not found.*|Got EOF from the server.*)', line)
                 if err_match:
                     last_error_line = _redact_transfer_error(err_match.group(1))
+                if re.search(r'\bGot EOF from the server\b', line, re.I):
+                    eof_error = _redact_transfer_error(err_match.group(1) if err_match else
+                                                       'Got EOF from the server.')
                 match = re.search(r'\((\d+)%\)', line)
                 # aria2 outputs speed as "DL:5.2MiB" or "DL: 5.2MiB/s" - capture various formats
                 speed_match = re.search(r'DL:\s*(\d+\.?\d*)\s*([KMG])i?B', line)
@@ -5127,7 +5373,10 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
                         print(f"      ✓ Found downloaded file: {f}")
                     return candidate
             status = 429 if saw_throttle else transient_status or http_status
-            reason = last_error_line or (f'aria2 exited with code {process.returncode}'
+            # An explicit HTTP failure takes priority over EOF from another
+            # parallel connection. errorCode=1 alone is not an EOF diagnosis.
+            pikpak_eof = pikpak_transfer and bool(eof_error) and not status
+            reason = (eof_error if pikpak_eof else last_error_line) or (f'aria2 exited with code {process.returncode}'
                                         if process.returncode else 'aria2 reported success but no completed file was found')
             last_failure = f'HTTP {status}: {reason}' if status else reason
             detail = f" — {last_failure}"
@@ -5138,8 +5387,8 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
                     print(f"      ⚠️ File not found at expected path{detail}")
                     print(f"         Expected: {final_path}")
 
-            # A 429 keeps its existing throttle budget. Transient server errors
-            # get a separate, bounded cooldown instead of rapidly exhausting retries.
+            # A 429 keeps its existing throttle budget. Server failures and
+            # PikPak EOFs share a bounded cooldown, even if partial bytes advance.
             throttled = saw_throttle
             if made_progress:
                 throttle_waits = 0
@@ -5153,19 +5402,20 @@ def download_with_aria2(url: str, filename: str, dest_folder: str, cookie: Optio
                 cmd[cmd.index('-x') + 1] = '1'
                 cmd[cmd.index('-s') + 1] = '1'
                 wait_reason = 'Rate limited (HTTP 429)'
-            elif not throttled and transient_status and server_waits < MAX_SERVER_WAITS:
+            elif not throttled and (transient_status or pikpak_eof) and server_waits < MAX_SERVER_WAITS:
                 server_waits += 1
                 attempt -= 1
                 cool_off = min(SERVER_BACKOFF_SECS * (2 ** (server_waits - 1)),
                                SERVER_MAX_BACKOFF_SECS)
-                wait_reason = f'Server unavailable (HTTP {transient_status})'
+                wait_reason = (f'Server unavailable (HTTP {transient_status})' if transient_status else
+                               'PikPak connection closed early (EOF)')
                 if pikpak_transfer:
-                    # Reduce the range-request burst only after PikPak rejects it.
-                    connections = '4' if server_waits == 1 else '1'
-                    cmd[cmd.index('-x') + 1] = connections
-                    cmd[cmd.index('-s') + 1] = connections
+                    # Resume with one connection rather than repeating the
+                    # range-request burst against an unstable download server.
+                    cmd[cmd.index('-x') + 1] = '1'
+                    cmd[cmd.index('-s') + 1] = '1'
 
-            elif not throttled and transient_status:
+            elif not throttled and (transient_status or pikpak_eof):
                 # The server has not recovered within its cooldown budget.
                 attempt = 3
 
@@ -6347,7 +6597,7 @@ def _tb_fetch_item(endpoint: str, item_id, tb_key: str) -> Optional[dict]:
             return None
         item = data.get('data')
         if isinstance(item, list):
-            item = next((x for x in item if x.get('id') == item_id), None)
+            item = next((x for x in item if str(x.get('id')) == str(item_id)), None)
         return item
     except Exception:
         return None  # Transient poll error — caller retries until its poll limit
@@ -6429,7 +6679,7 @@ def _tb_requestdl(endpoint: str, id_param: str, item_id, file_id, tb_key: str,
             dl_r = requests.get(f"{TORBOX_API_BASE}/{endpoint}/requestdl",
                                 params=dl_params, headers=_get_tb_headers(tb_key), timeout=30)
         except Exception as e:
-            err = str(e)[:100]
+            err = re.sub(r'(?i)https?://\S+', '[URL]', str(e).replace(tb_key, '[hidden]'))[:100]
             retry_after = 0.0
             continue
         try:
@@ -6447,7 +6697,7 @@ def _tb_requestdl(endpoint: str, id_param: str, item_id, file_id, tb_key: str,
         download_url = _tb_extract_download_url(dl_data)
         if download_url:
             return download_url, ''
-        err = str(dl_data.get('detail') or dl_data.get('error') or err)[:120]
+        err = str(dl_data.get('detail') or dl_data.get('error') or err).replace(tb_key, '[hidden]')[:120]
         if dl_r.status_code < 429 and not _tb_err_is_throttle(err):
             return '', err  # genuine refusal — retrying won't change the answer
         if (dl_r.status_code == 429 or _tb_err_is_throttle(err)) and retry_after <= 0:
@@ -6648,7 +6898,7 @@ def resolve_tb_link(url: str, tb_key: str) -> List[Tuple[str, str]]:
     try:
         # Step 1: Create web download
         r = requests.post(f"{TORBOX_API_BASE}/webdl/createwebdownload",
-                         json={"url": url}, headers=h, timeout=30)
+                         files={"link": (None, url)}, headers=h, timeout=30)
         data = r.json()
         
         if not data.get('success'):
@@ -6681,7 +6931,7 @@ def resolve_tb_link(url: str, tb_key: str) -> List[Tuple[str, str]]:
                 progress_bar.value = progress_pct
                 progress_bar.description = f"TB: {int(progress_pct)}%"
 
-            if status in ['completed', 'cached', 'done']:
+            if item.get('download_finished') or status in ['completed', 'cached', 'done', 'finished', 'downloaded']:
                 filename = item.get('name', item.get('filename', 'download'))
 
                 # Step 3: Get download URL (first/main file)
@@ -8010,6 +8260,965 @@ def _pikpak_download_url(task: DownloadTask) -> str:
                        json_output=False)
     return _pikpak_validate_download_url(link)
 
+# --- CHAU THANH DONOR LINKS ---
+# Reuse the user's PC session from the downloading runtime to authorise access.
+# Turnstile is completed by the user in the optional runtime browser, never solved
+# automatically. Session credentials are never persisted by the downloader.
+# eri2 is the donor server verified with a real 206 response. Other servers must
+# be verified before adding them; never silently use the free download route.
+# Three files with five aria2 connections each stay below 16 donor threads.
+_chauthanh_transfer_slots = BoundedSemaphore(3)
+_chauthanh_session_lock = RLock()
+_chauthanh_cached_session = None
+_chauthanh_session_key = None
+_chauthanh_session_time = 0.0
+_chauthanh_profile_url = ''
+_chauthanh_browser = None
+_chauthanh_browser_panel = None
+
+
+class ChauThanhLoginError(ValueError):
+    pass
+
+
+class ChauThanhChallengeError(ChauThanhLoginError):
+    pass
+
+
+class ChauThanhAccessError(ValueError):
+    def __init__(self, info):
+        self.info = info
+        super().__init__(_chauthanh_refusal(info))
+
+
+class _ChauThanhPage(HTMLParser):
+    """Parse the observed login fields and profile labels without saving HTML."""
+    def __init__(self, text):
+        super().__init__()
+        self.forms, self.links, self.texts = [], [], []
+        self.feedback_parts = []
+        self.main_parts = []
+        self._main_count = 0
+        self.form = self.link = None
+        self.hidden = 0
+        self._regions = []
+        self.feed(text)
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag in ('p', 'div', 'section', 'article', 'aside', 'form', 'header', 'footer',
+                   'nav', 'li', 'tr', 'td', 'th', 'br', 'h1', 'h2', 'h3', 'h4'):
+            self.feedback_parts.append('\n')
+            if self._main_count:
+                self.main_parts.append('\n')
+        excluded = (tag in ('script', 'style') or attrs.get('id', '').lower() in
+                    ('chatbox', 'chatinline', 'sidebar') or
+                    'sidebar' in attrs.get('class', '').lower().split())
+        if tag not in ('area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
+                       'link', 'meta', 'param', 'source', 'track', 'wbr'):
+            main = attrs.get('id', '').lower() in ('content', 'content-full')
+            self._regions.append((tag, excluded, main))
+            self._main_count += int(main)
+        if excluded:
+            self.hidden += 1
+        if tag == 'form':
+            self.form = {'id': attrs.get('id'), 'action': attrs.get('action', ''),
+                         'method': attrs.get('method', 'get').lower(), 'inputs': {},
+                         'challenge': False, 'texts': []}
+            self.forms.append(self.form)
+        if self.form is not None:
+            if 'cf-turnstile' in attrs.get('class', '').split():
+                self.form['challenge'] = True
+            if tag == 'input' and attrs.get('name'):
+                self.form['inputs'][attrs['name']] = attrs.get('value', '')
+        if tag == 'a' and not self.hidden:
+            self.link = [attrs.get('href', ''), '']
+            self.links.append(self.link)
+
+    def handle_endtag(self, tag):
+        if tag in ('p', 'div', 'section', 'article', 'aside', 'form', 'header', 'footer',
+                   'nav', 'li', 'tr', 'td', 'th', 'h1', 'h2', 'h3', 'h4'):
+            self.feedback_parts.append('\n')
+            if self._main_count:
+                self.main_parts.append('\n')
+        for i in range(len(self._regions) - 1, -1, -1):
+            if self._regions[i][0] == tag:
+                self.hidden = max(0, self.hidden - sum(hidden for _, hidden, _ in self._regions[i:]))
+                self._main_count -= sum(main for _, _, main in self._regions[i:])
+                del self._regions[i:]
+                break
+        if tag == 'form':
+            self.form = None
+        if tag == 'a':
+            self.link = None
+
+    def handle_data(self, value):
+        if not self.hidden and value.strip():
+            self.texts.append(value.strip())
+            self.feedback_parts.append(value.strip() + ' ')
+            if self._main_count:
+                self.main_parts.append(value.strip() + ' ')
+            if self.form is not None:
+                self.form['texts'].append(value.strip())
+            if self.link is not None:
+                self.link[1] += value.strip() + ' '
+
+
+def _chauthanh_site_url(url: str) -> str:
+    parsed = urlparse(url)
+    if (parsed.scheme != 'https' or parsed.hostname not in ('chauthanh.info', 'www.chauthanh.info')
+            or parsed.username or parsed.password or parsed.port not in (None, 443)):
+        raise ChauThanhLoginError('Châu Thành login refused an unexpected destination.')
+    return url
+
+
+def _chauthanh_login_result(text: str) -> dict:
+    """Classify visible login feedback without exposing account text or chat posts."""
+    page = _ChauThanhPage(text)
+    visible = '\n'.join(' '.join(line.split()) for line in ''.join(page.feedback_parts).splitlines())
+    verification = bool(re.search(
+        r'\b(?:captcha|turnstile)[ \t]+(?:(?:verification|validation|check|response|token|challenge)[ \t]+){0,3}'
+        r'(?:(?:is|was)[ \t]+)?(?:required|failed|invalid|missing|expired|incorrect|not passed|not valid)\b|'
+        r'\b(?:failed|invalid|missing|expired|incorrect)[ \t]+(?:captcha|turnstile)\b|'
+        r'\b(?:confirmation|verification|security)[ \t]+code[ \t]+'
+        r'(?:(?:is|was)[ \t]+)?(?:not[ \t]+(?:correct|valid)|incorrect|invalid|missing|expired|required|wrong)\b|'
+        r'\b(?:incorrect|invalid|missing|expired|wrong)[ \t]+(?:confirmation|verification|security)[ \t]+code\b|'
+        r'\bplease (?:complete|solve) (?:the |a )?(?:captcha|turnstile)\b|'
+        r'\b(?:please |must )?(?:confirm|verify) (?:that )?you are (?:not (?:a )?(?:robot|bot)|human)\b|'
+        r'\b(?:have not|haven\x27t|did not|didn\x27t) (?:passed?|completed?)\b.{0,60}\b(?:captcha|verification)\b',
+        visible, re.I))
+    credentials = bool(re.search(
+        r'\b(?:incorrect|wrong|invalid)[ \t]+(?:password|username|credentials)\b|'
+        r'\b(?:password|username|credentials)(?:[ \t]*(?:or|and|/)[ \t]*(?:password|username))?[ \t]+'
+        r'(?:(?:is|are|was|were)[ \t]+)?(?:incorrect|wrong|invalid|not correct)\b',
+        visible, re.I))
+    return {'login_form_returned': any(form['id'] == 'login' for form in page.forms),
+            'logout_link_present': any('/logout' in urlparse(href).path.lower() or
+                                       label.strip().lower() in ('logout', 'log out', 'sign out')
+                                       for href, label in page.links),
+            'profile_link_present': any('profile' in label.lower() or '/profile' in urlparse(href).path.lower()
+                                       for href, label in page.links),
+            'verification_error': verification, 'credentials_error': credentials,
+            'not_authorized': bool(re.search(r'\byou are not authori[sz]ed to access this page\b', visible, re.I)),
+            'success_notice': bool(re.search(r'\b(?:successfully logged in|logged in successfully|'
+                                              r'login successful|successfully signed in)\b', visible, re.I))}
+
+
+def _chauthanh_safe_preview(text: str, session=None, sensitive=()) -> str:
+    """Bounded main-page feedback; no input values, scripts, account profile or secrets."""
+    page = _ChauThanhPage(text)
+    if any(token.strip(':').lower() in ('permission', 'direct download server', "user's title")
+           for token in page.texts):
+        return '[account profile details omitted]'
+    main = ' '.join(''.join(page.main_parts).split())
+    if not main:
+        visible = ' '.join(''.join(page.feedback_parts).split())
+        main = visible if len(visible) <= 1000 else '[main content region not found]'
+    values = list(sensitive) + list(_chauthanh_credentials()) + [_chauthanh_pc_session_value()]
+    try:
+        values.extend(session.cookies.values() if session is not None else [])
+    except (AttributeError, TypeError):
+        pass
+    for value in sorted({str(v) for v in values if v}, key=len, reverse=True):
+        for candidate in {value, ' '.join(value.split())}:
+            if candidate:
+                main = re.sub(re.escape(candidate), '[hidden]', main, flags=re.I)
+    main = re.sub(r'https?://\S+|(?<!\w)//\S+', '[URL]', main, flags=re.I)
+    main = re.sub(r'\b[^\s@]+@[^\s@]+\.[^\s@]+\b', '[email]', main)
+    main = re.sub(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', '[IP]', main)
+    main = re.sub(r'(?<!\w)(?:[0-9a-f]{0,4}:){2,}[0-9a-f:.]+', '[IP]', main, flags=re.I)
+    main = re.sub(r'[A-Za-z0-9_+/=-]{28,}', '[token]', main)
+    return main[:360]
+
+
+def _chauthanh_login_challenge(text: str, headers, submitted=False) -> bool:
+    """Identify an actual server challenge, not a login form containing Turnstile."""
+    if headers.get('cf-mitigated', '').lower() == 'challenge':
+        return True
+    if re.search(r'<title[^>]*>\s*just a moment', text, re.I):
+        return True
+    if not submitted:
+        return False
+    # The server can put feedback outside the returned form. Chat/sidebar text
+    # is excluded by the page parser before classifying that feedback.
+    return _chauthanh_login_result(text)['verification_error']
+
+
+def _chauthanh_web_request(session, url: str, data=None, diagnostic=None, stage='login', referer=None):
+    """Never replay a credential POST to a redirect destination."""
+    url = _chauthanh_site_url(url)
+    for _ in range(5):
+        method = 'POST' if data is not None else 'GET'
+        origin = urlparse(_chauthanh_site_url(referer or url))
+        response = (session.post(url, data=data,
+                                 headers={'Referer': referer or url, 'Origin': f'{origin.scheme}://{origin.netloc}'},
+                                 allow_redirects=False, timeout=REQUEST_TIMEOUT)
+                    if data is not None else
+                    session.get(url, headers={'Referer': referer} if referer else {},
+                                allow_redirects=False, timeout=REQUEST_TIMEOUT))
+        try:
+            # Never expose raw fields, cookies, bodies or signed URLs. Diagnostics
+            # below include only a bounded, redacted feedback preview.
+            text = '' if response.status_code in (301, 302, 303, 307, 308) else response.text
+            challenge = _chauthanh_login_challenge(
+                text, response.headers, submitted=method == 'POST' or stage == 'login submission')
+            if diagnostic is not None:
+                diagnostic({'stage': stage, 'method': method, 'host': urlparse(url).hostname,
+                            'status': response.status_code, 'challenge': challenge})
+                if text and stage == 'login submission':
+                    diagnostic({'stage': 'login result', **_chauthanh_login_result(text)})
+                if text and stage in ('login submission', 'donor profile check'):
+                    diagnostic({'stage': 'server feedback', 'source_stage': stage,
+                                'preview': _chauthanh_safe_preview(
+                                    text, session=session, sensitive=tuple(data.values()) if data else ())})
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get('Location', '')
+                if not location:
+                    raise ChauThanhLoginError('Châu Thành login returned an empty redirect.')
+                url = _chauthanh_site_url(urljoin(url, location))
+                data = None
+                continue
+            if challenge:
+                raise ChauThanhChallengeError(
+                    f'Châu Thành returned a verification challenge during {stage} '
+                    f'(HTTP {response.status_code}). Complete verification using Open browser login '
+                    'on this runtime, then click Use this login.')
+            if response.status_code in (401, 403):
+                raise ChauThanhLoginError(
+                    f'Châu Thành refused {stage} (HTTP {response.status_code}; no verification challenge detected). '
+                    'The reason is unconfirmed; this does not establish a wrong password or a browser requirement.')
+            if response.status_code != 200:
+                raise ChauThanhLoginError(f'Châu Thành login returned HTTP {response.status_code}.')
+            return url, text
+        finally:
+            response.close()
+    raise ChauThanhLoginError('Châu Thành login returned too many redirects.')
+
+
+def _chauthanh_profile(text: str) -> bool:
+    # This is the account's Permission label, not a username, user title or footer.
+    tokens = _ChauThanhPage(text).texts
+    for i, token in enumerate(tokens[:-1]):
+        if token.rstrip(':').strip().lower() == 'permission':
+            role = tokens[i + 1].strip().lower()
+            if role not in ('supporter', 'donor', 'donator', 'premium', 'admin', 'administrator'):
+                raise ChauThanhLoginError('Châu Thành account is not marked as a donor/supporter.')
+            return True
+    return False
+
+
+def _chauthanh_verify_profile(session, url: str, text: str, diagnostic=None) -> str:
+    if _chauthanh_profile(text):
+        return url
+    candidates = ['https://chauthanh.info/forum/profile.html']  # Confirmed account-page URL.
+    for href, label in _ChauThanhPage(text).links:
+        if ('profile' in label.lower() or '/profile' in urlparse(href).path.lower()):
+            candidates.append(_chauthanh_site_url(urljoin(url, href)))
+    for profile_url in dict.fromkeys(candidates):
+        profile_url, profile_text = _chauthanh_web_request(
+            session, profile_url, diagnostic=diagnostic, stage='donor profile check', referer=url)
+        if diagnostic is not None:
+            diagnostic({'stage': 'profile result', **_chauthanh_login_result(profile_text)})
+        if _chauthanh_profile(profile_text):
+            return profile_url
+        if _chauthanh_login_result(profile_text)['not_authorized']:
+            raise ChauThanhLoginError('The protected profile says this session is not authorized. '
+                                     'Normal HTTP login has not authenticated the account.')
+    raise ChauThanhLoginError('Châu Thành login was not verified: the protected profile did not show donor permission.')
+
+
+def _chauthanh_password_hash(password: str, page: str) -> str:
+    # Observed page handler: md5(md5(md5(password)) + per-page nonce).
+    nonce = re.search(r'pass\s*\+=\s*[\'"]([0-9a-f]{32})[\'"]', page, re.I)
+    if not nonce or not re.search(r'hex_md5\(hex_md5\(', page):
+        raise ChauThanhLoginError('Châu Thành password form changed; login was not submitted.')
+    # Only ASCII is implemented here; the browser handles other password encodings.
+    if not password.isascii():
+        raise ChauThanhLoginError('HTTP login does not yet support this password encoding. '
+                                 'The optional browser can use the site\'s own password handler.')
+    digest = lambda value: hashlib.md5(value.encode('ascii')).hexdigest()
+    return digest(digest(digest(password)) + nonce[1])
+
+
+def _chauthanh_credentials() -> tuple:
+    return (getattr(globals().get('token_chauthanh_username'), 'value', '').strip(),
+            getattr(globals().get('token_chauthanh_password'), 'value', ''))
+
+
+def _chauthanh_pc_session_value() -> str:
+    return getattr(globals().get('token_chauthanh_session'), 'value', '').strip()
+
+
+def _chauthanh_check_pc_session(session, diagnostic=None) -> str:
+    url, text = _chauthanh_web_request(
+        session, 'https://chauthanh.info/forum/profile.html', diagnostic=diagnostic,
+        stage='donor profile check', referer='https://chauthanh.info/')
+    if diagnostic is not None:
+        diagnostic({'stage': 'profile result', **_chauthanh_login_result(text)})
+    if not _chauthanh_profile(text):
+        raise ChauThanhLoginError('The PC login session is no longer accepted as a supporter session. '
+                                 'Copy the current PHPSESSID from your signed-in PC browser, '
+                                 'then click Use PC login in Settings.')
+    _chauthanh_ip_status_refresh(session, url, diagnostic=diagnostic)
+    return url
+
+
+def _chauthanh_reuse_pc_session(value, diagnostic=None):
+    """Reuse the user's own authenticated session; never submit a password."""
+    value = value.strip()
+    if not re.fullmatch(r'[A-Za-z0-9,-]{1,256}', value):
+        raise ChauThanhLoginError('Enter only the PHPSESSID value from an active supporter login.')
+    session = requests.Session()
+    session.headers.update({'User-Agent': 'Mozilla/5.0'})
+    session.cookies.set('PHPSESSID', value, domain='chauthanh.info', path='/', secure=True)
+    try:
+        _chauthanh_check_pc_session(session, diagnostic=diagnostic)
+        return session
+    except Exception:
+        session.close()
+        raise
+
+
+def _chauthanh_ip_status_refresh(session, profile_url: str, diagnostic=None) -> bool:
+    """Repeat the site's own update_ip_status() GET after verified supporter login.
+
+    The public handler reports an IP. HTTP 200 does not establish that an address
+    was allow-listed; only the subsequent cookie-free donor file check can do so.
+    """
+    completed = False
+    try:
+        _chauthanh_web_request(session, 'https://chauthanh.info/ip', referer=profile_url,
+                              diagnostic=diagnostic, stage='IP status refresh')
+        completed = True
+    except (ChauThanhLoginError, requests.RequestException):
+        pass
+    if diagnostic is not None:
+        diagnostic({'stage': 'IP status result', 'request_completed': completed})
+    return completed
+
+
+def _get_chauthanh_session(force=False, diagnostic=None, http_only=False, pc_session_only=False):
+    """One runtime login shared by all donor workers; never save cookies to Drive."""
+    global _chauthanh_cached_session, _chauthanh_session_key
+    global _chauthanh_session_time, _chauthanh_profile_url
+    username, password = _chauthanh_credentials()
+    key = hashlib.sha256((username + '\0' + password).encode('utf-8')).digest() if username and password else None
+    with _chauthanh_session_lock:
+        pc_value = _chauthanh_pc_session_value()
+        if pc_session_only and not pc_value:
+            raise ChauThanhLoginError('Paste your current PHPSESSID in Settings, then click Use PC login.')
+        if pc_session_only or (pc_value and not http_only):
+            pc_key = ('pc-session', hashlib.sha256(pc_value.encode('utf-8')).digest())
+            if (_chauthanh_cached_session is not None and _chauthanh_session_key == pc_key):
+                if not force and time.monotonic() - _chauthanh_session_time < 300:
+                    return _chauthanh_cached_session
+                try:
+                    _chauthanh_check_pc_session(_chauthanh_cached_session, diagnostic=diagnostic)
+                except Exception:
+                    _chauthanh_cached_session.close()
+                    _chauthanh_cached_session = None
+                    raise
+                session = _chauthanh_cached_session
+            else:
+                if _chauthanh_cached_session is not None:
+                    _chauthanh_cached_session.close()
+                    _chauthanh_cached_session = None
+                session = _chauthanh_reuse_pc_session(pc_value, diagnostic=diagnostic)
+            _chauthanh_cached_session, _chauthanh_session_key = session, pc_key
+            _chauthanh_profile_url = 'https://chauthanh.info/forum/profile.html'
+            _chauthanh_session_time = time.monotonic()
+            return session
+        if force and not http_only and _chauthanh_session_key == 'browser' and _chauthanh_browser is not None:
+            return _chauthanh_browser_session()
+        if (_chauthanh_cached_session is not None and not force
+                and ((_chauthanh_session_key == 'browser' and not http_only) or _chauthanh_session_key == key)):
+            if time.monotonic() - _chauthanh_session_time < 300:
+                return _chauthanh_cached_session
+            # Browser sessions are verified through that same runtime browser.
+            if _chauthanh_session_key == 'browser' and _chauthanh_browser is not None:
+                return _chauthanh_browser_session()
+            url, text = _chauthanh_web_request(
+                _chauthanh_cached_session, _chauthanh_profile_url,
+                diagnostic=diagnostic, stage='donor profile check')
+            if _chauthanh_profile(text):
+                _chauthanh_ip_status_refresh(_chauthanh_cached_session, url, diagnostic=diagnostic)
+                _chauthanh_session_time = time.monotonic()
+                return _chauthanh_cached_session
+        if _chauthanh_cached_session is not None:
+            _chauthanh_cached_session.close()
+            _chauthanh_cached_session = None
+        if not username or not password:
+            raise ChauThanhLoginError('Log in to Châu Thành in Settings on this runtime first. '
+                                      'Paste PHPSESSID and click Use PC login.')
+        session = requests.Session()
+        session.headers.update({'User-Agent': 'Mozilla/5.0'})
+        try:
+            url, page = _chauthanh_web_request(
+                session, 'https://chauthanh.info/forum/login.html',
+                diagnostic=diagnostic, stage='login page', referer='https://chauthanh.info/')
+            parsed = _ChauThanhPage(page)
+            form = next((item for item in parsed.forms if item['id'] == 'login'), None)
+            if form is None or form['method'] != 'post':
+                raise ChauThanhLoginError('Châu Thành login form was not recognised; no password was submitted.')
+            if diagnostic is not None:
+                diagnostic({'stage': 'login form',
+                            'turnstile_present': form['challenge'] or 'cf-turnstile-response' in form['inputs'],
+                            'ref_present': bool(form['inputs'].get('ref'))})
+            target = _chauthanh_site_url(urljoin(url, form['action'] or url))
+            data = dict(form['inputs'])
+            if form['challenge']:
+                data.setdefault('cf-turnstile-response', '')
+            data.update(username=username, password='', passhash=_chauthanh_password_hash(password, page))
+            url, text = _chauthanh_web_request(
+                session, target, data=data, diagnostic=diagnostic, stage='login submission', referer=url)
+            if _chauthanh_login_result(text)['credentials_error']:
+                raise ChauThanhLoginError('Châu Thành reported a username/password error after submission. '
+                                         'Account login is not verified.')
+            profile_url = _chauthanh_verify_profile(session, url, text, diagnostic=diagnostic)
+            _chauthanh_ip_status_refresh(session, profile_url, diagnostic=diagnostic)
+        except Exception:
+            session.close()
+            raise
+        _chauthanh_cached_session, _chauthanh_session_key = session, key
+        _chauthanh_profile_url = profile_url
+        _chauthanh_session_time = time.monotonic()
+        return session
+
+
+class _ChauThanhRuntimeBrowser:
+    """A normal headed browser on the runtime; all page interaction is by the user."""
+    _installed = False
+    def __init__(self, on_status=None):
+        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='chauthanh-browser')
+        self.page = self.context = self.browser = self.playwright = self.xvfb = None
+        self.state = 'new'
+        self.status = 'Preparing the runtime browser.'
+        self.on_status = on_status
+
+    def submit(self, action, payload=None):
+        return self.pool.submit(self._run, action, payload or {})
+
+    def report(self, message, state=None):
+        self.status = message
+        if state is not None:
+            self.state = state
+        if self.on_status is not None:
+            try:
+                self.on_status(message)
+            except Exception:
+                pass  # A disconnected notebook view must not break browser cleanup.
+
+    def _run(self, action, payload):
+        try:
+            if action == 'start':
+                self.report('Preparing browser tools in this runtime.', 'starting')
+            result = self._action(action, payload)
+            if action == 'start':
+                self.report('Browser ready. Complete login in the displayed page.', 'ready')
+            elif action == 'close':
+                self.report('Browser closed.', 'closed')
+            return result
+        except Exception as exc:
+            if action == 'start':
+                stage = self.status
+                try:
+                    self._action('close', {})
+                except Exception:
+                    pass
+                detail = str(exc) if isinstance(exc, ChauThanhLoginError) else type(exc).__name__
+                self.report(f'Browser startup failed during: {stage} ({detail}). Click Open browser login to retry.',
+                            'failed')
+            raise
+
+    def _action(self, action, payload):
+        if action == 'start':
+            import sys
+            if platform.system() != 'Linux':
+                raise ChauThanhLoginError('The interactive runtime browser currently requires Linux/Colab.')
+            try:
+                from playwright.sync_api import sync_playwright
+            except ImportError:
+                self.report('Installing the Python browser tools. This may take a few minutes.')
+                subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'playwright>=1.49,<2'],
+                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                from playwright.sync_api import sync_playwright
+            self.playwright = sync_playwright().start()
+            if not type(self)._installed:
+                self.report('Installing Chromium and its system dependencies. The first launch can take several minutes.')
+                subprocess.run([sys.executable, '-m', 'playwright', 'install', '--with-deps', 'chromium'],
+                               check=True, timeout=600, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if not shutil.which('Xvfb'):
+                self.report('Installing the runtime display tools.')
+                subprocess.run(['apt-get', 'update', '-qq'], check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(['apt-get', 'install', '-y', '-qq', 'xvfb'], check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            type(self)._installed = True
+            self.report('Starting the runtime display.')
+            number = next((n for n in range(80, 100) if not os.path.exists(f'/tmp/.X11-unix/X{n}')), None)
+            if number is None:
+                raise ChauThanhLoginError('No runtime display is available.')
+            self.xvfb = subprocess.Popen(['Xvfb', f':{number}', '-screen', '0', '1280x900x24', '-nolisten', 'tcp'],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(50):
+                if os.path.exists(f'/tmp/.X11-unix/X{number}'):
+                    break
+                if self.xvfb.poll() is not None:
+                    raise ChauThanhLoginError('Runtime browser display could not start.')
+                time.sleep(0.1)
+            self.report('Launching Chromium in the runtime.')
+            self.browser = self.playwright.chromium.launch(
+                headless=False, env={**os.environ, 'DISPLAY': f':{number}'})
+            self.context = self.browser.new_context(viewport={'width': 1280, 'height': 900},
+                                                    accept_downloads=False)
+            self.page = self.context.new_page()
+            def navigation_guard(route):
+                request = route.request
+                if request.is_navigation_request() and request.frame == self.page.main_frame:
+                    try:
+                        _chauthanh_site_url(request.url)
+                    except ChauThanhLoginError:
+                        route.abort()
+                        return
+                route.continue_()
+            self.context.route('**/*', navigation_guard)
+            self.report('Opening the Châu Thành login page.')
+            self.page.goto('https://chauthanh.info/forum/login.html', wait_until='domcontentloaded', timeout=60000)
+        elif action == 'close':
+            for resource in (self.context, self.browser, self.playwright):
+                if resource is not None:
+                    try:
+                        resource.stop() if resource is self.playwright else resource.close()
+                    except Exception:
+                        pass
+            if self.xvfb is not None:
+                self.xvfb.terminate()
+            self.page = None
+            return None
+        elif self.page is None:
+            raise ChauThanhLoginError('Open the runtime browser first.')
+        elif action == 'click':
+            x, y = int(payload.get('x', -1)), int(payload.get('y', -1))
+            if 0 <= x < 1280 and 0 <= y < 900:
+                self.page.mouse.click(x, y)
+        elif action == 'key':
+            key = str(payload.get('key', ''))
+            if len(key) == 1:
+                self.page.keyboard.insert_text(key)
+            elif key in ('Tab', 'Enter', 'Backspace', 'Delete', 'Escape', 'ArrowLeft',
+                         'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'Control+A'):
+                self.page.keyboard.press(key)
+            return None  # Render on the next refresh, without queuing screenshots per character.
+        elif action == 'text':
+            self.page.keyboard.insert_text(str(payload.get('text', ''))[:4096])
+            return None
+        elif action == 'scroll':
+            self.page.mouse.wheel(0, max(-900, min(900, int(payload.get('dy', 0)))))
+        elif action == 'verify':
+            _chauthanh_site_url(self.page.url)
+            # A fresh profile navigation verifies that the session is still active.
+            # Use the confirmed protected URL even if the landing page has no link.
+            self.page.goto('https://chauthanh.info/forum/profile.html',
+                           wait_until='domcontentloaded', timeout=60000)
+            url = _chauthanh_site_url(self.page.url)
+            if not _chauthanh_profile(self.page.content()):
+                raise ChauThanhLoginError('The runtime browser did not return a donor/supporter profile. '
+                                         'Complete login and verification there, then try Use this login again.')
+            return (self.context.cookies(['https://chauthanh.info/', 'https://eri2.chauthanh.info/']),
+                    self.page.evaluate('navigator.userAgent'), url)
+        return self.page.screenshot(type='jpeg', quality=65, timeout=10000)
+
+
+def _chauthanh_browser_session():
+    """Import only this runtime browser's provider cookies into its HTTP session."""
+    global _chauthanh_cached_session, _chauthanh_session_key
+    global _chauthanh_session_time, _chauthanh_profile_url
+    if _chauthanh_browser is None:
+        raise ChauThanhLoginError('Open browser login in this runtime first.')
+    cookies, user_agent, profile_url = _chauthanh_browser.submit('verify').result(timeout=75)
+    session = requests.Session()
+    session.headers.update({'User-Agent': user_agent})
+    for cookie in cookies:
+        domain = cookie.get('domain', '').lstrip('.').lower()
+        if domain == 'chauthanh.info' or domain.endswith('.chauthanh.info'):
+            session.cookies.set(cookie['name'], cookie['value'], domain=cookie['domain'],
+                                path=cookie.get('path', '/'), secure=cookie.get('secure', True))
+    _chauthanh_ip_status_refresh(session, profile_url)
+    with _chauthanh_session_lock:
+        if _chauthanh_cached_session is not None:
+            _chauthanh_cached_session.close()
+        _chauthanh_cached_session, _chauthanh_session_key = session, 'browser'
+        _chauthanh_profile_url, _chauthanh_session_time = profile_url, time.monotonic()
+        # Choosing the alternate browser route replaces the PC-session input.
+        if globals().get('token_chauthanh_session') is not None:
+            token_chauthanh_session.value = ''
+    return session
+
+
+def _chauthanh_enable_widgets():
+    """Enable Colab's custom manager before displaying the containing controls."""
+    try:
+        from google.colab import output
+        output.enable_custom_widget_manager()
+    except ImportError:
+        pass
+
+
+def _chauthanh_browser_widget():
+    """User-operated browser view; passwords and cookies are never widget traits."""
+    import base64
+    try:
+        import anywidget
+    except ImportError:
+        import sys
+        subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'anywidget>=0.9,<1'], check=True)
+        import anywidget
+    import traitlets
+    _chauthanh_enable_widgets()
+
+    class BrowserView(anywidget.AnyWidget):
+        frame = traitlets.Unicode('').tag(sync=True)
+        busy = traitlets.Bool(True).tag(sync=True)
+        ready = traitlets.Bool(False).tag(sync=True)
+        status = traitlets.Unicode('Preparing the runtime browser; the first launch installs Chromium and its display tools.').tag(sync=True)
+        _esm = r'''
+        export function render({model, el}) {
+          const status = document.createElement('p');
+          const view = document.createElement('div'); view.tabIndex = 0;
+          view.style.cssText = 'outline:1px solid #aaa;max-width:100%;overflow:hidden';
+          const img = document.createElement('img'); img.style.width = '100%';
+          img.draggable = false; view.append(img); el.append(status, view);
+          const update = () => { status.textContent = model.get('status');
+            const data = model.get('frame'); img.src = data ? 'data:image/jpeg;base64,' + data : ''; };
+          const send = (action, payload={}) => { if(model.get('ready') && (action!=='refresh' || !model.get('busy')))
+            model.send({action, payload}); };
+          img.addEventListener('click', e => { view.focus(); const r=img.getBoundingClientRect();
+            send('click', {x:Math.floor((e.clientX-r.left)*1280/r.width), y:Math.floor((e.clientY-r.top)*900/r.height)}); });
+          view.addEventListener('keydown', e => { if((e.ctrlKey || e.metaKey) && e.key.toLowerCase()==='a') {
+            e.preventDefault(); send('key', {key:'Control+A'});
+          } else if(!e.ctrlKey && !e.metaKey && !e.altKey) {
+            e.preventDefault(); send('key', {key:e.key}); } });
+          view.addEventListener('paste', e => { e.preventDefault();
+            send('text', {text:e.clipboardData.getData('text/plain')}); });
+          view.addEventListener('wheel', e => { e.preventDefault(); send('scroll', {dy:e.deltaY}); }, {passive:false});
+          const timer=setInterval(()=>send('refresh'),2000);
+          model.on('change:frame change:status',update); update();
+          return () => { clearInterval(timer); model.off('change:frame change:status',update); };
+        }'''
+
+    global _chauthanh_browser
+    if _chauthanh_browser is not None:
+        _chauthanh_browser.submit('close')
+    view = BrowserView()
+    use = widgets.Button(description='Use this login', button_style='success')
+    close = widgets.Button(description='Close browser')
+    status = widgets.HTML('<small>Preparing the runtime browser.</small>')
+
+    def report_status(message):
+        view.status = message
+        status.value = '<small>' + html.escape(message) + '</small>'
+        target = globals().get('chauthanh_login_status')
+        if target is not None and globals().get('_chauthanh_browser') is browser:
+            target.value = status.value
+
+    browser = _ChauThanhRuntimeBrowser(on_status=report_status)
+    _chauthanh_browser = browser
+
+    def refresh_result(future):
+        try:
+            frame = future.result()
+            if frame is not None:
+                view.frame = base64.b64encode(frame).decode('ascii')
+                view.ready = True
+                report_status('This browser runs in Colab. Click the page and type normally; complete any verification yourself, then click Use this login.')
+        except Exception as exc:
+            report_status(browser.status if browser.state == 'failed' else
+                          str(exc) if isinstance(exc, ChauThanhLoginError) else
+                          f'Runtime browser action failed ({type(exc).__name__}).')
+        finally:
+            view.busy = False
+
+    def message(_widget, content, _buffers):
+        if (not view.ready or content.get('action') not in ('click', 'key', 'text', 'scroll', 'refresh')
+                or view.busy and content.get('action') == 'refresh'):
+            return
+        view.busy = True
+        browser.submit(content['action'], content.get('payload', {})).add_done_callback(refresh_result)
+
+    def use_login(_button):
+        try:
+            _chauthanh_browser_session()
+            status.value = '<small>Supporter login verified in this runtime. A file range check will verify donor download access when starting.</small>'
+            target = globals().get('chauthanh_login_status')
+            if target is not None:
+                target.value = status.value
+        except Exception as exc:
+            status.value = '<small>' + html.escape(str(exc) if isinstance(exc, ChauThanhLoginError)
+                                                   else f'Login check failed ({type(exc).__name__}).') + '</small>'
+
+    def close_browser(_button):
+        global _chauthanh_browser, _chauthanh_browser_panel
+        view.ready = False
+        view.frame = ''
+        view.status = 'Browser closed. The verified runtime HTTP session is retained until it expires.'
+        browser.submit('close')
+        if _chauthanh_browser is browser:
+            _chauthanh_browser = None
+            _chauthanh_browser_panel = None
+
+    view.on_msg(message)
+    use.on_click(use_login)
+    close.on_click(close_browser)
+    browser.submit('start').add_done_callback(refresh_result)
+    # Standard HTML remains visible even when the custom browser view fails to load.
+    return widgets.VBox([status, view, widgets.HBox([use, close])])
+
+
+def _chauthanh_pc_session_clicked(_button=None):
+    try:
+        chauthanh_login_status.value = '<small>Checking your PC login from this runtime...</small>'
+        _get_chauthanh_session(force=True, pc_session_only=True)
+        chauthanh_login_status.value = ('<small>PC supporter session accepted. '
+                                       'File access will be checked when downloading; no Colab browser is needed.</small>')
+    except Exception as exc:
+        chauthanh_login_status.value = '<small>' + html.escape(
+            str(exc) if isinstance(exc, ChauThanhLoginError) else
+            f'Session check failed ({type(exc).__name__}).') + '</small>'
+
+
+def _chauthanh_login_clicked(_button=None):
+    try:
+        chauthanh_login_status.value = '<small>Trying normal HTTP login on this runtime...</small>'
+        _get_chauthanh_session(force=True, http_only=True)
+        if globals().get('token_chauthanh_session') is not None:
+            token_chauthanh_session.value = ''
+        chauthanh_login_status.value = '<small>Donor/supporter profile verified on this runtime.</small>'
+    except Exception as exc:
+        chauthanh_login_status.value = '<small>' + html.escape(
+            str(exc) if isinstance(exc, ChauThanhLoginError) else
+            f'Login request failed ({type(exc).__name__}).') + '</small>'
+
+
+def _chauthanh_open_browser(_button=None):
+    global _chauthanh_browser, _chauthanh_browser_panel
+    try:
+        chauthanh_login_status.value = '<small>Preparing browser login...</small>'
+        _chauthanh_enable_widgets()
+        if _chauthanh_browser is not None and getattr(_chauthanh_browser, 'state', '') in ('starting', 'ready'):
+            chauthanh_login_status.value = '<small>' + html.escape(_chauthanh_browser.status) + '</small>'
+            panel = _chauthanh_browser_panel
+        else:
+            if _chauthanh_browser is not None:
+                _chauthanh_browser.submit('close')
+            _chauthanh_browser = None
+            panel = _chauthanh_browser_widget()
+            _chauthanh_browser_panel = panel
+        if panel is not None:
+            chauthanh_browser_box.children = [panel]
+            if _button is None:
+                display(panel)  # A direct cell also gets fresh custom-manager display metadata.
+        return panel
+    except Exception as exc:
+        if _chauthanh_browser is not None:
+            try:
+                _chauthanh_browser.submit('close')
+            except Exception:
+                pass
+        _chauthanh_browser = _chauthanh_browser_panel = None
+        detail = str(exc) if isinstance(exc, ChauThanhLoginError) else type(exc).__name__
+        chauthanh_login_status.value = '<small>Could not open browser login: ' + html.escape(detail) + '. Run the Start browser directly cell to retry.</small>'
+        return None
+
+
+btn_chauthanh_session.on_click(_chauthanh_pc_session_clicked)
+btn_chauthanh_login.on_click(_chauthanh_login_clicked)
+btn_chauthanh_browser.on_click(_chauthanh_open_browser)
+
+
+def _chauthanh_url(url: str, *, download_server: bool = False) -> str:
+    """Validate a donor URL without treating a token or path as credentials."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or '').lower()
+    if (parsed.scheme != 'https' or parsed.username or parsed.password
+            or parsed.port not in (None, 443) or re.search(r'[\x00-\x20\x7f]', url)):
+        raise ValueError('Châu Thành requires an HTTPS donor download link.')
+    if host == 'eri2.chauthanh.info' and parsed.path not in ('', '/'):
+        return url
+    if not download_server and host in ('chauthanh.info', 'www.chauthanh.info'):
+        if re.fullmatch(r'/(?:drama|anime|latest_anime|ost)/download/eri2/[^/]+/[^/]+', parsed.path):
+            return url
+    raise ValueError('Châu Thành: sign in as a donor in your browser, then copy the '
+                     'donor download link (containing /download/eri2/ or starting '
+                     'https://eri2.chauthanh.info/). Show pages and free-server links '
+                     'are not supported yet.')
+
+
+def _chauthanh_filename(url: str) -> str:
+    """The observed donor redirect uses download.php?...&name=<filename>."""
+    parsed = urlparse(url)
+    if parsed.hostname == 'eri2.chauthanh.info' and parsed.path == '/download.php':
+        names = parse_qs(parsed.query).get('name', [])
+        if len(names) != 1:
+            raise ValueError('Châu Thành direct server link is missing its file name.')
+        filename = names[0]
+    else:
+        filename = unquote(parsed.path.rsplit('/', 1)[-1])
+    if (not filename or filename in ('.', '..') or '/' in filename or '\\' in filename
+            or re.search(r'[\x00-\x1f\x7f]', filename) or filename.lower().endswith(('.html', '.php'))):
+        raise ValueError('Châu Thành: copy the file download button link, not its HTML page.')
+    return filename
+
+
+def resolve_chauthanh(url: str) -> List[DownloadTask]:
+    """Queue browser-generated donor links; do no network work during preview."""
+    url = _chauthanh_url(url)
+    filename = _chauthanh_filename(url)
+    return [DownloadTask(url=url, filename=filename, source='chauthanh',
+                         link_type='chauthanh', original_url=url)]
+
+
+def _chauthanh_response_info(response, link: str) -> dict:
+    """Report a refusal's location and challenge markers without signed URLs.
+
+    Read at most 2 KiB of an error page. A Cloudflare Server header alone is not
+    a challenge signal, and no marker does not establish the reason for a 403.
+    """
+    challenge = response.headers.get('cf-mitigated', '').lower() == 'challenge'
+    ip_denied = False
+    if response.status_code not in (206, 301, 302, 303, 307, 308) and not challenge:
+        prefix = response.raw.read(2048, decode_content=True).lower()
+        ip_denied = b'not in the allowed list' in prefix and b'ip' in prefix
+        challenge = any(marker in prefix for marker in
+                        (b'<title>just a moment', b'/cdn-cgi/challenge-platform/',
+                         b'cf-chl-', b'challenges.cloudflare.com'))
+    info = {'host': (urlparse(link).hostname or '').lower(),
+            'status': response.status_code, 'challenge': challenge}
+    if ip_denied:
+        info['ip_not_allowed'] = True
+    return info
+
+
+def _chauthanh_refusal(info: dict) -> str:
+    location = f"HTTP {info['status']} at {info['host']}"
+    if info.get('ip_not_allowed'):
+        return (f'Châu Thành donor server says this runtime IP is not in its allowed list ({location}). '
+                'The site must authorise the connecting IP; account login or an IP-status response alone '
+                'does not prove file permission.')
+    if info['challenge']:
+        stage = 'donor server' if info['host'] == 'eri2.chauthanh.info' else 'entry website'
+        return (f'Châu Thành Cloudflare challenge at the {stage} ({location}). '
+                'This does not establish an account login failure. '
+                'Use a direct eri2 donor link to test file-server access separately.'
+                if stage == 'entry website' else
+                f'Châu Thành Cloudflare challenge at the donor server ({location}). '
+                'This runtime has not been granted file access.')
+    if info['host'] == 'eri2.chauthanh.info':
+        return (f'Châu Thành donor server refused this runtime ({location}; '
+                'no challenge marker observed). Token expiry or IP/session restrictions '
+                'remain unconfirmed; browser login does not establish runtime access.')
+    return (f'Châu Thành entry website refused this runtime before the donor redirect '
+            f'({location}; no challenge marker observed). Test a direct eri2 donor link. '
+            'This does not establish an account login failure.')
+
+
+def _chauthanh_download_url(task: DownloadTask, diagnostic=None, session=None) -> str:
+    """Follow only the verified donor route and read at most 32 file bytes.
+
+    Reopen the original link on each attempt, so redirects are obtained on the
+    downloading machine. This cannot renew an expired browser-generated token.
+    """
+    link = _chauthanh_url(task.original_url or task.url)
+    try:
+        with (requests.Session() if session is None else nullcontext(session)) as client, \
+                (requests.Session() if session is not None else nullcontext(client)) as file_client:
+            for _ in range(5):
+                if _cancel_requested:
+                    raise RuntimeError('Cancelled by user')
+                is_file_server = urlparse(link).hostname == 'eri2.chauthanh.info'
+                # Test file permission without account cookies, exactly as aria2
+                # will download. Keep the login session on the entry website.
+                request_client = file_client if is_file_server else client
+                agent = ('Mozilla/5.0' if is_file_server or session is None else
+                         session.headers.get('User-Agent', 'Mozilla/5.0'))
+                with request_client.get(link, headers={'Range': 'bytes=0-31', 'User-Agent': agent},
+                                 allow_redirects=False, stream=True, timeout=REQUEST_TIMEOUT) as response:
+                    info = _chauthanh_response_info(response, link)
+                    if diagnostic is not None:
+                        diagnostic(info)
+                    if response.status_code in (301, 302, 303, 307, 308):
+                        location = response.headers.get('Location')
+                        if not location:
+                            raise ValueError('Châu Thành returned a redirect without a destination.')
+                        link = _chauthanh_url(urljoin(link, location))
+                        continue
+                    if response.status_code in (401, 403) or info.get('ip_not_allowed'):
+                        raise ChauThanhAccessError(info)
+                    if response.status_code != 206:
+                        raise ValueError(f'Châu Thành range check returned HTTP {response.status_code}; '
+                                         'a resumable donor download was not verified.')
+                    _chauthanh_url(link, download_server=True)
+                    content_range = re.fullmatch(r'bytes 0-(\d+)/(\d+)',
+                                                 response.headers.get('Content-Range', ''), re.I)
+                    if not content_range or not 0 <= int(content_range[1]) <= 31:
+                        raise ValueError('Châu Thành returned an invalid download range.')
+                    size = int(content_range[2])
+                    if size <= int(content_range[1]) or (task.chauthanh_size and task.chauthanh_size != size):
+                        raise ValueError('Châu Thành file size changed; review the file before resuming.')
+                    prefix = response.raw.read(32)
+                    content_type = response.headers.get('Content-Type', '').lower()
+                    if (not prefix or 'html' in content_type or 'json' in content_type
+                            or prefix.lstrip().lower().startswith((b'<!doctype', b'<html', b'<?xml'))):
+                        raise ValueError('Châu Thành returned an access page instead of a file.')
+                    if (int(content_range[1]) != min(31, size - 1)
+                            or len(prefix) != min(32, size)):
+                        raise ValueError('Châu Thành returned an incomplete download range.')
+                    if (task.filename.lower().endswith(('.mkv', '.webm'))
+                            and not prefix.startswith(b'\x1aE\xdf\xa3')):
+                        raise ValueError('Châu Thành did not return a Matroska video file.')
+                    task.chauthanh_size = size
+                    return link
+        raise ValueError('Châu Thành returned too many download redirects.')
+    except requests.RequestException as exc:
+        # requests errors include the signed path; do not put it in saved errors.
+        raise RuntimeError(f'Châu Thành network request failed ({type(exc).__name__}).') from None
+
+
+def _download_chauthanh(task: DownloadTask):
+    """Allow three donor files with five connections each, including live adds."""
+    while not _chauthanh_transfer_slots.acquire(timeout=0.25):
+        if _cancel_requested:
+            return None
+        with progress_lock:
+            download_stats[task.id] = {'pct': 0.0, 'speed_mbs': 0.0,
+                                       'stage': 'Waiting for Châu Thành download slot'}
+    try:
+        if _cancel_requested:
+            return None
+        link = _chauthanh_runtime_link(task)
+        result = download_with_aria2(link, task.filename, COLAB_ROOT, task_id=task.id,
+                                     update_bar=False, source='chauthanh',
+                                     url_refresh=lambda: _chauthanh_runtime_link(task))
+        if result and result is not DUPLICATE_SKIP and os.path.getsize(result) != task.chauthanh_size:
+            raise ValueError('Châu Thành download size differs from the verified file. '
+                             'The local file was kept for review.')
+        return result
+    finally:
+        _chauthanh_transfer_slots.release()
+
+
+def _chauthanh_runtime_link(task):
+    with _chauthanh_session_lock:
+        session = _get_chauthanh_session()
+        try:
+            return _chauthanh_download_url(task, session=session)
+        except ChauThanhAccessError as exc:
+            # One renewed runtime login, only for an unchallenged donor refusal.
+            if exc.info['challenge'] or exc.info['host'] != 'eri2.chauthanh.info':
+                raise
+            session = _get_chauthanh_session(force=True)
+            return _chauthanh_download_url(task, session=session)
+
+
 # --- PARALLEL DOWNLOAD WORKER ---
 def download_worker(task: DownloadTask, gofile_token: str, move_queue: Optional[queue.Queue] = None,
                     tb_key: str = "") -> DownloadTask:
@@ -8044,8 +9253,14 @@ def download_worker(task: DownloadTask, gofile_token: str, move_queue: Optional[
                 return task
             task.filename = _strip_size_suffix(task.filename)
         # update_bar=False: the batch monitor thread owns the shared progress bar
-        f = download_with_aria2(download_url, task.filename, COLAB_ROOT, task.cookie, task_id=task.id,
-                                update_bar=False, url_refresh=url_refresh)
+        if task.link_type == 'chauthanh':
+            if check_duplicate_in_drive(_strip_size_suffix(task.filename)):
+                task.status = 'skipped'
+                return task
+            f = _download_chauthanh(task)
+        else:
+            f = download_with_aria2(download_url, task.filename, COLAB_ROOT, task.cookie, task_id=task.id,
+                                    update_bar=False, url_refresh=url_refresh, source=task.link_type)
         if f is DUPLICATE_SKIP:
             task.status = "skipped"  # Already in Drive — not a failure, don't retry on resume
         elif f and move_queue is not None:
@@ -8082,7 +9297,8 @@ def download_worker(task: DownloadTask, gofile_token: str, move_queue: Optional[
         task.error = "Cancelled by user"
     except Exception as e:
         task.status = "failed"
-        task.error = str(e)[:600] if task.link_type == 'pikpak' else str(e)[:100]
+        task.error = (_redact_transfer_error(str(e)) if task.link_type == 'chauthanh' else
+                      str(e)[:600] if task.link_type == 'pikpak' else str(e)[:100])
     if task.status == 'failed':
         with print_lock:
             print(f"   ❌ {task.filename[:60]}: {task.error or 'Download failed'}")
@@ -8146,6 +9362,8 @@ def url_matches_host(url: str, hosts) -> bool:
 
 def _classify_url(url: str, has_debrid: bool) -> str:
     """Map a URL to a resolver kind (mirrors the historical routing order)."""
+    if url_matches_host(url, ('chauthanh.info',)):
+        return 'chauthanh'
     if url.startswith('pikpak://') or _url_host(url) in ('mypikpak.com', 'www.mypikpak.com'):
         return 'pikpak'
     if url_matches_host(url, ('transfer.it',)):
@@ -8310,6 +9528,11 @@ def resolve_all_links(urls: List[str], session: requests.Session, tokens: dict, 
                     ))
             elif kind == 'pikpak':
                 parallel_tasks.extend(resolve_pikpak(url))
+            elif kind == 'chauthanh':
+                try:
+                    parallel_tasks.extend(resolve_chauthanh(url))
+                except ValueError as exc:
+                    print('   ❌ ' + _redact_transfer_error(str(exc)))
             elif kind == 'fshare':
                 # FShare file or folder links - resolve with VIP account
                 fshare_email = token_fshare_email.value.strip()
@@ -9470,6 +10693,8 @@ btn_queue_cancel.on_click(queue_cancel)
 btn_queue_sort.on_click(queue_sort_alpha)
 btn_tmdb_match.on_click(apply_tmdb_override)
 btn_tmdb_clear.on_click(clear_tmdb_override)
+btn_episode_orders.on_click(load_episode_orders)
+btn_episode_order_apply.on_click(apply_episode_order)
 btn_queue_apply_changes.on_click(apply_queue_changes)
 btn_season_apply.on_click(apply_season_override)
 btn_season_clear.on_click(clear_season_override)
@@ -9515,5 +10740,6 @@ def early_mount_drive():
     check_resume_available()
 
 # Display UI first (so it shows even if mount hangs), then mount drive
+_chauthanh_enable_widgets()
 display(input_ui)
 early_mount_drive()

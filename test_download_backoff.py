@@ -57,10 +57,10 @@ class DownloadBackoffTests(unittest.TestCase):
             self.path.write_bytes(b'complete')
         return SimpleNamespace(stdout=lines, returncode=code, wait=lambda: None)
 
-    def run_download(self, refresh=None, url='https://test.tb-cdn.io/video'):
+    def run_download(self, refresh=None, url='https://test.tb-cdn.io/video', source=''):
         return self.ns['download_with_aria2'](
             url, self.path.name, self.temp.name,
-            task_id='task', url_refresh=refresh)
+            task_id='task', url_refresh=refresh, source=source)
 
     def test_stalled_retries_are_capped_and_use_one_connection(self):
         self.outputs = [(['status=429'], 1)] * 4 + [([], 0)]
@@ -70,6 +70,15 @@ class DownloadBackoffTests(unittest.TestCase):
             self.assertEqual(cmd[cmd.index('-x') + 1], '1')
             self.assertEqual(cmd[cmd.index('-s') + 1], '1')
             self.assertIn('-c', cmd)
+
+    def test_chauthanh_donor_transfer_uses_five_connections_and_resume(self):
+        self.outputs = [([], 0)]
+        self.assertEqual(self.run_download(url='https://eri2.chauthanh.info/file',
+                                           source='chauthanh'), str(self.path))
+        cmd = self.calls[0]
+        self.assertEqual(cmd[cmd.index('-x') + 1], '5')
+        self.assertEqual(cmd[cmd.index('-s') + 1], '5')
+        self.assertIn('-c', cmd)
 
     def test_progress_at_99_percent_resets_throttle_budget(self):
         self.outputs = [(['[#abcdef 990MiB/1GiB(99%)]', 'status=429'], 1)]
@@ -113,11 +122,109 @@ class DownloadBackoffTests(unittest.TestCase):
         self.assertEqual(self.run_download(refresh, 'http://dl-z01.mypikpak.com/file'), str(self.path))
         self.assertEqual(self.waits, [0, 15, 30])
         self.assertEqual(refresh_times, [15, 30])
-        self.assertEqual([cmd[cmd.index('-x') + 1] for cmd in self.calls], ['16', '4', '1'])
-        self.assertEqual([cmd[cmd.index('-s') + 1] for cmd in self.calls], ['16', '4', '1'])
+        self.assertEqual([cmd[cmd.index('-x') + 1] for cmd in self.calls], ['4', '1', '1'])
+        self.assertEqual([cmd[cmd.index('-s') + 1] for cmd in self.calls], ['4', '1', '1'])
         self.assertTrue(all('-c' in cmd for cmd in self.calls))
         self.assertEqual(self.calls[-1][1], 'http://dl-z01.mypikpak.com/fresh')
         self.assertNotIn('error', self.ns['download_stats']['task'])
+
+    def test_pikpak_eof_waits_before_refresh_and_resumes_with_one_connection(self):
+        self.path.write_bytes(b'partial')
+        control = Path(str(self.path) + '.aria2')
+        control.write_bytes(b'resume metadata')
+        self.outputs = [(['errorCode=1 Got EOF from the server.'], 1)] * 2 + [([], 0)]
+        refresh_times = []
+
+        def refresh():
+            refresh_times.append(self.sleep_count)
+            self.assertEqual(self.path.read_bytes(), b'partial')
+            self.assertEqual(control.read_bytes(), b'resume metadata')
+            self.assertNotIn('retry_reason', self.ns['download_stats']['task'])
+            return f'http://dl-z01.mypikpak.com/fresh-{len(refresh_times)}'
+
+        self.assertEqual(self.run_download(refresh, 'http://dl-z01.mypikpak.com/file'), str(self.path))
+        self.assertEqual(self.waits, [0, 15, 30])
+        self.assertEqual(refresh_times, [15, 30])
+        self.assertEqual([cmd[cmd.index('-x') + 1] for cmd in self.calls], ['4', '1', '1'])
+        self.assertEqual([cmd[cmd.index('-s') + 1] for cmd in self.calls], ['4', '1', '1'])
+        self.assertTrue(all('-c' in cmd and '--retry-wait=5' in cmd for cmd in self.calls))
+        self.assertEqual(self.calls[-1][1], 'http://dl-z01.mypikpak.com/fresh-2')
+        self.assertNotIn('error', self.ns['download_stats']['task'])
+
+    def test_pikpak_source_uses_recovery_on_an_alternate_cdn(self):
+        self.outputs = [(['errorCode=1 Got EOF from the server.'], 1), ([], 0)]
+        self.assertEqual(self.run_download(url='https://cdn.example.test/file', source='pikpak'), str(self.path))
+        self.assertEqual(self.waits, [0, 15])
+        self.assertEqual([cmd[cmd.index('-x') + 1] for cmd in self.calls], ['4', '1'])
+
+    def test_pikpak_eof_budget_is_bounded_even_with_progress_and_later_errors(self):
+        self.outputs = [([f'[#abcdef {size}MiB/1GiB(99%)]',
+                          'errorCode=1 Got EOF from the server. https://cdn.test/?secret=hidden',
+                          'errorCode=22 download aborted'], 1) for size in range(990, 994)]
+        self.assertIsNone(self.run_download(url='http://dl-z01.mypikpak.com/file'))
+        self.assertEqual(len(self.calls), 4)
+        self.assertEqual(self.waits, [0, 15, 30, 60])
+        error = self.ns['download_stats']['task']['error']
+        self.assertIn('Got EOF from the server', error)
+        self.assertIn('4 attempt(s)', error)
+        self.assertNotIn('secret=', error)
+        self.assertNotIn('secret=', str(self.ns['print'].call_args_list))
+
+    def test_pikpak_eof_and_503_share_one_recovery_budget(self):
+        self.outputs = [(['status=503'], 1), (['errorCode=1 Got EOF from the server.'], 1)] * 2
+        refresh = Mock(return_value='http://dl-z01.mypikpak.com/fresh')
+        self.assertIsNone(self.run_download(refresh, 'http://dl-z01.mypikpak.com/file'))
+        self.assertEqual(len(self.calls), 4)
+        self.assertEqual(self.waits, [0, 15, 30, 60])
+        self.assertEqual(refresh.call_count, 3)
+
+    def test_pikpak_eof_cancellation_preserves_partial_without_refresh(self):
+        self.path.write_bytes(b'partial')
+        control = Path(str(self.path) + '.aria2')
+        control.write_bytes(b'resume metadata')
+        self.outputs = [(['errorCode=1 Got EOF from the server.'], 1)]
+        refresh = Mock()
+
+        def cancel(_seconds):
+            stats = self.ns['download_stats']['task']
+            self.assertIn('EOF', stats['retry_reason'])
+            self.assertEqual(stats['retry_until'], 115)
+            self.ns['_cancel_requested'] = True
+
+        self.ns['time'].sleep = cancel
+        self.assertIsNone(self.run_download(refresh, 'http://dl-z01.mypikpak.com/file'))
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.path.read_bytes(), b'partial')
+        self.assertEqual(control.read_bytes(), b'resume metadata')
+        refresh.assert_not_called()
+        self.assertNotIn('error', self.ns['download_stats']['task'])
+
+    def test_other_host_eof_keeps_its_normal_retry_policy(self):
+        self.outputs = [(['errorCode=1 Got EOF from the server.'], 1)] * 3
+        self.assertIsNone(self.run_download(url='https://cdn.example.test/file'))
+        self.assertEqual(self.waits, [0, 2, 4])
+        self.assertEqual([cmd[cmd.index('-x') + 1] for cmd in self.calls], ['16'] * 3)
+
+    def test_generic_error_code_one_does_not_trigger_eof_recovery(self):
+        self.outputs = [(['errorCode=1 Unknown error occurred.'], 1)] * 3
+        self.assertIsNone(self.run_download(url='http://dl-z01.mypikpak.com/file'))
+        self.assertEqual(self.waits, [0, 2, 4])
+        self.assertIn('Unknown error', self.ns['download_stats']['task']['error'])
+
+    def test_pikpak_403_takes_precedence_over_eof_from_other_connections(self):
+        self.outputs = [(['errorCode=1 Got EOF from the server.', 'status=403'], 1)] * 3
+        refresh = Mock(return_value='http://dl-z01.mypikpak.com/fresh')
+        self.assertIsNone(self.run_download(refresh, 'http://dl-z01.mypikpak.com/file'))
+        self.assertEqual(self.waits, [0, 2, 4])
+        self.assertEqual(refresh.call_count, 2)
+        self.assertIn('HTTP 403', self.ns['download_stats']['task']['error'])
+
+    def test_pikpak_429_takes_precedence_over_eof_and_does_not_refresh(self):
+        self.outputs = [(['status=429', 'errorCode=1 Got EOF from the server.'], 1), ([], 0)]
+        refresh = Mock()
+        self.assertEqual(self.run_download(refresh, 'http://dl-z01.mypikpak.com/file'), str(self.path))
+        self.assertEqual(self.waits, [0, 5])
+        refresh.assert_not_called()
 
     def test_permanent_503_terminates_with_status_and_redacted_details(self):
         self.outputs = [(['status=503', 'errorCode=29 server unavailable https://cdn.test/file?secret=hidden'], 1)] * 4

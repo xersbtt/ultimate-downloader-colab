@@ -302,6 +302,7 @@ class PikPakTests(unittest.TestCase):
             self.assertEqual(url, 'https://cdn.test/first')
             self.assertEqual(name, 'Show.S01E01.mkv')
             self.assertIsNone(cookie)
+            self.assertEqual(kwargs['source'], 'pikpak')
             refreshes.append(kwargs['url_refresh']())
             return '/content/video.mkv'
         self.ns['download_with_aria2'] = download

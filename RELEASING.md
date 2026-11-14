@@ -1,69 +1,53 @@
 # Releasing Ultimate Downloader
 
-The current release target is **v7.1 — PikPak & Live Download Reliability**. The Drive renamer is an experimental standalone tool included alongside the downloader. This checklist prepares the release; pushing and publishing are separate steps. The v7.1 section of [CHANGELOG.md](CHANGELOG.md#v71) is the release body.
+The release title is **v7.2 - Châu Thành Donor Downloads & Episode Orders**. Use the [v7.2 changelog section](CHANGELOG.md#v72) as the GitHub release body.
 
 ## Prepare and verify
 
-1. Check the README, changelog, app heading, About dialog and saved-session version all describe v7.1.
-2. Keep the previous release's script in `archive/ultimate_downloader_v7.0.py`, copied from the `v7.0` tag. Include the experimental standalone renamer and all maintained regression tests in the release commit, and preserve its experimental label in the documentation.
-3. Run the local checks below from the repository root. Use Python 3.10 or later and Node.js for the queue interaction check. Local test dependencies are `anywidget`, `ipywidgets`, `requests` and `yt-dlp`; Colab installs runtime tools when needed.
+Check that the README, app heading, About dialog, and saved-session metadata show v7.2. The archive snapshot must match the downloader from the v7.1 tag. Use Python 3.10 or later and Node.js for the queue interaction checks.
 
 ```powershell
 python -m pip install anywidget ipywidgets requests yt-dlp
-python -m py_compile ultimate_downloader.py rename_existing_files.py
-python -m unittest test_tmdb_anime_classification test_queue_editing test_queue_additions_torbox test_queue_table test_progress_panel test_live_queue test_pikpak test_download_backoff test_rename_existing_files test_drive_settings test_okru
+python -m py_compile ultimate_downloader.py
+python -X utf8 -m unittest test_tmdb_anime_classification test_tmdb_episode_orders test_queue_editing test_queue_additions_torbox test_queue_table test_progress_panel test_live_queue test_pikpak test_download_backoff test_chauthanh test_torbox_jit test_drive_cancellation test_drive_settings test_okru
 git diff --check -- . ':(exclude)archive/**'
+git hash-object archive/ultimate_downloader_v7.1.py
+git rev-parse v7.1:ultimate_downloader.py
 ```
 
-The named modules run regression checks without live service credentials. Avoid blanket test discovery: other local `test_*.py` files include exploratory checks and are intentionally ignored. Review skipped tests; missing `anywidget`, Node.js or `yt-dlp` reduces coverage.
-
-Archived scripts preserve the original released source, including historical whitespace. Exclude `archive/` from whitespace checks and verify each new snapshot against its release tag.
+Compare the two hashes. The archive keeps the original released source, including its historical whitespace. Run the named test modules so local exploratory files stay outside the release checks.
 
 ## Colab smoke test
 
-Use the prepared scripts in a fresh Colab notebook before publishing. Local tests use mocks and do not verify live provider responses, Google consent or Drive transfers.
+Use the candidate script in a fresh Colab notebook. The automated tests exercise local logic with mocked provider responses.
 
-- Confirm the heading and About dialog show v7.1 and saved Drive API preferences survive a runtime restart. Start a reviewed batch with API uploads enabled and check Google consent and the final Drive file.
-- Resolve a small direct-link batch, add another link while it runs, stop it, then Resume. Check completed files are retained and the final toolbar and Retry Failed control recover correctly.
-- Resolve a small PikPak share with a token from Secrets, select one file and confirm only that file is saved and transferred. Check an owned file and a nested folder; retry or resume an interrupted transfer.
-- Download a short YouTube video with a queue naming edit and subtitles. Check per-video progress, the final video name and matching subtitle names. Check an OK.ru link if available.
+- Check the v7.2 heading and About dialog. Run a small direct-link batch with Drive API uploads enabled, add a link during the batch, and use Stop, Resume and Retry Failed. Check final Drive files and settings after restarting the runtime.
+- Use a Châu Thành supporter session through **Settings → PC session → Use PC login** or Colab Secret `CHAUTHANH_PHPSESSID`. Try three eligible donor files with **Parallel DLs** set to at least three, interrupt and resume a transfer, and confirm file size and completion in Drive. Check that an expired session prompts for a fresh PC value. A previous live batch completed using the earlier two-file allocation. The three-file configuration and live runtime-browser login still need testing.
+- Apply an alternate TMDB episode order to selected absolute-numbered files and matching subtitles. Check the queue preview, explicit season markers, an omitted episode, and the saved order after Resume.
+- Check a small PikPak share and a TorBox WebDL link with configured accounts. Verify that the selected PikPak file reaches Drive and TorBox recognises the completed fetch. Try a short YouTube video with subtitles and a naming edit.
 
-Check the experimental renamer separately in its own notebook: preview a small test folder containing a video and subtitle, verify destinations, move selected files, and try both numbering conversions with a known TMDB match. Record its limitations separately from the downloader smoke test.
+## Publish
 
-## Commit, push and publish
-
-After the checks pass, review the changes and commit the intended release files. The explicit list includes the previously ignored Drive settings and OK.ru regression tests.
-
-```powershell
-git status --short
-git diff --stat
-git add .gitignore README.md CHANGELOG.md RELEASING.md ultimate_downloader.py rename_existing_files.py archive/ultimate_downloader_v7.0.py test_tmdb_anime_classification.py test_queue_editing.py test_queue_additions_torbox.py test_queue_table.py test_progress_panel.py test_live_queue.py test_pikpak.py test_download_backoff.py test_rename_existing_files.py test_drive_settings.py test_okru.py
-git diff --cached --check -- . ':(exclude)archive/**'
-git diff --cached --stat
-git commit -m "v7.1: PikPak and live download reliability"
-```
-
-Before pushing, fetch the remote and check for divergence. If `origin/main` has new commits, integrate them and rerun affected checks. Ensure `v7.1` does not already exist locally or remotely.
+Run these steps from the reviewed v7.2 candidate after confirming that it can fast-forward the remote main branch. Check that the remote tag query returns no v7.2 tag before pushing.
 
 ```powershell
 git fetch origin --tags
 git log --oneline --left-right HEAD...origin/main
-git tag --list v7.1
-git ls-remote --tags origin refs/tags/v7.1
-git push origin main
-git tag -a v7.1 -m "v7.1: PikPak and live download reliability"
-git push origin v7.1
+git ls-remote --tags origin refs/tags/v7.2
+git push origin HEAD:main
+git tag -a v7.2 -m "v7.2: Châu Thành donor downloads and episode orders"
+git push origin refs/tags/v7.2
 ```
 
-Run the push commands from `main` after resolving any divergence. Create the GitHub release with the exact changelog section; the temporary body file preserves its formatting.
+Create the release from the tagged commit using the exact changelog text.
 
 ```powershell
-$changelog = Get-Content -LiteralPath CHANGELOG.md -Raw
-$notes = [regex]::Match($changelog, '(?ms)^## v7\.1\r?\n(.*?)^---\s*$').Groups[1].Value.Trim()
-if (-not $notes) { throw 'v7.1 release notes were not found' }
-$releaseBodyPath = Join-Path ([System.IO.Path]::GetTempPath()) 'ultimate-downloader-v7.1-release.md'
+$changelog = Get-Content -LiteralPath CHANGELOG.md -Raw -Encoding UTF8
+$notes = [regex]::Match($changelog, '(?ms)^## v7\.2\r?\n(.*?)^---[ \t]*\r?$').Groups[1].Value.Trim()
+if (-not $notes) { throw 'v7.2 release notes were not found' }
+$releaseBodyPath = Join-Path ([System.IO.Path]::GetTempPath()) 'ultimate-downloader-v7.2-release.md'
 [System.IO.File]::WriteAllText($releaseBodyPath, $notes, [System.Text.UTF8Encoding]::new($false))
-gh release create v7.1 --verify-tag --title "v7.1 - PikPak & Live Download Reliability" --notes-file $releaseBodyPath
+gh release create v7.2 --verify-tag --title "v7.2 - Châu Thành Donor Downloads & Episode Orders" --notes-file $releaseBodyPath
 ```
 
-Finally, verify the [GitHub release](https://github.com/xersbtt/ultimate-downloader-colab/releases), its tag, and both scripts at the tag. The README's `main` commands follow the latest source; replace `main` with `v7.1` to use the published release.
+Verify the [GitHub release](https://github.com/xersbtt/ultimate-downloader-colab/releases) and the downloader script at the tag. Replace `main` with `v7.2` in the README launcher to run the tagged script.

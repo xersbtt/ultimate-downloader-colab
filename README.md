@@ -2,19 +2,15 @@
 
 # Ultimate Downloader
 
-Download videos and files in Google Colab, save them to Google Drive, and organise shows and movies for Plex. It supports Gofile, Pixeldrain, Mega, YouTube, TorBox, Real-Debrid, PikPak, and many other sources.
+Download videos and files in Google Colab, save them to Google Drive, and organise shows and movies for Plex. It supports Gofile, Pixeldrain, Mega, YouTube, TorBox, Real-Debrid, PikPak, Châu Thành donor links, and many other sources.
 
-**Current version: v7.1.** PikPak support and more reliable live downloads. See the [v7.1 release notes](CHANGELOG.md#v71).
+**Version 7.2** adds experimental Châu Thành donor downloads, alternate episode orders, and transfer fixes for PikPak and TorBox. See the [v7.2 release notes](CHANGELOG.md#v72).
 
-## What's new in v7.1
+## What's new in v7.2
 
-- **PikPak downloads:** browse shares and account folders, select files, and resume with fresh download links.
-- **Live Resume and Retry:** add links and stop downloads during resumed batches and automatic retries.
-- **YouTube progress and naming:** follow each video's progress and apply queue edits to videos and subtitles.
-- **More reliable transfers:** recover from temporary server errors, keep partial files, and see readable failure details.
-- **Compatibility and settings fixes:** restore completion controls, support older OK.ru extractors, and preserve the saved Drive API upload choice.
-
-An [experimental standalone Drive renaming tool](#rename-files-already-in-drive) is also available for existing libraries.
+- **Châu Thành donor downloads** reuse your PC supporter session in Colab and support up to three simultaneous `eri2` files with five connections each.
+- **Alternate TMDB episode orders** map absolute-numbered downloads to a chosen season split and show the resulting paths in the queue.
+- **Transfer fixes** keep PikPak recovery active on alternate CDN hosts and correct TorBox WebDL submission and polling.
 
 ## Get started
 
@@ -46,6 +42,7 @@ Open **⚙️ Settings** to enter tokens, or save them in Colab's **Secrets** pa
 | PikPak | `PIKPAK_TOKEN` | PikPak shares and files in your own PikPak account |
 | TMDB | `TMDB_API_KEY` | Better names, years, anime routing, and season matching |
 | FShare | `FSHARE_EMAIL` and `FSHARE_PASSWORD` | FShare VIP links |
+| Châu Thành | `CHAUTHANH_PHPSESSID` | Reuse your PC supporter login without installing a Colab browser |
 
 Choose **Real-Debrid**, **TorBox**, or **None** with the **Debrid** selector. You can use YouTube, Mega, Gofile, Pixeldrain, and other public sources without a debrid subscription.
 
@@ -56,11 +53,28 @@ Choose **Real-Debrid**, **TorBox**, or **None** with the **Debrid** selector. Yo
 3. Paste a `https://mypikpak.com/s/...` share link into **Links**, then click **Resolve Links**. Nested folder links browse that folder; root share links include all its folders. Review the queue before starting a large share.
 4. Select the files you want and click **Start Download**. Only selected shared files are saved to your PikPak account, and existing Google Drive files are skipped before saving. The downloaded originals use the same organisation and Drive transfer settings as other sources.
 
-Files you already own are reused without creating another account copy. After temporary server errors, PikPak transfers use fewer connections and request fresh links. Failed files show a readable reason, with tokens and signed URLs hidden.
+Files you already own are reused without creating another account copy. PikPak transfers start with up to four connections per file. If the server closes the connection early (`Got EOF from the server`) or returns a temporary server error, the downloader waits 15, 30, then 60 seconds, requests a fresh link, and resumes the partial file with one connection. These errors share a limit of three recovery waits per file. Failed files show a readable reason, with tokens and signed URLs hidden.
 
 The official PikPak client installs automatically in the Colab runtime on first use. This integration works independently of the **Debrid** selector. It also accepts `pikpak://folder/FOLDER_ID`, `pikpak://file/FILE_ID`, and PikPak `drive/all` URLs with a `parent_id`. For a protected share, append `?pass_code=CODE` to its link (URL-encode the code if it contains special characters).
 
 **Resume Previous Session** and **Retry Failed** reuse saved PikPak file IDs and pending save references, and request fresh download links. If PikPak is still saving a selected file, retry shortly. Saved copies stay in your PikPak account; remove them there when you no longer need them. Account storage and transfer limits apply; check [PikPak's current connected-app limits](https://mypikpak.com/en-US/connect-apps-faq).
+
+### Châu Thành donor downloads
+
+**Experimental.** A Colab download-to-Drive batch completed using a PC supporter session with the earlier two-file allocation. This route runs without a browser in Colab.
+
+1. Sign into your supporter account normally in your PC browser.
+2. In developer tools (F12), open **Application → Cookies → chauthanh.info** in Chrome/Edge, or **Storage → Cookies → chauthanh.info** in Firefox/Mullvad. Copy the **Value** of `PHPSESSID`.
+3. In **Settings → Châu Thành donor account → PC session**, paste that value and click **Use PC login**. Alternatively, use Colab Secret `CHAUTHANH_PHPSESSID`. No username/password is needed for this route.
+4. Paste donor file links into **Links**, click **Resolve Links**, then **Start Download**. The Debrid selector does not affect this source.
+
+The value is a login credential: enter it only into the masked field or your private Colab Secret. The downloader shares one in-memory session across workers and rechecks supporter permission after five minutes or a donor refusal. It does not save the value or cookies in Drive settings, history or queues. When the session is no longer accepted, copy the current value from your signed-in PC browser. This route does not fall back to password submission. A new login elsewhere can replace the active session under the site's [single-login rule](https://chauthanh.info/compare.html).
+
+Accepted links contain `/download/eri2/`, or point directly to `eri2.chauthanh.info`, including the observed `download.php?id=…&file=…&name=…` redirect. If the site offers **Queue all**, copy its generated donor file links into the same field. Show-page browsing, other `eri` servers and free downloads remain unsupported.
+
+Up to three donor files at once use five connections each (15 total), within the site's [stated 16 download threads](https://chauthanh.info/compare.html). Workers check for Drive duplicates first, verify supporter permission, repeat the site's normal `/ip` status request, then check file access without account cookies as aria2 will download. Only the file range establishes download permission. The check recognises IP allow-list refusals even with HTTP 200. Completed files must match the verified expected size before Drive processing. Retry and Resume reuse the runtime session and original donor link. An expired signed link still requires a fresh link; signed input links remain in the saved queue for Resume and should be kept private.
+
+**Other login options** in Settings retains the fresh HTTP login and optional runtime browser. The fresh HTTP test returned “Confirmation code is not correct!” The browser path lets you complete verification on the runtime and still needs a successful live login test.
 
 ## Use the queue
 
@@ -86,6 +100,10 @@ YouTube queue edits apply to duplicate checks and the final video and subtitle d
 
 With a TMDB key, the downloader can find official names and years, match anime to the anime folders, and place high-numbered anime episodes in the right season. A manual **Route as** choice takes priority.
 
+To use an alternate TMDB season split, select the files for one matched show in the queue, click **Load episode orders**, choose **Episode order** (for example **TVDB Order**, **Season Split**, or a streaming service's order), then click **Apply Order**. This enables **Season match** and updates the selected files' destination previews. The choice is saved for Start, Retry, and Resume. Select **Original Air Date (standard)** and apply it to restore the default. Explicit `SxxEyy`/`NxN` filenames and manual Season/Episode overrides keep their numbering.
+
+Absolute numbers refer to the standard aired episodes, excluding Specials. Alternate orders use the actual episode positions, so omitted filler does not shift later episodes. Files absent from the chosen order, or ranges that become split or nonconsecutive, show **Review needed** and fail organisation until corrected.
+
 ## Where files go
 
 With **Auto-organise** on, TV episodes go to `My Drive/TV Shows`, movies to `My Drive/Movies`, and recognised anime to `My Drive/Anime Series` or `My Drive/Anime Movies`. YouTube videos without an episode pattern go to `My Drive/YouTube`. Turn Auto-organise off to keep original filenames in `My Drive/Downloads`.
@@ -93,22 +111,6 @@ With **Auto-organise** on, TV episodes go to `My Drive/TV Shows`, movies to `My 
 You can change these folders in **⚙️ Settings**. Existing subtitles are kept with their videos. You can also extract text subtitles from videos after download or scan an existing Drive folder with **Extract from Library**.
 
 RAR, ZIP, and 7Z archives are unpacked automatically. Files already downloaded are skipped when possible.
-
-### Rename files already in Drive
-
-**Experimental standalone tool.** The [renaming script](rename_existing_files.py) runs in its own Colab notebook and is not integrated into the downloader. It mounts the same Drive, reads the download folder settings from `My Drive/Ultimate Downloader/settings.json`, and uses `TMDB_API_KEY` from Colab Secrets. Try it on a small test folder and review every preview before moving files. In a new Colab notebook, run:
-
-```python
-import requests; exec(requests.get("https://raw.githubusercontent.com/xersbtt/ultimate-downloader-colab/main/rename_existing_files.py").text)
-```
-
-Click **Browse Drive**, choose a folder with **Use this folder**, then choose **Downloader style**, **Season to absolute**, or **Absolute to season** and click **Preview files**. **Include subfolders** is on by default. Check the old and new paths, select the files you want, then click **Move selected files**. You can force a name, year, library route, or TMDB match (`tv:12345` or `movie:12345`) for a preview; use one show or movie folder at a time when forcing a match.
-
-**Downloader style** organises TV episodes and movies into your configured libraries, with TMDB names, years, and anime routing when a key is available. Filename-only organisation also works without a key. The script handles episode ranges and Specials, keeps matching subtitle sidecars with their videos, and preserves subtitle language, forced, and SDH tags. Files without an identifiable title and subtitles without a matching video are skipped. Existing destinations and conflicting preview rows are skipped; files changed since the preview must be reviewed again before moving.
-
-**Season to absolute** converts `S02E03` to `S01E15` when TMDB says season 1 has 12 episodes, and moves the result into `Season 01`, matching the downloader's Absolute convention. It needs TMDB counts for every preceding season. If those counts are missing or the episode exceeds the reported season count, the file is skipped for review.
-
-**Absolute to season** reverses that conversion: `S01E15` or a bare `15` becomes `S02E03` in `Season 02` using TMDB season counts. It skips files when the TMDB match or counts are missing, the number exceeds the known episode total, or a multi-episode file crosses a season boundary.
 
 ### Download and Drive settings
 
@@ -131,6 +133,7 @@ The downloader pauses new downloads when Colab's temporary disk runs low. If lar
 - **Debrid links:** Real-Debrid and TorBox support magnet files and many premium file hosts. TorBox share links and JDownloader folder links are supported.
 - **FShare:** File and folder links with a VIP account. This integration is experimental and may need updates when FShare changes its site. Resolving a single file uses your daily quota; browsing a folder does not.
 - **PikPak:** Public shares, nested shared folders, and files or folders in your own account, using a Personal Access Token. Premium is recommended for large batches; free-account storage and transfer restrictions still apply.
+- **Châu Thành:** Reuse a PC supporter session through `PHPSESSID`, with no Colab browser installation; `eri2` donor links, three files and five connections per file. Cross-IP session reuse and small cookie-free file ranges passed a private Colab test. The user confirmed a complete download-to-Drive batch with the earlier two-file allocation. Show-page browsing is not implemented; the new three-file allocation and interrupted resume still need live verification.
 
 For YouTube playlists, you can choose a range such as `1,3,5-10` and select subtitle languages in the queue. YouTube cookies for Premium or members-only videos can be uploaded in **⚙️ Settings**; this option is experimental.
 

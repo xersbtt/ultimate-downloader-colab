@@ -2,6 +2,27 @@
 
 All notable changes to Ultimate Downloader are documented here.
 
+## v7.2
+
+### Downloads
+
+- **Châu Thành donor links (experimental).** Reuse a signed-in PC supporter session from the masked **PC session** field or Colab Secret `CHAUTHANH_PHPSESSID`. The downloader keeps the shared session in memory, rechecks supporter access, and accepts updated cookies. It handles `eri2` links and donor redirects, reads bounded file ranges without cookies, and checks the completed size before transferring to Drive.
+- **Parallel Châu Thành transfers.** Download up to three donor files at once, with up to five connections each. Lower **Parallel DLs** settings still apply. IP allow-list refusals are recognised even with HTTP 200, and an expired PC session prompts for a current value. The optional HTTP login and runtime-browser diagnostics are under **Other login options**.
+- **TorBox WebDL fixes.** Submit links as multipart form data, recognise downloaded tasks and completion flags, and match numeric polling IDs to saved string IDs. Redact token values from download-link errors.
+- **PikPak recovery on alternate CDN hosts.** Identify PikPak by the download source and apply the three-wait recovery budget to early disconnects and temporary server errors. Refresh links and continue partial downloads with one connection.
+
+### Episode orders
+
+- **TMDB episode orders in the queue.** Apply a show's alternate season split to selected absolute-numbered files and see the resulting paths before downloading. The order persists through Start, Retry and Resume. Explicit season numbers and manual edits take precedence. Omitted episodes and ranges that split in the chosen order are flagged for review.
+
+### Verification
+
+- All 323 downloader regression tests passed locally.
+- A Colab download-to-Drive batch was reported complete through Châu Thành's PC-session route with the earlier two-file allocation. Live testing remains for the three-file allocation, interrupted resume, and runtime-browser login.
+- See [the release checklist](RELEASING.md) for local checks and the Colab smoke test.
+
+---
+
 ## v7.1
 **Theme: PikPak & Live Download Reliability**
 
@@ -15,6 +36,7 @@ All notable changes to Ultimate Downloader are documented here.
 - **Live Resume and Retry:** Add Links and Stop Download remain available during resumed batches and automatic retries. Completed files, partial downloads and saved account file IDs are retained; automatic retries stay in the same live batch and use the configured retry budget.
 - **Individual YouTube progress:** queue items show percentage, speed, preparation, video processing and Drive transfer states in both Colab's live display and the standard progress panel, including videos added during a running batch.
 - **Download-server recovery:** temporary HTTP 500/502/503/504 errors use bounded 15/30/60-second waits with a visible countdown and partial-file continuation. PikPak reduces connections and refreshes download links after waiting; both HTTP and HTTPS original-file links are accepted.
+- **PikPak connection drops:** `Got EOF from the server` uses the same bounded recovery waits as temporary HTTP errors, with fresh links and partial-file continuation. PikPak starts with up to four connections per file and falls back to one after either error, including on alternate CDN hosts. Explicit HTTP failures retain their own retry rules.
 - **Readable failures:** live status and completion logs retain service error codes, redacted details and actual attempt counts, including failures during preparation. Tokens and signed URLs are hidden.
 
 ### Bug fixes

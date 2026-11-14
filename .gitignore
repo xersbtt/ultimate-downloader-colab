@@ -75,7 +75,10 @@ test_*.py
 !test_live_queue.py
 !test_pikpak.py
 !test_download_backoff.py
-!test_rename_existing_files.py
+!test_chauthanh.py
+!test_drive_cancellation.py
+!test_tmdb_episode_orders.py
+!test_torbox_jit.py
 !test_drive_settings.py
 !test_okru.py
 test_*.txt
