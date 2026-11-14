@@ -4,7 +4,7 @@ The release title is **v7.2 - Châu Thành Donor Downloads & Episode Orders**. U
 
 ## Prepare and verify
 
-Check that the README, app heading, About dialog, and saved-session metadata show v7.2. The archive snapshot must match the downloader from the v7.1 tag. Use Python 3.10 or later and Node.js for the queue interaction checks.
+Check that the README and `APP_VERSION` in `ultimate_downloader.py` agree. The app heading, About dialog, and saved-session metadata all read that version. The archive snapshot must match the downloader from the v7.1 tag. Use Python 3.10 or later and Node.js for the queue interaction checks.
 
 ```powershell
 python -m pip install anywidget ipywidgets requests yt-dlp

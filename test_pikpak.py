@@ -32,7 +32,7 @@ def load_subject():
              (node.name in names or node.name.startswith('_pikpak') or node.name == 'resolve_pikpak')
              or isinstance(node, ast.Assign) and any(
                  isinstance(t, ast.Name) and (t.id.startswith('PIKPAK_') or t.id in
-                 {'_TASK_FIELDS', '_pikpak_install_lock', '_pikpak_command_lock',
+                 {'APP_VERSION', '_TASK_FIELDS', '_pikpak_install_lock', '_pikpak_command_lock',
                   'STREAMING_HOSTS', 'DEBRID_SUPPORTED_HOSTS'})
                  for t in node.targets)]
     ns = dict(os=os, re=re, json=json, hashlib=hashlib, platform=platform,
@@ -284,6 +284,7 @@ class PikPakTests(unittest.TestCase):
             self.ns['save_session']([task])
             saved = Path(directory, 'session.json').read_text()
         self.assertNotIn('private-test-token', saved)
+        self.assertEqual(json.loads(saved)['version'], self.ns['APP_VERSION'])
         self.assertIn('saved', saved)
 
     def test_queue_identity_does_not_change_on_refresh_or_contextual_filename_edits(self):

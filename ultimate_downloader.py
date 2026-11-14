@@ -23,6 +23,9 @@ from uuid import uuid4
 import ipywidgets as widgets
 from IPython.display import display, clear_output, HTML, JSON
 from urllib.parse import urlparse, urljoin, unquote, parse_qs, quote
+
+APP_VERSION = "7.2"
+
 try:
     from google.colab import drive
 except ImportError:
@@ -878,10 +881,10 @@ settings_ui = widgets.VBox([
 # --- ABOUT UI ---
 btn_about_close = widgets.Button(description="Close", button_style='', layout=widgets.Layout(width='80px'))
 about_ui = widgets.VBox([
-    widgets.HTML("""
+    widgets.HTML(f"""
         <div style='padding: 10px;'>
             <h3>ℹ️ About Ultimate Downloader</h3>
-            <p><strong>Version:</strong> 7.2</p>
+            <p><strong>Version:</strong> {APP_VERSION}</p>
             <p><strong>Author:</strong> xersbtt</p>
             <p><strong>Repository:</strong> <a href='https://github.com/xersbtt/ultimate-downloader-colab' target='_blank'>github.com/xersbtt/ultimate-downloader-colab</a></p>
             <hr>
@@ -1602,7 +1605,7 @@ queue_ui = widgets.VBox([
 
 
 input_ui = widgets.VBox([
-    widgets.HTML("<h3>🚀 Ultimate Downloader v7.2</h3>"),
+    widgets.HTML(f"<h3>🚀 Ultimate Downloader v{APP_VERSION}</h3>"),
     widgets.HBox([auto_organize_checkbox, debrid_service_toggle]),
     widgets.HBox([concurrent_slider, auto_retry_input]),
     links_row,
@@ -1662,7 +1665,7 @@ def save_session(
     try:
         with _session_save_lock:
             session = {
-                "version": "7.2",
+                "version": APP_VERSION,
                 "started_at": datetime.now().isoformat(),
                 "playlist_range": playlist_range,
                 "yt_success": yt_success,

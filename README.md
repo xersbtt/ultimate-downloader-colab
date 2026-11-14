@@ -4,7 +4,7 @@
 
 Download videos and files in Google Colab, save them to Google Drive, and organise shows and movies for Plex. It supports Gofile, Pixeldrain, Mega, YouTube, TorBox, Real-Debrid, PikPak, Châu Thành donor links, and many other sources.
 
-**Version 7.2** adds experimental Châu Thành donor downloads, alternate episode orders, and transfer fixes for PikPak and TorBox. See the [v7.2 release notes](CHANGELOG.md#v72).
+**Current version on `main` is v7.2.** It adds experimental Châu Thành donor downloads, alternate episode orders, and transfer fixes for PikPak and TorBox. See the [v7.2 release notes](CHANGELOG.md#v72).
 
 ## What's new in v7.2
 
@@ -28,7 +28,9 @@ import requests; exec(requests.get("https://raw.githubusercontent.com/xersbtt/ul
 
 The code runs in Colab; you do not need to install anything on your computer. Colab sessions can end unexpectedly, so use **Resume Previous Session** when you return.
 
-> The command above runs code from this repository. You can [read the script](ultimate_downloader.py) first, or paste its contents directly into a Colab cell. To run a fixed release, replace `main` in the URL with a [published release tag](https://github.com/xersbtt/ultimate-downloader-colab/releases).
+The launcher loads the current script from `main`. If you already use it, restart your Colab runtime, rerun the cell, and look for **Ultimate Downloader v7.2**. If you pasted the full script into Colab, replace it with the [current script](ultimate_downloader.py) first.
+
+To stay on a fixed release, replace `main` in the launcher URL with a [published release tag](https://github.com/xersbtt/ultimate-downloader-colab/releases).
 
 ### Add your keys
 
@@ -145,7 +147,7 @@ For YouTube playlists, you can choose a range such as `1,3,5-10` and select subt
 | Some files failed | Click **Retry Failed**. For a throttled provider, wait a little before retrying. |
 | HTTP 500/502/503/504 appears during a transfer | Let the automatic server countdown finish. If the file still fails, check its saved error and use **Retry Failed** later. |
 | PikPak reports a token, permission, storage, or quota error | Check **Read files** and **Manage files**, replace an expired token in Secrets or Settings, and check your account's storage and Connected Apps allowance. |
-| OK.ru reports "the JSON object must be str, bytes or bytearray, not dict" | Run v7.1 or later, which includes the metadata compatibility fix. Both `ok.ru` and `odnoklassniki.ru` links are supported. |
+| OK.ru reports "the JSON object must be str, bytes or bytearray, not dict" | Rerun the launcher to load the current script. The compatibility fix first shipped in v7.1 and covers `ok.ru` and `odnoklassniki.ru` links. |
 | A file has the wrong name or folder | Check its queue destination and use **Force Name**, **Fix Match**, or **Route as**. |
 | YouTube skips a video | Clear the YouTube archive in **⚙️ Settings**. If you uploaded cookies, try clearing them too. |
 | A FShare login fails | Try resolving again; if it keeps failing, restart the Colab runtime and check your VIP account. |
