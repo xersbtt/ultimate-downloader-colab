@@ -10,6 +10,7 @@ All notable changes to Ultimate Downloader are documented here.
 - **Parallel Châu Thành transfers.** Download up to three donor files at once, with up to five connections each. Lower **Parallel DLs** settings still apply. IP allow-list refusals are recognised even with HTTP 200, and an expired PC session prompts for a current value. The optional HTTP login and runtime-browser diagnostics are under **Other login options**.
 - **TorBox WebDL fixes.** Submit links as multipart form data, recognise downloaded tasks and completion flags, and match numeric polling IDs to saved string IDs. Redact token values from download-link errors.
 - **PikPak recovery on alternate CDN hosts.** Identify PikPak by the download source and apply the three-wait recovery budget to early disconnects and temporary server errors. Refresh links and continue partial downloads with one connection.
+- **Clean notebook startup.** Restore the Debrid selector so the downloader opens in a fresh Colab runtime.
 
 ### Episode orders
 
@@ -17,7 +18,7 @@ All notable changes to Ultimate Downloader are documented here.
 
 ### Verification
 
-- All 323 downloader regression tests passed locally.
+- Local checks include running the full notebook launcher in a fresh Python namespace.
 - A Colab download-to-Drive batch was reported complete through Châu Thành's PC-session route with the earlier two-file allocation. Live testing remains for the three-file allocation, interrupted resume, and runtime-browser login.
 - See [the release checklist](RELEASING.md) for local checks and the Colab smoke test.
 

@@ -467,6 +467,14 @@ tmdb_enabled_checkbox = widgets.Checkbox(value=True, description='TMDB matching'
 token_rd = widgets.Text(description='RD Token:', placeholder='Real-Debrid API Key', value=get_colab_secret('RD_TOKEN'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
 token_tb = widgets.Text(description='TB Token:', placeholder='TorBox API Key', value=get_colab_secret('TB_TOKEN'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
 token_pikpak = widgets.Password(description='PikPak:', placeholder='Personal Access Token', value=get_colab_secret('PIKPAK_TOKEN'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
+debrid_service_toggle = widgets.Dropdown(
+    options=['None', 'Real-Debrid', 'TorBox'],
+    value='None',
+    description='Debrid:',
+    tooltip='Select debrid service for premium links & magnets',
+    style={'description_width': '75px'},
+    layout=widgets.Layout(width='215px')
+)
 token_fshare_email = widgets.Text(description='FShare:', placeholder='Email', value=get_colab_secret('FSHARE_EMAIL'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
 token_fshare_password = widgets.Password(description='Password:', placeholder='FShare Password', value=get_colab_secret('FSHARE_PASSWORD'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
 token_chauthanh_session = widgets.Password(description='PC session:', placeholder='PHPSESSID from your active PC login', value=get_colab_secret('CHAUTHANH_PHPSESSID'), style={'description_width': '130px'}, layout=widgets.Layout(width='450px'))

@@ -81,6 +81,7 @@ test_*.py
 !test_torbox_jit.py
 !test_drive_settings.py
 !test_okru.py
+!test_startup.py
 test_*.txt
 debug_*.py
 

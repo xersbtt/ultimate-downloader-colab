@@ -9,7 +9,7 @@ Check that the README and `APP_VERSION` in `ultimate_downloader.py` agree. The a
 ```powershell
 python -m pip install anywidget ipywidgets requests yt-dlp
 python -m py_compile ultimate_downloader.py
-python -X utf8 -m unittest test_tmdb_anime_classification test_tmdb_episode_orders test_queue_editing test_queue_additions_torbox test_queue_table test_progress_panel test_live_queue test_pikpak test_download_backoff test_chauthanh test_torbox_jit test_drive_cancellation test_drive_settings test_okru
+python -X utf8 -m unittest test_startup test_tmdb_anime_classification test_tmdb_episode_orders test_queue_editing test_queue_additions_torbox test_queue_table test_progress_panel test_live_queue test_pikpak test_download_backoff test_chauthanh test_torbox_jit test_drive_cancellation test_drive_settings test_okru
 git diff --check -- . ':(exclude)archive/**'
 git hash-object archive/ultimate_downloader_v7.1.py
 git rev-parse v7.1:ultimate_downloader.py
