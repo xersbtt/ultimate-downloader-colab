@@ -11,7 +11,11 @@ import builtins
 import html
 import hashlib
 import platform
-from contextlib import nullcontext
+import base64
+import posixpath
+import stat
+import sys
+from contextlib import ExitStack, closing, contextmanager, nullcontext
 from html.parser import HTMLParser
 from collections import deque
 from typing import Optional, Tuple, List, Dict, Any, Callable
@@ -24,7 +28,7 @@ import ipywidgets as widgets
 from IPython.display import display, clear_output, HTML, JSON
 from urllib.parse import urlparse, urljoin, unquote, parse_qs, quote
 
-APP_VERSION = "7.2"
+APP_VERSION = "7.3"
 
 try:
     from google.colab import drive
@@ -167,12 +171,17 @@ class DownloadTask:
     pikpak_restore_root: Optional[str] = None
     pikpak_restore_task_id: Optional[str] = None
     chauthanh_size: int = 0  # Verified donor-file size; retained for Retry/Resume
+    rapidseedbox_account: str = ''  # Account identity digest; credentials stay in memory
+    rapidseedbox_path: str = ''
+    rapidseedbox_torrent: str = ''
+    rapidseedbox_size: int = 0
+    rapidseedbox_mtime: Optional[int] = None
 
 _TASK_FIELDS = {f.name for f in fields(DownloadTask)}
 
 # Link types with dedicated sequential processors. Every other link type (gofile,
 # pixeldrain, direct, rd, tb, fshare, mediafire, 1fichier, ...) downloads through
-# the parallel aria2 pool — partitioning by exclusion so new resolver types are
+# the parallel worker pool — partitioning by exclusion so new resolver types are
 # never silently dropped.
 SEQUENTIAL_LINK_TYPES = {'youtube', 'mega', 'magnet', 'magnet_file', 'tb_magnet_file'}
 
@@ -467,6 +476,24 @@ tmdb_enabled_checkbox = widgets.Checkbox(value=True, description='TMDB matching'
 token_rd = widgets.Text(description='RD Token:', placeholder='Real-Debrid API Key', value=get_colab_secret('RD_TOKEN'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
 token_tb = widgets.Text(description='TB Token:', placeholder='TorBox API Key', value=get_colab_secret('TB_TOKEN'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
 token_pikpak = widgets.Password(description='PikPak:', placeholder='Personal Access Token', value=get_colab_secret('PIKPAK_TOKEN'), style={'description_width': '130px'}, layout=widgets.Layout(width='320px'))
+rapidseedbox_fields = {
+    key: widget(description=label, placeholder=placeholder, style={'description_width': '130px'},
+                layout=widgets.Layout(width='385px'))
+    for key, widget, label, placeholder in (
+        ('HOST', widgets.Text, 'SFTP host:', 'Hostname or IP, default port 63526'),
+        ('USERNAME', widgets.Text, 'SFTP username:', 'From RapidSeedbox Client Area'),
+        ('PASSWORD', widgets.Password, 'SFTP password:', 'From RapidSeedbox Client Area'),
+        ('HOST_KEY', widgets.Text, 'SFTP fingerprint:', 'SHA256:…'),
+        ('QBIT_URL', widgets.Text, 'qBittorrent URL:', 'HTTPS Web UI link from Client Area'),
+        ('QBIT_USERNAME', widgets.Text, 'qBittorrent user:', 'Optional if same as SFTP'),
+        ('QBIT_PASSWORD', widgets.Password, 'qBittorrent password:', 'Optional if same as SFTP'),
+    )
+}
+rapidseedbox_magnets = widgets.Checkbox(description='Use RapidSeedbox for magnet links', indent=False)
+rapidseedbox_connections = widgets.Dropdown(options=[1, 2], value=2, description='SFTP connections per file:',
+                                             style={'description_width': '165px'}, layout=widgets.Layout(width='250px'))
+btn_rapidseedbox_test = widgets.Button(description='Test connection')
+rapidseedbox_status = widgets.HTML()
 debrid_service_toggle = widgets.Dropdown(
     options=['None', 'Real-Debrid', 'TorBox'],
     value='None',
@@ -865,6 +892,14 @@ settings_ui = widgets.VBox([
     widgets.HBox([token_pikpak]),
     widgets.HTML("<small>Use a token with Read files and Manage files permissions. Selected shared files are saved to your PikPak before downloading. <a href='https://mypikpak.com/en-US/help-center/connected_apps/personal_access_tokens/create_personal_access_token' target='_blank'>Create a token</a></small>"),
     secrets_status,
+    widgets.HTML("<div style='margin-top:10px'><small><b>RapidSeedbox Swift:</b></small></div>"),
+    widgets.HBox([rapidseedbox_fields[key] for key in ('HOST', 'HOST_KEY')], layout=widgets.Layout(flex_flow='row wrap')),
+    widgets.HBox([rapidseedbox_fields[key] for key in ('USERNAME', 'PASSWORD')], layout=widgets.Layout(flex_flow='row wrap')),
+    widgets.HTML('<small>Paste a Swift File Browser URL or an SFTP path such as <code>rapidseedbox:///Downloads/</code> in Links.</small>'),
+    widgets.HBox([rapidseedbox_fields['QBIT_URL'], rapidseedbox_magnets], layout=widgets.Layout(flex_flow='row wrap')),
+    widgets.HBox([rapidseedbox_fields[key] for key in ('QBIT_USERNAME', 'QBIT_PASSWORD')], layout=widgets.Layout(flex_flow='row wrap')),
+    rapidseedbox_connections,
+    widgets.HBox([btn_rapidseedbox_test, rapidseedbox_status], layout=widgets.Layout(flex_flow='row wrap')),
     widgets.HTML("<div style='margin-top:10px'><small><b>📁 Download Directories (relative to Google Drive):</b></small></div>"),
     dir_config_row,
     dir_status,
@@ -2308,7 +2343,7 @@ def update_queue_display(preserve_selection: bool = True):
             overrides.append(task.route_override.replace('_', ' '))
         size = re.search(r'\(([^()]*[KMG]i?B)\)\s*$', task.filename or '')
         source = {'tb_magnet_file': 'TorBox', 'tb': 'TorBox', 'tb_host': 'TorBox',
-                  'magnet_file': 'Real-Debrid', 'rd': 'Real-Debrid'}.get(
+                  'magnet_file': 'Real-Debrid', 'rd': 'Real-Debrid', 'rapidseedbox': 'RapidSeedbox'}.get(
                       task.link_type, task.link_type.replace('_', ' ').title())
         destination = dest
         if not destination and m:
@@ -2493,6 +2528,8 @@ def _queue_task_key(task: DownloadTask) -> tuple:
     """Stable resolved-file identity, independent of temporary download URLs."""
     if task.link_type == 'pikpak':
         return 'pikpak', task.pikpak_share_id or '', task.pikpak_file_id
+    if task.link_type == 'rapidseedbox':
+        return 'rapidseedbox', task.rapidseedbox_account, task.rapidseedbox_torrent, task.rapidseedbox_path
     if task.link_type in ('magnet_file', 'tb_magnet_file'):
         return task.link_type, task.original_url or task.url
     if task.link_type == 'youtube':
@@ -2789,6 +2826,8 @@ def _launch_live_batch(tasks: List[DownloadTask], mode: str, *, resume: bool = F
     # launch a background batch, and a reviewed queue can enable the API after
     # resolving links, so authenticate before starting either kind of worker.
     load_dir_settings()
+    if resume and any(task.link_type == 'rapidseedbox' and task.status not in ('done', 'skipped') for task in tasks):
+        _rapidseedbox_refresh_secrets()
     if drive_api_checkbox.value:
         _init_drive_api()
     _restore_standard_status_widgets()
@@ -9230,6 +9269,490 @@ def _chauthanh_runtime_link(task):
             return _chauthanh_download_url(task, session=session)
 
 
+# --- RAPIDSEEDBOX SWIFT ---
+_rapidseedbox_install_lock = Lock()
+_rapidseedbox_secrets: Dict[str, str] = {}
+_RAPIDSEEDBOX_READ_BLOCK = 32 * 1024
+_RAPIDSEEDBOX_READ_AHEAD = 8 * 1024 ** 2
+_RAPIDSEEDBOX_READ_AHEAD_FALLBACK = 64 * _RAPIDSEEDBOX_READ_BLOCK
+_RAPIDSEEDBOX_SSH_WINDOW = 2 * _RAPIDSEEDBOX_READ_AHEAD
+_RAPIDSEEDBOX_SSH_PACKET = 64 * 1024
+
+
+class _RapidSeedboxError(RuntimeError):
+    """A diagnostic safe to display and store with the task."""
+
+
+class _RapidSeedboxReadError(_RapidSeedboxError):
+    """An interrupted read can be resumed with fewer outstanding requests."""
+
+
+def _rapidseedbox_refresh_secrets():
+    """Read Colab Secrets on the notebook thread before starting workers."""
+    global _rapidseedbox_secrets
+    _rapidseedbox_secrets = {key: get_colab_secret('RAPIDSEEDBOX_' + key) or ''
+                            for key, widget in rapidseedbox_fields.items() if not widget.value}
+
+
+def _rapidseedbox_value(key: str) -> str:
+    return rapidseedbox_fields[key].value or _rapidseedbox_secrets.get(key, '')
+
+
+def _rapidseedbox_sftp_settings():
+    address = _rapidseedbox_value('HOST').strip()
+    username = _rapidseedbox_value('USERNAME').strip()
+    password = _rapidseedbox_value('PASSWORD')
+    fingerprint = _rapidseedbox_value('HOST_KEY').strip()
+    if not (address and username and password):
+        raise _RapidSeedboxError('Enter the Swift SFTP host, username and password in Settings or Colab Secrets.')
+    try:
+        parts = urlparse('//' + address)
+        host, port = parts.hostname, parts.port if parts.port is not None else 63526
+        if (not host or not re.fullmatch(r'[a-z0-9.:-]+', host) or not port
+                or parts.username is not None or parts.path or parts.params or parts.query or parts.fragment):
+            raise ValueError
+    except ValueError:
+        raise _RapidSeedboxError('Enter the SFTP hostname or IP, optionally followed by :port.') from None
+    if fingerprint:
+        match = re.fullmatch(r'(?i:SHA256:)([A-Za-z0-9+/]{43})=?\.?', fingerprint)
+        if not match:
+            raise _RapidSeedboxError('Paste the full SHA256: code from Test connection. '
+                                     'Clear any example text or surrounding words.')
+        fingerprint = 'SHA256:' + match.group(1)
+    return host, port, username, password, fingerprint
+
+
+@contextmanager
+def _rapidseedbox_sftp(settings):
+    with _rapidseedbox_install_lock:
+        try:
+            import paramiko
+        except ImportError:
+            try:
+                subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'paramiko'], check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+                import paramiko
+            except (subprocess.SubprocessError, ImportError, OSError):
+                raise _RapidSeedboxError('Could not install the SFTP library in this runtime.') from None
+
+    host, port, username, password, expected = settings
+
+    class CheckHostKey(paramiko.MissingHostKeyPolicy):
+        def missing_host_key(self, client, hostname, key):
+            digest = base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip('=')
+            actual = 'SHA256:' + digest
+            if actual != expected:
+                notice = ('The server fingerprint differs from the saved one.' if expected else
+                          'SFTP server fingerprint')
+                raise _RapidSeedboxError(f'{notice}\n{actual}\nVerify this fingerprint before saving it.')
+
+    with paramiko.SSHClient() as client:
+        client.set_missing_host_key_policy(CheckHostKey())
+        try:
+            client.connect(host, port=port, username=username, password=password, allow_agent=False,
+                           look_for_keys=False, timeout=15, banner_timeout=15, auth_timeout=15, channel_timeout=15)
+            sftp = paramiko.SFTPClient.from_transport(client.get_transport(),
+                                                    window_size=_RAPIDSEEDBOX_SSH_WINDOW,
+                                                    max_packet_size=_RAPIDSEEDBOX_SSH_PACKET)
+            sftp.get_channel().settimeout(20)
+        except paramiko.AuthenticationException:
+            raise _RapidSeedboxError('Swift SFTP login failed. Check the SFTP username and password.') from None
+        except (paramiko.SSHException, paramiko.SFTPError, OSError, EOFError):
+            raise _RapidSeedboxError('Could not open Swift SFTP. Check the host, port and service status.') from None
+        with sftp:
+            try:
+                yield sftp
+            except FileNotFoundError:
+                raise _RapidSeedboxError('File or folder missing in Swift SFTP. Check its path and availability.') from None
+            except (paramiko.SSHException, paramiko.SFTPError, EOFError, TimeoutError, ConnectionError):
+                raise _RapidSeedboxError('Swift SFTP connection interrupted. Retry to resume the local partial.') from None
+
+
+def _rapidseedbox_qbit_settings(sftp_settings):
+    url = _rapidseedbox_value('QBIT_URL').strip().rstrip('/')
+    try:
+        parts = urlparse(url)
+        if (parts.scheme != 'https' or not parts.hostname or parts.username is not None
+                or parts.params or parts.query or parts.fragment or parts.port == 0):
+            raise ValueError
+    except ValueError:
+        raise _RapidSeedboxError('Enter the HTTPS qBittorrent Web UI URL from the RapidSeedbox Client Area.') from None
+    return (url, _rapidseedbox_value('QBIT_USERNAME').strip() or sftp_settings[2],
+            _rapidseedbox_value('QBIT_PASSWORD') or sftp_settings[3])
+
+
+@contextmanager
+def _rapidseedbox_qbit(settings):
+    url, username, password = settings
+    parts = urlparse(url)
+    with requests.Session() as session:
+        session.headers.update({'Origin': f'{parts.scheme}://{parts.netloc}', 'Referer': url + '/'})
+
+        def api(endpoint, *, params=None, form=None, multipart=None, json_result=False):
+            method = 'GET' if form is None and multipart is None else 'POST'
+            try:
+                with session.request(method, f'{url}/api/v2/{endpoint}', params=params, data=form, files=multipart,
+                                     timeout=(10, 20), allow_redirects=False) as response:
+                    if (endpoint == 'auth/login' and response.status_code == 401 and not session.auth
+                            and 'basic' in response.headers.get('WWW-Authenticate', '').lower()):
+                        session.auth = (username, password)
+                        return api(endpoint, form=form)
+                    if not 200 <= response.status_code < 300:
+                        raise _RapidSeedboxError(f'qBittorrent {endpoint} returned HTTP {response.status_code}.')
+                    if endpoint == 'auth/login' and response.status_code == 204:
+                        return 'Ok.'  # qBittorrent 5.2+ uses an empty successful response
+                    return response.json() if json_result else response.text.strip()
+            except (requests.RequestException, ValueError):
+                raise _RapidSeedboxError(f'Could not read qBittorrent {endpoint}. Check the URL and service status.') from None
+
+        reply = api('auth/login', form={'username': username, 'password': password})
+        if reply != 'Ok.':
+            raise _RapidSeedboxError('qBittorrent login failed. Check the Web UI URL, username and password.')
+        yield api
+
+
+def _rapidseedbox_test_connection(b=None):
+    btn_rapidseedbox_test.disabled = True
+    rapidseedbox_status.value = 'Connecting…'
+    messages = []
+    try:
+        _rapidseedbox_refresh_secrets()
+        settings = _rapidseedbox_sftp_settings()
+        with _rapidseedbox_sftp(settings) as sftp:
+            home = sftp.normalize('.')
+        messages.append(f'SFTP connected. Home folder {home}')
+        if rapidseedbox_magnets.value or _rapidseedbox_value('QBIT_URL').strip():
+            with _rapidseedbox_qbit(_rapidseedbox_qbit_settings(settings)) as api:
+                version = api('app/version')
+                if not re.fullmatch(r'v?\d[\w.+-]*', version):
+                    raise _RapidSeedboxError('The qBittorrent URL did not return a version.')
+            messages.append(f'qBittorrent {version} connected.')
+    except _RapidSeedboxError as exc:
+        messages.append(str(exc))
+    except OSError:
+        messages.append('Could not read the Swift SFTP home folder.')
+    finally:
+        rapidseedbox_status.value = '<br>'.join(html.escape(line) for message in messages
+                                                for line in message.splitlines())
+        btn_rapidseedbox_test.disabled = False
+
+
+def _rapidseedbox_account_id(sftp_settings, qbit_settings=None):
+    account = sftp_settings[:3]
+    if qbit_settings:
+        account += qbit_settings[:2]
+    return hashlib.sha256(json.dumps(account).encode()).hexdigest()
+
+
+def _rapidseedbox_magnet_hashes(url):
+    hashes = []
+    for value in parse_qs(urlparse(url).query).get('xt', []):
+        kind, _, info_hash = value.lower().rpartition(':')
+        if kind == 'urn:btih' and re.fullmatch(r'[0-9a-f]{40}', info_hash):
+            hashes.append(info_hash)
+        elif kind == 'urn:btih' and re.fullmatch(r'[a-z2-7]{32}', info_hash):
+            hashes.append(base64.b32decode(info_hash.upper()).hex())
+        elif kind == 'urn:btmh' and re.fullmatch(r'1220[0-9a-f]{64}', info_hash):
+            hashes.append(info_hash[4:44])  # qBittorrent uses a 20-byte ID for v2 torrents.
+    if not hashes:
+        raise _RapidSeedboxError('The magnet link has no supported BitTorrent info hash.')
+    return tuple(dict.fromkeys(hashes))
+
+
+def _rapidseedbox_path(path, *, absolute):
+    if (not path or path.startswith('/') != absolute or '\\' in path or any(ord(c) < 32 for c in path)
+            or any(part in ('.', '..') for part in path.split('/'))):
+        raise _RapidSeedboxError('Swift returned or received an invalid file path.')
+    return posixpath.normpath('/' + path.lstrip('/') if absolute else path)
+
+
+def _rapidseedbox_task(url, account, path, size, *, torrent='', mtime=None):
+    filename = _tb_contextual_filename(path)
+    if not filename or filename in ('.', '..'):
+        raise _RapidSeedboxError('Swift returned an unusable filename.')
+    if not isinstance(size, int) or size < 0:
+        raise _RapidSeedboxError('Swift did not report a valid file size.')
+    return DownloadTask(url=url, original_url=url, filename=f'{filename} ({size / (1024 ** 2):.1f} MB)',
+                        source='rapidseedbox', link_type='rapidseedbox', rapidseedbox_account=account,
+                        rapidseedbox_torrent=torrent, rapidseedbox_path=path, rapidseedbox_size=size,
+                        rapidseedbox_mtime=mtime, selected_by_default=not _tb_file_in_extras_folder(path))
+
+
+def _rapidseedbox_torrent_info(api, *hashes):
+    results = api('torrents/info', params={'hashes': '|'.join(hashes)}, json_result=True)
+    if not isinstance(results, list):
+        raise _RapidSeedboxError('qBittorrent returned an invalid torrent list.')
+    return next((item for item in results if item.get('hash') in hashes), None)
+
+
+def _rapidseedbox_torrent_files(api, info_hash):
+    results = api('torrents/files', params={'hash': info_hash}, json_result=True)
+    if not isinstance(results, list):
+        raise _RapidSeedboxError('qBittorrent returned an invalid file list.')
+    return results
+
+
+def _rapidseedbox_browser_link(parts) -> bool:
+    return (parts.scheme == 'https'
+            and re.fullmatch(r'rapidseedbox[0-9]+-files\.swift-[0-9]+\.seedbox\.vip', parts.hostname or '') is not None
+            and (parts.path == '/files' or parts.path.startswith('/files/')))
+
+
+def resolve_rapidseedbox(url: str) -> List[DownloadTask]:
+    parts = urlparse(url)
+    is_magnet = parts.scheme == 'magnet'
+    is_browser_link = _rapidseedbox_browser_link(parts)
+    if is_browser_link:
+        if parts.username is not None:
+            raise _RapidSeedboxError('Paste the Swift File Browser URL without credentials in the address.')
+    elif not is_magnet and (parts.scheme != 'rapidseedbox' or parts.params or parts.query
+                            or parts.fragment or parts.netloc not in ('', 'torrent')):
+        raise _RapidSeedboxError('Use a Swift File Browser URL, rapidseedbox:///path, or rapidseedbox://torrent/HASH.')
+    settings = _rapidseedbox_sftp_settings()
+    if not settings[4]:
+        raise _RapidSeedboxError('Verify the SFTP fingerprint in Settings before importing Swift files.')
+    if is_magnet or parts.netloc == 'torrent':
+        if is_magnet:
+            hashes = _rapidseedbox_magnet_hashes(url)
+        else:
+            info_hash = parts.path.strip('/').lower()
+            if not re.fullmatch(r'[0-9a-f]{40}(?:[0-9a-f]{24})?', info_hash):
+                raise _RapidSeedboxError('Enter a 40- or 64-character hexadecimal qBittorrent torrent hash.')
+            hashes = (info_hash[:40],)
+        qbit_settings = _rapidseedbox_qbit_settings(settings)
+        account = _rapidseedbox_account_id(settings, qbit_settings)
+        with _rapidseedbox_qbit(qbit_settings) as api:
+            torrent = _rapidseedbox_torrent_info(api, *hashes)
+            if torrent is None and is_magnet:
+                reply = api('torrents/add', multipart={'urls': (None, url)})
+                if reply == 'Fails.':
+                    raise _RapidSeedboxError('qBittorrent refused the magnet link.')
+                print('   RapidSeedbox: sent magnet to qBittorrent. Waiting for the file list…')
+            elif torrent is None:
+                raise _RapidSeedboxError('This torrent hash was not found in qBittorrent.')
+            deadline = time.monotonic() + 90
+            link = f'rapidseedbox://torrent/{hashes[0]}'
+            while not cancel_requested():
+                if torrent:
+                    info_hash = torrent['hash']
+                    link = f'rapidseedbox://torrent/{info_hash}'
+                    files = _rapidseedbox_torrent_files(api, info_hash)
+                    if files:
+                        return [_rapidseedbox_task(link, account, _rapidseedbox_path(file['name'], absolute=False),
+                                                   file['size'], torrent=info_hash) for file in files]
+                if time.monotonic() >= deadline:
+                    raise _RapidSeedboxError(f'qBittorrent is still waiting for metadata. '
+                                             f'Resolve the magnet or {link} again later.')
+                time.sleep(2)
+                torrent = _rapidseedbox_torrent_info(api, *hashes)
+        return []
+
+    path = parts.path[len('/files'):] if is_browser_link else parts.path
+    start = _rapidseedbox_path(unquote(path or '/'), absolute=True)
+    account = _rapidseedbox_account_id(settings)
+    tasks = []
+    with _rapidseedbox_sftp(settings) as sftp:
+        if is_browser_link:
+            # The browser exposes the account home as /files. SFTP may show it as / or /home/<user>.
+            home = _rapidseedbox_path(sftp.normalize('.'), absolute=True)
+            start = posixpath.join(home, start.lstrip('/')) if start != '/' else home
+        pending = [(start, sftp.lstat(start))]
+        while pending and not cancel_requested():
+            path, entry = pending.pop()
+            if stat.S_ISDIR(entry.st_mode):
+                children = sorted(sftp.listdir_attr(path), key=lambda child: child.filename.casefold(), reverse=True)
+                pending.extend((posixpath.join(path, child.filename), child) for child in children
+                               if child.filename not in ('', '.', '..') and '/' not in child.filename)
+            elif stat.S_ISREG(entry.st_mode):
+                safe_path = _rapidseedbox_path(path, absolute=True)
+                link = 'rapidseedbox://' + quote(safe_path, safe='/')
+                tasks.append(_rapidseedbox_task(link, account, safe_path, entry.st_size, mtime=entry.st_mtime))
+    if not tasks and not cancel_requested():
+        raise _RapidSeedboxError('No regular files were found at the Swift SFTP path.')
+    return tasks
+
+
+def _rapidseedbox_torrent_path(task, qbit_settings):
+    """Look up the final path after qBittorrent finishes writing and moving the torrent."""
+    info_hash = task.rapidseedbox_torrent
+    if not re.fullmatch(r'[0-9a-f]{40}', info_hash):
+        raise _RapidSeedboxError('Invalid saved qBittorrent torrent hash. Resolve the torrent again.')
+    deadline = time.monotonic() + 30 * 60
+    with _rapidseedbox_qbit(qbit_settings) as api:
+        while not cancel_requested():
+            torrent = _rapidseedbox_torrent_info(api, info_hash)
+            if not torrent:
+                raise _RapidSeedboxError('Torrent missing from qBittorrent. Add it there and resolve it again.')
+            state = torrent.get('state', '')
+            if state in ('error', 'missingFiles'):
+                raise _RapidSeedboxError('qBittorrent reported a file or storage error. Check the torrent in the Web UI.')
+            progress = torrent.get('progress', 0)
+            if progress >= 1 and state not in ('moving', 'checkingDL', 'checkingUP', 'checkingResumeData'):
+                files = _rapidseedbox_torrent_files(api, info_hash)
+                file = next((entry for entry in files if entry.get('name') == task.rapidseedbox_path), None)
+                if not file or file.get('size') != task.rapidseedbox_size:
+                    raise _RapidSeedboxError('The qBittorrent file changed. Resolve the torrent again.')
+                if file.get('progress', 0) < 1:
+                    raise _RapidSeedboxError('The selected file is incomplete. Check its priority in qBittorrent.')
+                save_path = _rapidseedbox_path(torrent.get('save_path', ''), absolute=True)
+                return posixpath.join(save_path, _rapidseedbox_path(task.rapidseedbox_path, absolute=False))
+            if state in ('pausedDL', 'stoppedDL'):
+                raise _RapidSeedboxError('The torrent is paused. Start it in qBittorrent, then retry.')
+            if time.monotonic() >= deadline:
+                raise _RapidSeedboxError('The torrent is still downloading on Swift. Retry after it finishes.')
+            with progress_lock:
+                download_stats[task.id] = {'pct': 0.0, 'speed_mbs': 0.0,
+                                           'stage': f'Swift torrent downloading ({progress:.0%})'}
+            for _ in range(5):
+                if cancel_requested():
+                    return None
+                time.sleep(1)
+    return None
+
+
+def _rapidseedbox_remote_file(sftp, path, task, username):
+    try:
+        entry = sftp.lstat(path)
+    except FileNotFoundError:
+        # qBittorrent can show the system path while SFTP confines users to their home.
+        prefix = f'/home/{username}/'
+        if not task.rapidseedbox_torrent or not path.startswith(prefix):
+            raise
+        path = '/' + path[len(prefix):]
+        entry = sftp.lstat(path)
+    if (not stat.S_ISREG(entry.st_mode) or entry.st_size != task.rapidseedbox_size
+            or task.rapidseedbox_mtime is not None and entry.st_mtime != task.rapidseedbox_mtime):
+        raise _RapidSeedboxError('The Swift file changed or is incomplete. Check the seedbox and resolve it again.')
+    return path, entry.st_mtime
+
+
+def _download_rapidseedbox(task: DownloadTask):
+    settings = _rapidseedbox_sftp_settings()
+    qbit_settings = _rapidseedbox_qbit_settings(settings) if task.rapidseedbox_torrent else None
+    if task.rapidseedbox_account != _rapidseedbox_account_id(settings, qbit_settings):
+        raise _RapidSeedboxError('Use the Swift account that resolved this file or resolve the link again.')
+    # A separate staging directory preserves the intended filename for Drive
+    # processing even when two unrelated seedbox folders contain the same name.
+    staging_dir = os.path.join(COLAB_ROOT, '.rapidseedbox', hashlib.sha256(task.id.encode()).hexdigest())
+    filename = _strip_size_suffix(task.filename)
+    if filename in ('', '.', '..') or any(c in filename for c in '/\\\x00'):
+        raise _RapidSeedboxError('Swift task has an invalid filename. Resolve the link again.')
+    final_path = os.path.join(staging_dir, filename)
+    size = task.rapidseedbox_size
+    if os.path.isfile(final_path) and os.path.getsize(final_path) == size:
+        return final_path  # Download verified earlier; a Drive move may have been interrupted.
+
+    remote = (_rapidseedbox_torrent_path(task, qbit_settings) if qbit_settings else
+              _rapidseedbox_path(task.rapidseedbox_path, absolute=True))
+    if cancel_requested() or remote is None:
+        return None
+    if not _wait_for_disk_space(DISK_START_GB, label=filename[:40], task_id=task.id):
+        _mark_disk_gave_up(task.id)
+        return None
+    try:
+        return _rapidseedbox_transfer_file(task, settings, remote, final_path, _RAPIDSEEDBOX_READ_AHEAD,
+                                           rapidseedbox_connections.value)
+    except _RapidSeedboxReadError:
+        if cancel_requested():
+            return None
+        with print_lock:
+            print(f'   Swift SFTP read interrupted. Resuming {filename[:50]} with one connection and less read-ahead.')
+        return _rapidseedbox_transfer_file(task, settings, remote, final_path, _RAPIDSEEDBOX_READ_AHEAD_FALLBACK, 1)
+
+
+def _rapidseedbox_read_window(source, start, end):
+    block = _RAPIDSEEDBOX_READ_BLOCK
+    chunks = [(offset, min(block, end - offset)) for offset in range(start, end, block)]
+    try:
+        data = list(source.readv(chunks))
+    except (OSError, EOFError):
+        raise _RapidSeedboxReadError('Swift SFTP read failed. Retry to resume the local partial.') from None
+    if len(data) != len(chunks) or any(len(buf) != length for buf, (_, length) in zip(data, chunks)):
+        raise _RapidSeedboxReadError('Swift sent an incomplete file. Retry to resume the local partial.')
+    return data
+
+
+def _rapidseedbox_read_windows(readers, offset, size, read_ahead):
+    offsets = iter(range(offset, size, read_ahead))
+    if len(readers) == 1:
+        for start in offsets:
+            if cancel_requested():
+                return
+            yield _rapidseedbox_read_window(readers[0], start, min(size, start + read_ahead))
+        return
+
+    # One in-flight range per connection. Yield in file order so the partial on
+    # disk always consists of the contiguous bytes that a single connection can resume.
+    with ThreadPoolExecutor(max_workers=len(readers)) as pool:
+        pending = deque((reader, pool.submit(_rapidseedbox_read_window, reader, start, min(size, start + read_ahead)))
+                        for reader, start in zip(readers, offsets))
+        while pending:
+            reader, future = pending.popleft()
+            yield future.result()
+            if cancel_requested():
+                return
+            start = next(offsets, None)
+            if start is not None:
+                pending.append((reader, pool.submit(_rapidseedbox_read_window, reader, start,
+                                                    min(size, start + read_ahead))))
+
+
+def _rapidseedbox_transfer_file(task, settings, remote, final_path, read_ahead, connections):
+    staging_dir = os.path.dirname(final_path)
+    size = task.rapidseedbox_size
+    with ExitStack() as stack:
+        sftp = stack.enter_context(_rapidseedbox_sftp(settings))
+        remote, mtime = _rapidseedbox_remote_file(sftp, remote, task, settings[2])
+        os.makedirs(staging_dir, exist_ok=True)
+        version = hashlib.sha256(json.dumps([remote, size, mtime]).encode()).hexdigest()
+        partial = os.path.join(staging_dir, '.partial-' + version)
+        if mtime is None or not os.path.isfile(partial) or os.path.getsize(partial) > size:
+            with open(partial, 'wb'):
+                pass
+        resumed_from = offset = os.path.getsize(partial)
+        start = time.monotonic()
+        readers = [stack.enter_context(sftp.open(remote, 'rb'))]
+        remote_paths = [(sftp, remote)]
+        if connections == 2 and mtime is not None and size - offset >= 4 * read_ahead and not cancel_requested():
+            try:
+                second = stack.enter_context(_rapidseedbox_sftp(settings))
+            except _RapidSeedboxError:
+                with print_lock:
+                    print('   Swift could not open a second SFTP connection. Continuing with one.')
+            else:
+                second_path, second_mtime = _rapidseedbox_remote_file(second, remote, task, settings[2])
+                if second_mtime != mtime:
+                    raise _RapidSeedboxError('The Swift file changed before the second connection opened.')
+                readers.append(stack.enter_context(second.open(second_path, 'rb')))
+                remote_paths.append((second, second_path))
+        if cancel_requested():
+            return None
+        windows = _rapidseedbox_read_windows(readers, offset, size, read_ahead)
+        with open(partial, 'ab') as target, closing(windows):
+            for data in windows:
+                if cancel_requested():
+                    return None
+                if _disk_free_gb() < DISK_FLOOR_GB:
+                    _mark_disk_gave_up(task.id)
+                    return None
+                target.writelines(data)
+                offset += sum(map(len, data))
+                elapsed = max(0.1, time.monotonic() - start)
+                with progress_lock:
+                    download_stats[task.id] = {'pct': 100 * offset / size,
+                                               'speed_mbs': (offset - resumed_from) / (1024 ** 2 * elapsed)}
+        if cancel_requested():
+            return None
+        for connection, path in remote_paths:
+            after = connection.lstat(path)
+            if not stat.S_ISREG(after.st_mode) or after.st_size != size or after.st_mtime != mtime:
+                raise _RapidSeedboxError('The Swift file changed during transfer. Resolve the current file again.')
+        if os.path.getsize(partial) != size:
+            raise _RapidSeedboxError('The Swift file is incomplete. Retry to resume the local partial.')
+        os.replace(partial, final_path)
+    return final_path
+
+
 # --- PARALLEL DOWNLOAD WORKER ---
 def download_worker(task: DownloadTask, gofile_token: str, move_queue: Optional[queue.Queue] = None,
                     tb_key: str = "") -> DownloadTask:
@@ -9269,6 +9792,11 @@ def download_worker(task: DownloadTask, gofile_token: str, move_queue: Optional[
                 task.status = 'skipped'
                 return task
             f = _download_chauthanh(task)
+        elif task.link_type == 'rapidseedbox':
+            if check_duplicate_in_drive(_strip_size_suffix(task.filename)):
+                task.status = 'skipped'
+                return task
+            f = _download_rapidseedbox(task)
         else:
             f = download_with_aria2(download_url, task.filename, COLAB_ROOT, task.cookie, task_id=task.id,
                                     update_bar=False, url_refresh=url_refresh, source=task.link_type)
@@ -9308,7 +9836,7 @@ def download_worker(task: DownloadTask, gofile_token: str, move_queue: Optional[
         task.error = "Cancelled by user"
     except Exception as e:
         task.status = "failed"
-        task.error = (_redact_transfer_error(str(e)) if task.link_type == 'chauthanh' else
+        task.error = (_redact_transfer_error(str(e)) if task.link_type in ('chauthanh', 'rapidseedbox') else
                       str(e)[:600] if task.link_type == 'pikpak' else str(e)[:100])
     if task.status == 'failed':
         with print_lock:
@@ -9373,6 +9901,10 @@ def url_matches_host(url: str, hosts) -> bool:
 
 def _classify_url(url: str, has_debrid: bool) -> str:
     """Map a URL to a resolver kind (mirrors the historical routing order)."""
+    if url.lower().startswith('rapidseedbox://'):
+        return 'rapidseedbox'
+    if _url_host(url).endswith('.seedbox.vip') and _rapidseedbox_browser_link(urlparse(url)):
+        return 'rapidseedbox'
     if url_matches_host(url, ('chauthanh.info',)):
         return 'chauthanh'
     if url.startswith('pikpak://') or _url_host(url) in ('mypikpak.com', 'www.mypikpak.com'):
@@ -9428,8 +9960,12 @@ def resolve_all_links(urls: List[str], session: requests.Session, tokens: dict, 
 
     # Determine which debrid key is active
     has_debrid = bool((debrid_service == 'rd' and rd_key) or (debrid_service == 'tb' and tb_key))
+    swift_magnets = getattr(globals().get('rapidseedbox_magnets'), 'value', False)
+    swift_files = set()
 
     classified = [(url, _classify_url(url, has_debrid)) for url in urls]
+    if any(kind == 'rapidseedbox' or (kind == 'magnet' and swift_magnets) for _, kind in classified):
+        _rapidseedbox_refresh_secrets()
 
     # Kick off independent resolvers concurrently (keyed by position - URLs may repeat)
     futures = {}
@@ -9447,7 +9983,18 @@ def resolve_all_links(urls: List[str], session: requests.Session, tokens: dict, 
                 futures[i] = executor.submit(_resolve_tb_cdn, url, session)
 
         for i, (url, kind) in enumerate(classified):
-            if kind == 'transfer':
+            if kind == 'rapidseedbox' or (kind == 'magnet' and swift_magnets):
+                try:
+                    for task in resolve_rapidseedbox(url):
+                        key = _queue_task_key(task)
+                        if key not in swift_files:
+                            swift_files.add(key)
+                            parallel_tasks.append(task)
+                except _RapidSeedboxError as exc:
+                    print(f'   ❌ RapidSeedbox: {exc}')
+                except (OSError, TypeError, ValueError, KeyError):
+                    print('   ❌ RapidSeedbox could not read this file or torrent. Check the path and seedbox status.')
+            elif kind == 'transfer':
                 mega_urls.append(url)
             elif kind == 'mega':
                 if debrid_service == 'rd' and rd_key:
@@ -9517,7 +10064,7 @@ def resolve_all_links(urls: List[str], session: requests.Session, tokens: dict, 
                 elif debrid_service == 'tb' and tb_key:
                     parallel_tasks.extend(resolve_tb_magnet_files(url, tb_key))
                 else:
-                    print(f"   ❌ Debrid token required for magnet links (select Real-Debrid or TorBox)")
+                    print("   ❌ For magnet links, configure Real-Debrid, TorBox, or RapidSeedbox Swift in Settings.")
             elif kind == 'tb_folder':
                 # torbox.app share links always resolve via TorBox regardless of toggle
                 tb_key_for_tb_links = tb_key or token_tb.value.strip()
@@ -10559,6 +11106,8 @@ def execute_batch(mode: str, resume: bool = False, quick_mode: bool = False,
                 btn.disabled = False
                 return
 
+            if _live_batch is None:
+                _reset_cancel_state()
             all_tasks = _resolve_queue_links(urls)
 
             # Save initial session
@@ -10723,6 +11272,7 @@ btn_queue_start_subs.on_click(lambda b: start_from_queue(mode="subs_only"))
 # Settings control bindings
 btn_settings.on_click(toggle_settings)
 btn_settings_close.on_click(close_settings)
+btn_rapidseedbox_test.on_click(_rapidseedbox_test_connection)
 btn_upload_cookies.on_click(upload_cookies)
 btn_clear_cookies.on_click(clear_cookies)
 btn_clear_history.on_click(request_clear_history)

@@ -82,6 +82,7 @@ test_*.py
 !test_drive_settings.py
 !test_okru.py
 !test_startup.py
+!test_rapidseedbox.py
 test_*.txt
 debug_*.py
 

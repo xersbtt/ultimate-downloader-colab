@@ -2,6 +2,22 @@
 
 All notable changes to Ultimate Downloader are documented here.
 
+## v7.3
+
+### RapidSeedbox Swift
+
+- **Import files over SFTP.** Resolve a Swift Web File Browser URL or absolute SFTP path. Review and select files in the queue, then transfer them to Google Drive. Settings provides a connection test and verifies the SFTP server fingerprint before authentication.
+- **Send magnets to qBittorrent.** Enable Swift magnet routing in Settings to submit magnets during link resolution. Import an existing qBittorrent torrent by info hash. The downloader waits for the torrent's files to finish downloading and moving on Swift before transferring selected files to Drive. The files stay on Swift for seeding.
+- **Resume interrupted transfers.** Resume or Retry reuses partial files in the same Colab runtime. Larger transfers can use two SFTP connections per file, with a single-connection fallback after an interrupted read. The downloader checks file size and modification time before staging a completed import.
+- **Keep credentials in the active runtime.** Swift credentials can come from Colab Secrets or Settings and stay out of Drive settings and saved queues.
+
+### Verification
+
+- Local regression checks cover the notebook launcher, Swift connection settings, file and torrent resolution, qBittorrent login responses, duplicate handling, and interrupted SFTP transfers.
+- See [the release checklist](RELEASING.md) for the live Colab smoke test.
+
+---
+
 ## v7.2
 
 ### Downloads

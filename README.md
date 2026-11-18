@@ -2,19 +2,19 @@
 
 # Ultimate Downloader
 
-Download videos and files in Google Colab, save them to Google Drive, and organise shows and movies for Plex. It supports Gofile, Pixeldrain, Mega, YouTube, TorBox, Real-Debrid, PikPak, Châu Thành donor links, and many other sources.
+Download videos and files in Google Colab, save them to Google Drive, and organise shows and movies for Plex. It supports Gofile, Pixeldrain, Mega, YouTube, TorBox, Real-Debrid, PikPak, RapidSeedbox Swift, Châu Thành donor links, and many other sources.
 
-**Current version on `main` is v7.2.** It adds experimental Châu Thành donor downloads, alternate episode orders, and transfer fixes for PikPak and TorBox. See the [v7.2 release notes](CHANGELOG.md#v72).
+**Current version on `main` is v7.3.** Import files from RapidSeedbox Swift and optionally send magnet links to its qBittorrent client. See the [v7.3 release notes](CHANGELOG.md#v73).
 
-## What's new in v7.2
+## What's new in v7.3
 
-- **Châu Thành donor downloads** reuse your PC supporter session in Colab and support up to three simultaneous `eri2` files with five connections each.
-- **Alternate TMDB episode orders** map absolute-numbered downloads to a chosen season split and show the resulting paths in the queue.
-- **Transfer fixes** keep PikPak recovery active on alternate CDN hosts and correct TorBox WebDL submission and polling.
+- **RapidSeedbox Swift imports** resolve files and folders from an SFTP path or the Swift Web File Browser, then transfer selected files to Google Drive.
+- **Optional qBittorrent routing** sends magnet links to Swift and can import torrents already in its queue by info hash.
+- **Resumable SFTP transfers** verify the server fingerprint, use up to two connections per file, and can recover from interrupted reads using a single connection.
 
 ## Get started
 
-You need a Google account and enough space in Drive. A Real-Debrid or TorBox subscription is only needed for premium hosts and magnet links. A free TMDB key is optional for better movie and TV names.
+You need a Google account and enough space in Drive. Premium hosts use Real-Debrid or TorBox. For magnets, you can use either service or RapidSeedbox Swift with qBittorrent. A free TMDB key is optional for better movie and TV names.
 
 1. Open [Google Colab](https://colab.research.google.com/) and create a new notebook.
 2. Paste this into a cell and run it:
@@ -28,7 +28,7 @@ import requests; exec(requests.get("https://raw.githubusercontent.com/xersbtt/ul
 
 The code runs in Colab; you do not need to install anything on your computer. Colab sessions can end unexpectedly, so use **Resume Previous Session** when you return.
 
-The launcher loads the current script from `main`. If you already use it, restart your Colab runtime, rerun the cell, and look for **Ultimate Downloader v7.2**. If you pasted the full script into Colab, replace it with the [current script](ultimate_downloader.py) first.
+The launcher loads the current script from `main`. If you already use it, restart your Colab runtime, rerun the cell, and look for **Ultimate Downloader v7.3**. If you pasted the full script into Colab, replace it with the [current script](ultimate_downloader.py) first.
 
 To stay on a fixed release, replace `main` in the launcher URL with a [published release tag](https://github.com/xersbtt/ultimate-downloader-colab/releases).
 
@@ -42,11 +42,23 @@ Open **⚙️ Settings** to enter tokens, or save them in Colab's **Secrets** pa
 | Real-Debrid | `RD_TOKEN` | Premium hosts and magnets through Real-Debrid |
 | TorBox | `TB_TOKEN` | Premium hosts, magnets, and TorBox links |
 | PikPak | `PIKPAK_TOKEN` | PikPak shares and files in your own PikPak account |
+| RapidSeedbox Swift | `RAPIDSEEDBOX_HOST`, `RAPIDSEEDBOX_USERNAME`, `RAPIDSEEDBOX_PASSWORD`, `RAPIDSEEDBOX_HOST_KEY` | Import files from your seedbox over SFTP |
 | TMDB | `TMDB_API_KEY` | Better names, years, anime routing, and season matching |
 | FShare | `FSHARE_EMAIL` and `FSHARE_PASSWORD` | FShare VIP links |
 | Châu Thành | `CHAUTHANH_PHPSESSID` | Reuse your PC supporter login without installing a Colab browser |
 
 Choose **Real-Debrid**, **TorBox**, or **None** with the **Debrid** selector. You can use YouTube, Mega, Gofile, Pixeldrain, and other public sources without a debrid subscription.
+
+### RapidSeedbox Swift setup
+
+1. Open **Settings → RapidSeedbox Swift**. Enter the SFTP hostname or IP, username and password from your RapidSeedbox Client Area, or add the corresponding Colab Secrets. Swift's SFTP port defaults to `63526`. Append `:port` to the hostname if your Client Area lists a different port. [RapidSeedbox SFTP guide](https://help.rapidseedbox.com/en/articles/5767029-how-to-transfer-files-from-your-seedbox-to-your-local-device-with-filezilla)
+2. Click **Test connection** with the fingerprint field blank to show the server's `SHA256:…` code on its own line. Compare it with the fingerprint from a trusted SFTP connection. Paste the full line into **SFTP fingerprint** and test again. The app checks that fingerprint on future connections. A successful test shows your SFTP home folder.
+3. In the Swift Web File Browser, open a folder and copy its `https://rapidseedbox…-files.swift-….seedbox.vip/files/…` address from your browser into **Links**. Ultimate Downloader looks up that path in your configured SFTP account. You can also paste an absolute SFTP path as `rapidseedbox:///Downloads/Show%20Name/` or `rapidseedbox:///Downloads/Show%20Name/Episode%201.mkv`. **Resolve Links** lists regular files in a folder and its subfolders. Select the finished files you want, then click **Start Download** to transfer them through Colab to Drive. [RapidSeedbox Web File Browser guide](https://help.rapidseedbox.com/en/articles/15220939-how-to-use-the-web-file-browser-on-lean-seedbox-filestash)
+4. To send magnets, open qBittorrent in the RapidSeedbox Client Area and copy its HTTPS Web UI URL into the Swift settings. Enter its username and password if they differ from SFTP. Alternatively, use `RAPIDSEEDBOX_QBIT_URL`, `RAPIDSEEDBOX_QBIT_USERNAME` and `RAPIDSEEDBOX_QBIT_PASSWORD` in Colab Secrets. Test the connection and enable **Use RapidSeedbox for magnet links**. Resolving a magnet starts the torrent on Swift and shows its file list when metadata arrives. Queue selection controls which files go to Drive. [RapidSeedbox torrent client guide](https://help.rapidseedbox.com/en/articles/5755788-how-to-switch-your-torrent-clients-on-the-lean-seedbox)
+
+Use `rapidseedbox://torrent/HASH` to import a torrent already in qBittorrent, including a `.torrent` file added in its Web UI. Copy the info hash from qBittorrent's **General** panel. If the panel shows both v1 and v2 hashes, use the magnet link or try the v2 hash first. If a torrent is still downloading when the worker's 30-minute wait ends, use **Retry Failed** after it finishes. Files stay on Swift for seeding. Resume and Retry reuse the local partial within the same Colab runtime, and the saved queue keeps the remote file reference if the runtime restarts. Swift credentials are read from Colab Secrets or the current settings fields and are excluded from Drive settings and saved queues.
+
+By default, Swift uses two SFTP connections per file when at least 32 MiB remains to transfer. To compare speeds on your seedbox, change **SFTP connections per file** to **1** under **Settings → RapidSeedbox Swift**. If a parallel read fails, the app can continue from the saved bytes with one connection.
 
 ### PikPak setup
 
@@ -133,6 +145,7 @@ The downloader pauses new downloads when Colab's temporary disk runs low. If lar
 - **Public links:** Gofile, Pixeldrain, direct HTTP, Mega, Archive.org, and more.
 - **Video sites:** YouTube and playlists, OK.ru, Twitch, Vimeo, TikTok, Dailymotion, and SoundCloud.
 - **Debrid links:** Real-Debrid and TorBox support magnet files and many premium file hosts. TorBox share links and JDownloader folder links are supported.
+- **RapidSeedbox Swift:** SFTP file and folder imports, Swift Web File Browser links, and optional qBittorrent routing for magnets and existing torrents.
 - **FShare:** File and folder links with a VIP account. This integration is experimental and may need updates when FShare changes its site. Resolving a single file uses your daily quota; browsing a folder does not.
 - **PikPak:** Public shares, nested shared folders, and files or folders in your own account, using a Personal Access Token. Premium is recommended for large batches; free-account storage and transfer restrictions still apply.
 - **Châu Thành:** Reuse a PC supporter session through `PHPSESSID`, with no Colab browser installation; `eri2` donor links, three files and five connections per file. Cross-IP session reuse and small cookie-free file ranges passed a private Colab test. The user confirmed a complete download-to-Drive batch with the earlier two-file allocation. Show-page browsing is not implemented; the new three-file allocation and interrupted resume still need live verification.
